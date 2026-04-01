@@ -71,3 +71,13 @@
 <time>28:38:28</time><avg_loss>5.434800</avg_loss>
 <time>28:57:15</time><avg_loss>5.423465</avg_loss>
 <time>29:15:21</time><avg_loss>5.372304</avg_loss>
+<time>29:37:50</time><avg_loss>5.398404</avg_loss>
+<time>29:59:59</time><avg_loss>5.388553</avg_loss>
+<time>30:20:07</time><avg_loss>5.341471</avg_loss>
+<time>30:41:31</time><avg_loss>5.350205</avg_loss>
+<time>31:03:09</time><avg_loss>5.352787</avg_loss>
+<time>31:24:44</time><avg_loss>5.360687</avg_loss>
+<time>31:44:11</time><avg_loss>5.352823</avg_loss>
+<time>32:12:05</time><avg_loss>5.456920</avg_loss>
+<time>32:36:45</time><avg_loss>5.418180</avg_loss>
+<time>33:02:48</time><avg_loss>5.399999</avg_loss>
