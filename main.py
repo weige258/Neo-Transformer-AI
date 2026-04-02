@@ -72,7 +72,7 @@ print(f"Model parameter count: {total_params/1e+8} 亿参数")
 
 # Loss function and optimizer
 loss_func = torch.nn.CrossEntropyLoss().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
 
 def _truncate_train_tensor(train_tensor: torch.Tensor, ask_len: int) -> Tuple[torch.Tensor, int]:
     max_train_len = CONFIG["max_length"] + 1
