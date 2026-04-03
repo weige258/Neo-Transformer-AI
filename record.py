@@ -26,6 +26,11 @@ def seconds_to_hours_minutes_seconds(seconds: int) -> str:
     return f"{h:02}:{m:02}:{s:02}"
 
 
+def get_system_time():
+    """Get current system time in format YYYY/MM/DD HH:MM:SS"""
+    return time.strftime("%Y/%m/%d %H:%M:%S")
+
+
 def load_run_time():
     """Load running time from record file"""
     global running_time
@@ -34,7 +39,8 @@ def load_run_time():
     if not os.path.exists(record_file):
         # Create the record file if it doesn't exist
         with open(record_file, "w", encoding="utf-8") as f:
-            f.write("<time>00:00:00</time><avg_loss>0</avg_loss>\n")
+            system_time = get_system_time()
+            f.write(f"<system_time>{system_time}</system_time><time>00:00:00</time><avg_loss>0</avg_loss>\n")
         running_time = 0
         return
     
@@ -84,12 +90,13 @@ def record_loss(loss: float):
             
             with open(record_file, "a", encoding="utf-8") as f:
                 time_str = seconds_to_hours_minutes_seconds(running_time)
-                f.write(f"<time>{time_str}</time><avg_loss>{avg_loss:.6f}</avg_loss>\n")
+                system_time = get_system_time()
+                f.write(f"<system_time>{system_time}</system_time><time>{time_str}</time><avg_loss>{avg_loss:.6f}</avg_loss>\n")
             
             # Reset counters
             total_loss = 0
             record_count = 0
-            print(f"记录损失 - 运行时间: {time_str}, 平均损失: {avg_loss:.6f}")
+            print(f"记录损失 - 系统时间: {system_time}, 运行时间: {time_str}, 平均损失: {avg_loss:.6f}")
             
     except Exception as e:
         print(f"记录损失失败: {e}")

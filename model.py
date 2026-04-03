@@ -60,9 +60,8 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = emb_size // num_heads
         self.scale = self.head_dim ** -0.5
 
-        self.q_proj = nn.Linear(emb_size, emb_size, bias=False)
-        self.k_proj = nn.Linear(emb_size, emb_size, bias=False)
-        self.v_proj = nn.Linear(emb_size, emb_size, bias=False)
+        # Single linear layer for QKV projection (faster than 3 separate projections)
+        self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
         self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryPositionEmbedding(self.head_dim)
@@ -73,9 +72,12 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         batch, seq_len, _ = x.shape
-        q = self._shape(self.q_proj(x))
-        k = self._shape(self.k_proj(x))
-        v = self._shape(self.v_proj(x))
+        
+        # Project to QKV and split
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, num_heads, seq_len, head_dim]
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         cos, sin = self.rope(seq_len=seq_len, device=x.device)
         q = (q * cos) + (rotate_half(q) * sin)
@@ -129,13 +131,11 @@ class MainModel(nn.Module):
         super().__init__()
         dict_size = int(CONFIG["dict_size"])
         emb_size = int(CONFIG["emb_size"])
-        max_length = int(CONFIG["max_length"])
         num_heads = int(CONFIG["num_heads"])
         num_layers = int(CONFIG["num_layers"])
         dropout = float(CONFIG["dropout"])
 
         self.token_embedding = nn.Embedding(dict_size, emb_size)
-        self.position_embedding = nn.Embedding(max_length, emb_size)
         self.embedding_dropout = nn.Dropout(dropout)
         self.transformers = nn.ModuleList(
             [
@@ -154,7 +154,6 @@ class MainModel(nn.Module):
 
     def _reset_parameters(self) -> None:
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.position_embedding.weight, mean=0.0, std=0.02)
         nn.init.normal_(self.output_linear.weight, mean=0.0, std=0.02)
 
         for module in self.modules():
@@ -176,8 +175,7 @@ class MainModel(nn.Module):
                 f"Input length {seq_len} exceeds max_length={CONFIG['max_length']}."
             )
 
-        positions = torch.arange(seq_len, device=tokens.device).unsqueeze(0)
-        x = self.token_embedding(tokens) + self.position_embedding(positions)
+        x = self.token_embedding(tokens)
         x = self.embedding_dropout(x)
 
         for block in self.transformers:

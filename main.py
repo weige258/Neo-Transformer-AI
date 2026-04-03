@@ -1,6 +1,6 @@
 import random
 import torch
-from typing import Tuple
+from typing import Tuple, overload
 from model import MainModel, CONFIG
 from record import record_loss
 
@@ -84,8 +84,69 @@ def _truncate_train_tensor(train_tensor: torch.Tensor, ask_len: int) -> Tuple[to
     ask_len = max(ask_len - overflow, 0)
     return train_tensor, ask_len
 
-def train(ask: str, answer: str) -> None:
-    """Train the model on a single (ask, answer) pair"""
+@overload
+def train(ask: str, answer: str) -> None: ...
+
+@overload
+def train(text: str) -> None: ...
+
+def train(ask: str, answer: str = "") -> None:
+    """Train the model on a single (ask, answer) pair or a single text
+    
+    Args:
+        ask: Question/prompt text (or single text if answer is empty)
+        answer: Answer/response text (optional). If empty, uses single text training mode
+    """
+    # Single text training mode
+    if not answer:
+        print(f"\n---Single text training:\n{ask}")
+        print("\n---Learning tokens:")
+        # Prepare input tensor
+        text_tensor = encode(ask).to(device)
+        
+        # Create training sequence: [text tokens] + [end token]
+        train_tensor = torch.cat([
+            text_tensor,
+            torch.tensor([END_TOKEN], device=device)
+        ])
+        if train_tensor.numel() < 2:
+            return
+        
+        # Truncate if necessary
+        train_tensor, loss_start = _truncate_train_tensor(train_tensor, len(text_tensor))
+        
+        # Training loop
+        model.train()
+        prompt = train_tensor[:-1]
+        targets = train_tensor[1:]
+        logits = model(prompt)
+        
+        # Compute loss on all tokens in single text mode
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        if targets.dim() == 0:
+            targets = targets.unsqueeze(0)
+        
+        loss = loss_func(logits, targets)
+        
+        # Record loss for monitoring
+        record_loss(loss.item())
+        
+        # Backward pass and optimization
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        
+        # Print the target tokens for monitoring
+        try:
+            print(decode(targets), end="", flush=True)
+        except Exception:
+            pass
+        
+        print("", flush=True)  # New line after training
+        return
+    
+    # Dual text (ask, answer) training mode
     print(f"\n---Train question:\n{ask}")
     print("\n---Train answer:")
 
