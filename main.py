@@ -97,112 +97,89 @@ def train(ask: str, answer: str = "") -> None:
         ask: Question/prompt text (or single text if answer is empty)
         answer: Answer/response text (optional). If empty, uses single text training mode
     """
+    def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor) -> None:
+        if train_tensor.numel() < 2:
+            return
+
+        max_train_len = CONFIG["max_length"] + 1
+        if train_tensor.numel() > max_train_len:
+            train_tensor = train_tensor[-max_train_len:]
+            target_mask = target_mask[-max_train_len:]
+
+        prompt = train_tensor[:-1]
+        targets = train_tensor[1:]
+        loss_mask = target_mask[1:] & (targets != 0)
+        if loss_mask.numel() == 0 or not bool(loss_mask.any()):
+            return
+
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(prompt)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+
+        masked_logits = logits[loss_mask]
+        masked_targets = targets[loss_mask]
+        if masked_targets.numel() == 0:
+            return
+        if masked_logits.dim() == 1:
+            masked_logits = masked_logits.unsqueeze(0)
+            masked_targets = masked_targets.unsqueeze(0)
+
+        loss = loss_func(masked_logits, masked_targets)
+        record_loss(loss.item())
+        loss.backward()
+        optimizer.step()
+
+        try:
+            print(decode(preview[preview != 0]), end="", flush=True)
+        except Exception:
+            pass
+        print("", flush=True)
+
     # Single text training mode
     if not answer:
         print(f"\n---Single text training:\n{ask}")
         print("\n---Learning tokens:")
-        # Prepare input tensor
+
         text_tensor = encode(ask).to(device)
-        
-        # Create training sequence: [text tokens] + [end token]
+        if text_tensor.numel() == 0:
+            return
+
         train_tensor = torch.cat([
+            torch.tensor([START_TOKEN], device=device),
             text_tensor,
             torch.tensor([END_TOKEN], device=device)
         ])
-        if train_tensor.numel() < 2:
-            return
-        
-        # Truncate if necessary
-        train_tensor, loss_start = _truncate_train_tensor(train_tensor, len(text_tensor))
-        
-        # Training loop
-        model.train()
-        prompt = train_tensor[:-1]
-        targets = train_tensor[1:]
-        logits = model(prompt)
-        
-        # Compute loss on all tokens in single text mode
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-        if targets.dim() == 0:
-            targets = targets.unsqueeze(0)
-        
-        loss = loss_func(logits, targets)
-        
-        # Record loss for monitoring
-        record_loss(loss.item())
-        
-        # Backward pass and optimization
-        loss.backward()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        
-        # Print the target tokens for monitoring
-        try:
-            print(decode(targets), end="", flush=True)
-        except Exception:
-            pass
-        
-        print("", flush=True)  # New line after training
+        target_mask = torch.cat([
+            torch.tensor([False], device=device),
+            torch.ones(text_tensor.numel() + 1, dtype=torch.bool, device=device)
+        ])
+        preview = torch.cat([text_tensor, torch.tensor([END_TOKEN], device=device)])
+        _run_train_step(train_tensor, target_mask, preview)
         return
-    
+
     # Dual text (ask, answer) training mode
     print(f"\n---Train question:\n{ask}")
     print("\n---Train answer:")
 
-    # Prepare input tensors
     ask_tensor = encode(ask).to(device)
     answer_tensor = encode(answer).to(device)
+    if answer_tensor.numel() == 0:
+        return
 
-    # Create training sequence: [ask tokens] + [start token] + [answer tokens] + [end token]
     train_tensor = torch.cat([
         ask_tensor,
         torch.tensor([START_TOKEN], device=device),
         answer_tensor,
         torch.tensor([END_TOKEN], device=device)
     ])
-    if train_tensor.numel() < 2:
-        return
-
-    train_tensor, loss_start = _truncate_train_tensor(train_tensor, len(ask_tensor))
-
-    # Training loop (single forward with causal mask)
-    model.train()
-    prompt = train_tensor[:-1]
-    targets = train_tensor[1:]
-    logits = model(prompt)
-
-    # Only compute loss on answer tokens (after the start token).
-    if loss_start >= targets.numel():
-        return
-    loss_mask = torch.zeros_like(targets, dtype=torch.bool)
-    loss_mask[loss_start:] = True
-
-    masked_logits = logits[loss_mask]
-    masked_targets = targets[loss_mask]
-    if masked_targets.numel() == 0:
-        return
-    if masked_logits.dim() == 1:
-        masked_logits = masked_logits.unsqueeze(0)
-        masked_targets = masked_targets.unsqueeze(0)
-
-    loss = loss_func(masked_logits, masked_targets)
-    
-    # Record loss for monitoring
-    record_loss(loss.item())
-
-    # Backward pass and optimization
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad(set_to_none=True)
-
-    # Print the target tokens for monitoring
-    try:
-        print(decode(masked_targets), end="", flush=True)
-    except Exception:
-        pass
-
-    print("", flush=True)  # New line after generation
+    target_mask = torch.cat([
+        torch.zeros(ask_tensor.numel() + 1, dtype=torch.bool, device=device),
+        torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device)
+    ])
+    preview = torch.cat([answer_tensor, torch.tensor([END_TOKEN], device=device)])
+    _run_train_step(train_tensor, target_mask, preview)
 
 def generation(text: str) -> str:
     """Generate a response to the input text"""

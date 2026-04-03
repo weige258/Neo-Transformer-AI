@@ -1,5 +1,5 @@
-from main import train, generation
-
+from main import train, generation , _load_model
+import torch
 
 while True:
     train("你是什么ai 我是 deepseek")
