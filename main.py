@@ -124,25 +124,12 @@ def train(ask: str, answer: str = "") -> None:
         print("\n---Learning tokens:", flush=True)
 
         text_tensor = TextTokenizer.encode(ask).to(device)
-        if text_tensor.numel() == 0:
+        if text_tensor.numel() < 2:
             return
 
-        train_tensor = torch.cat(
-            [
-                torch.tensor([TextTokenizer.START_TOKEN], device=device),
-                text_tensor,
-                torch.tensor([TextTokenizer.END_TOKEN], device=device),
-            ]
-        )
-        target_mask = torch.cat(
-            [
-                torch.tensor([False], device=device),
-                torch.ones(text_tensor.numel() + 1, dtype=torch.bool, device=device),
-            ]
-        )
-        preview = torch.cat(
-            [text_tensor, torch.tensor([TextTokenizer.END_TOKEN], device=device)]
-        )
+        train_tensor = text_tensor
+        target_mask = torch.ones(text_tensor.numel(), dtype=torch.bool, device=device)
+        preview = text_tensor
         _run_train_step(train_tensor, target_mask, preview)
         return
 
