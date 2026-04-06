@@ -6,7 +6,7 @@ from torch import nn
 
 CONFIG: Dict[str, int | float] = {
     "dict_size": 60000,
-    "max_length": 256,
+    "context_length": 256,
     "emb_size": 512,
     "num_heads": 8,
     "num_layers": 8,
@@ -15,6 +15,10 @@ CONFIG: Dict[str, int | float] = {
 }
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
+
+
+def get_context_length() -> int:
+    return int(CONFIG.get("context_length", CONFIG.get("max_length", 256)))
 
 
 class RMSNorm(nn.Module):
@@ -257,9 +261,10 @@ class MainModel(nn.Module):
                 past_len = first_cache[0].size(-2)
 
         total_len = seq_len + past_len
-        if total_len > int(CONFIG["max_length"]):
+        context_length = get_context_length()
+        if total_len > context_length:
             raise ValueError(
-                f"Input length {total_len} exceeds max_length={CONFIG['max_length']}."
+                f"Input length {total_len} exceeds context_length={context_length}."
             )
 
         x = self.token_embedding(tokens)

@@ -1,10 +1,9 @@
-import random
 import sys
 from typing import Tuple, overload
 
 import torch
 
-from model import CONFIG, MainModel
+from model import CONFIG, MainModel, get_context_length
 from record import record_loss
 from tokenizer import TextTokenizer
 
@@ -57,7 +56,7 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
 
 
 def _truncate_train_tensor(train_tensor: torch.Tensor, ask_len: int) -> Tuple[torch.Tensor, int]:
-    max_train_len = CONFIG["max_length"] + 1
+    max_train_len = get_context_length() + 1
     if train_tensor.numel() <= max_train_len:
         return train_tensor, ask_len
 
@@ -84,7 +83,7 @@ def train(ask: str, answer: str = "") -> None:
         if train_tensor.numel() < 2:
             return
 
-        max_train_len = CONFIG["max_length"] + 1
+        max_train_len = get_context_length() + 1
         if train_tensor.numel() > max_train_len:
             train_tensor = train_tensor[-max_train_len:]
             target_mask = target_mask[-max_train_len:]
@@ -175,9 +174,10 @@ def train(ask: str, answer: str = "") -> None:
     _run_train_step(train_tensor, target_mask, preview)
 
 
-def generation(text: str) -> str:
+def generation(text: str, max_generate_tokens: int = 256) -> str:
     model.eval()
     output_text = ""
+    context_length = get_context_length()
 
     prompt = torch.cat(
         [
@@ -185,39 +185,40 @@ def generation(text: str) -> str:
             torch.tensor([TextTokenizer.START_TOKEN], device=device),
         ]
     )
-    if prompt.numel() > CONFIG["max_length"]:
-        prompt = prompt[-CONFIG["max_length"]:]
+    if prompt.numel() > context_length:
+        prompt = prompt[-context_length:]
 
     print("\n---Generated reply:", flush=True)
 
-    end_threshold = random.randint(3, 5)
-    end_hits = 0
+    min_new_tokens = 1
+    max_generate_tokens = max(1, min(int(max_generate_tokens), context_length))
 
     with torch.inference_mode():
         logits, past_key_values = model(prompt, use_cache=True)
 
-        for _ in range(CONFIG["max_length"]):
+        for step in range(max_generate_tokens):
             try:
                 next_logits = logits[-1]
+                if step < min_new_tokens:
+                    next_logits = next_logits.clone()
+                    next_logits[TextTokenizer.END_TOKEN] = float("-inf")
+
                 probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
                 index = int(torch.multinomial(probs, 1).item())
 
                 if index == TextTokenizer.END_TOKEN:
-                    end_hits += 1
-                    if end_hits >= end_threshold:
-                        break
+                    break
 
-                if index != TextTokenizer.END_TOKEN:
-                    decoded_piece = TextTokenizer.decode(torch.tensor([index]))
-                    if decoded_piece:
-                        print(decoded_piece, end="", flush=True)
-                        output_text += decoded_piece
+                decoded_piece = TextTokenizer.decode(torch.tensor([index]))
+                if decoded_piece:
+                    print(decoded_piece, end="", flush=True)
+                    output_text += decoded_piece
 
                 next_token = torch.tensor([index], device=device)
                 prompt = torch.cat([prompt, next_token])
 
-                if prompt.numel() > CONFIG["max_length"]:
-                    prompt = prompt[-CONFIG["max_length"]:]
+                if prompt.numel() > context_length:
+                    prompt = prompt[-context_length:]
                     logits, past_key_values = model(prompt, use_cache=True)
                 else:
                     logits, past_key_values = model(
