@@ -225,5 +225,5 @@ def generation(text: str) -> str:
                         use_cache=True,
                     )
             except Exception as e:
-                print(e)
+                print(e, flush=True)
     return output_text

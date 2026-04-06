@@ -7,9 +7,9 @@ from torch import nn
 CONFIG: Dict[str, int | float] = {
     "dict_size": 60000,
     "max_length": 256,
-    "emb_size": 1024,
+    "emb_size": 512,
     "num_heads": 8,
-    "num_layers": 16,
+    "num_layers": 8,
     "dropout": 0.1,
     "temperature": 0.8,
 }
