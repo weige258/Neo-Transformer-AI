@@ -146,10 +146,10 @@ class WebCrawler:
                 success = self._fetch_and_parse(url)
                 
                 if success:
-                    print(f"爬取成功: {url}")
+                    print(f"爬取成功: {url}", flush=True)
                 else:
                     self.failed_urls.add(url)
-                    print(f"失败url: {url}")
+                    print(f"失败url: {url}", flush=True)
                 
                 self.url_queue.task_done()
                 
@@ -303,10 +303,10 @@ class WebCrawler:
                     break
                 
                 # 清理所有成员集合和缓存
-                print("【内存清理】开始清理成员数据...")
+                print("【内存清理】开始清理成员数据...", flush=True)
                 print(f"  清理前 - visited_urls: {len(self.visited_urls)}, "
                       f"failed_urls: {len(self.failed_urls)}, "
-                      f"cache: {len(self.cache)}")
+                      f"cache: {len(self.cache)}", flush=True)
                 
                 # 清理已访问URL集合
                 self.visited_urls.clear()
@@ -320,8 +320,8 @@ class WebCrawler:
                 
                 print(f"  清理后 - visited_urls: {len(self.visited_urls)}, "
                       f"failed_urls: {len(self.failed_urls)}, "
-                      f"cache: {len(self.cache)}")
-                print("【内存清理】完成\n")
+                      f"cache: {len(self.cache)}", flush=True)
+                print("【内存清理】完成\n", flush=True)
                 
             except Exception as e:
                 pass

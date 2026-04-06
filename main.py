@@ -1,44 +1,14 @@
 import random
+import sys
 import torch
 from typing import Tuple, overload
 from model import MainModel, CONFIG
 from record import record_loss
-
-# Special tokens
-START_TOKEN = 1
-END_TOKEN = CONFIG["dict_size"] - 1
+from tokenizer import TextTokenizer
 
 # Device configuration
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Encoding/Decoding functions
-# Note: This is a simple ASCII-based encoding. For better performance, consider using a proper tokenizer.
-def encode(text: str) -> torch.Tensor:
-    """Encode text to tensor of indices"""
-    tensor = []
-    for letter in text:
-        try:
-            idx = ord(letter)
-            # Ensure index is within the dictionary size
-            if 0 < idx < CONFIG["dict_size"] - 1:
-                tensor.append(idx)
-            else:
-                tensor.append(0)  # Unknown token
-        except Exception:
-            tensor.append(0)  # Unknown token
-    return torch.tensor(tensor, dtype=torch.long)
-
-def decode(indices: torch.Tensor) -> str:
-    """Decode tensor of indices to text"""
-    text = []
-    for idx in indices:
-        try:
-            idx_int = int(idx)
-            if idx_int != START_TOKEN and idx_int != END_TOKEN:
-                text.append(chr(idx_int))
-        except Exception:
-            continue
-    return "".join(text)
 
 def _load_model() -> MainModel:
     """Load model from disk if possible, otherwise create a new one."""
@@ -52,8 +22,11 @@ def _load_model() -> MainModel:
             model = loaded.to(device)
             print("Loaded full model.")
 
-        # Verify model structure compatibility
-        if not hasattr(model, "transformers") or len(model.transformers) == 0 or not hasattr(model.transformers[0], "rms_norm1"):
+        if (
+            not hasattr(model, "transformers")
+            or len(model.transformers) == 0
+            or not hasattr(model.transformers[0], "rms_norm1")
+        ):
             print("Detected old model structure; creating new model.")
             model = MainModel().to(device)
         return model
@@ -63,16 +36,25 @@ def _load_model() -> MainModel:
         print("Created new model.")
         return model
 
-# Model initialization
+
 print(f"Using device: {device}")
 model = _load_model()
 
 total_params = sum(param.numel() for param in model.parameters())
-print(f"Model parameter count: {total_params/1e+8} 亿参数")
+print(f"模型参数 {total_params/1e+8}亿")
 
-# Loss function and optimizer
 loss_func = torch.nn.CrossEntropyLoss().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+
+
+def _safe_console_write(text: str) -> None:
+    if not text:
+        return
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    safe_text = text.encode(encoding, errors="backslashreplace").decode(encoding)
+    sys.stdout.write(safe_text)
+    sys.stdout.flush()
+
 
 def _truncate_train_tensor(train_tensor: torch.Tensor, ask_len: int) -> Tuple[torch.Tensor, int]:
     max_train_len = CONFIG["max_length"] + 1
@@ -84,20 +66,23 @@ def _truncate_train_tensor(train_tensor: torch.Tensor, ask_len: int) -> Tuple[to
     ask_len = max(ask_len - overflow, 0)
     return train_tensor, ask_len
 
+
 @overload
 def train(ask: str, answer: str) -> None: ...
+
 
 @overload
 def train(text: str) -> None: ...
 
+
 def train(ask: str, answer: str = "") -> None:
-    """Train the model on a single (ask, answer) pair or a single text
-    
-    Args:
-        ask: Question/prompt text (or single text if answer is empty)
-        answer: Answer/response text (optional). If empty, uses single text training mode
-    """
-    def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor) -> None:
+    """Train the model on a single (ask, answer) pair or a single text"""
+
+    def _run_train_step(
+        train_tensor: torch.Tensor,
+        target_mask: torch.Tensor,
+        preview: torch.Tensor,
+    ) -> None:
         if train_tensor.numel() < 2:
             return
 
@@ -132,65 +117,73 @@ def train(ask: str, answer: str = "") -> None:
         optimizer.step()
 
         try:
-            print(decode(preview[preview != 0]), end="", flush=True)
-        except Exception:
-            pass
+            _safe_console_write(TextTokenizer.decode(preview[preview != 0]))
+        except Exception as e:
+            print(e)
         print("", flush=True)
 
-    # Single text training mode
     if not answer:
         print(f"\n---Single text training:\n{ask}")
         print("\n---Learning tokens:")
 
-        text_tensor = encode(ask).to(device)
+        text_tensor = TextTokenizer.encode(ask).to(device)
         if text_tensor.numel() == 0:
             return
 
-        train_tensor = torch.cat([
-            torch.tensor([START_TOKEN], device=device),
-            text_tensor,
-            torch.tensor([END_TOKEN], device=device)
-        ])
-        target_mask = torch.cat([
-            torch.tensor([False], device=device),
-            torch.ones(text_tensor.numel() + 1, dtype=torch.bool, device=device)
-        ])
-        preview = torch.cat([text_tensor, torch.tensor([END_TOKEN], device=device)])
+        train_tensor = torch.cat(
+            [
+                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                text_tensor,
+                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+            ]
+        )
+        target_mask = torch.cat(
+            [
+                torch.tensor([False], device=device),
+                torch.ones(text_tensor.numel() + 1, dtype=torch.bool, device=device),
+            ]
+        )
+        preview = torch.cat([text_tensor, torch.tensor([TextTokenizer.END_TOKEN], device=device)])
         _run_train_step(train_tensor, target_mask, preview)
         return
 
-    # Dual text (ask, answer) training mode
     print(f"\n---Train question:\n{ask}")
     print("\n---Train answer:")
 
-    ask_tensor = encode(ask).to(device)
-    answer_tensor = encode(answer).to(device)
+    ask_tensor = TextTokenizer.encode(ask).to(device)
+    answer_tensor = TextTokenizer.encode(answer).to(device)
     if answer_tensor.numel() == 0:
         return
 
-    train_tensor = torch.cat([
-        ask_tensor,
-        torch.tensor([START_TOKEN], device=device),
-        answer_tensor,
-        torch.tensor([END_TOKEN], device=device)
-    ])
-    target_mask = torch.cat([
-        torch.zeros(ask_tensor.numel() + 1, dtype=torch.bool, device=device),
-        torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device)
-    ])
-    preview = torch.cat([answer_tensor, torch.tensor([END_TOKEN], device=device)])
+    train_tensor = torch.cat(
+        [
+            ask_tensor,
+            torch.tensor([TextTokenizer.START_TOKEN], device=device),
+            answer_tensor,
+            torch.tensor([TextTokenizer.END_TOKEN], device=device),
+        ]
+    )
+    target_mask = torch.cat(
+        [
+            torch.zeros(ask_tensor.numel() + 1, dtype=torch.bool, device=device),
+            torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
+        ]
+    )
+    preview = torch.cat([answer_tensor, torch.tensor([TextTokenizer.END_TOKEN], device=device)])
     _run_train_step(train_tensor, target_mask, preview)
+
 
 def generation(text: str) -> str:
     """Generate a response to the input text"""
     model.eval()
     output_text = ""
 
-    # Prepare initial prompt
-    prompt = torch.cat([
-        encode(text).to(device),
-        torch.tensor([START_TOKEN], device=device)
-    ])
+    prompt = torch.cat(
+        [
+            TextTokenizer.encode(text).to(device),
+            torch.tensor([TextTokenizer.START_TOKEN], device=device),
+        ]
+    )
     if prompt.numel() > CONFIG["max_length"]:
         prompt = prompt[-CONFIG["max_length"]:]
 
@@ -200,27 +193,37 @@ def generation(text: str) -> str:
     end_hits = 0
 
     with torch.inference_mode():
+        logits, past_key_values = model(prompt, use_cache=True)
+
         for _ in range(CONFIG["max_length"]):
             try:
-                logits = model(prompt)
-
-                # Sample from the output distribution
                 next_logits = logits[-1]
                 probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
                 index = int(torch.multinomial(probs, 1).item())
 
-                if index == END_TOKEN:
+                if index == TextTokenizer.END_TOKEN:
                     end_hits += 1
                     if end_hits >= end_threshold:
                         break
 
-                if index != END_TOKEN:
-                    print(chr(int(index)), end="")
-                    output_text += chr(int(index))
+                if index != TextTokenizer.END_TOKEN:
+                    decoded_piece = TextTokenizer.decode(torch.tensor([index]))
+                    if decoded_piece:
+                        _safe_console_write(decoded_piece)
+                        output_text += decoded_piece
 
-                prompt = torch.cat([prompt, torch.tensor([index], device=device)])
+                next_token = torch.tensor([index], device=device)
+                prompt = torch.cat([prompt, next_token])
+
                 if prompt.numel() > CONFIG["max_length"]:
                     prompt = prompt[-CONFIG["max_length"]:]
-            except Exception:
-                continue
+                    logits, past_key_values = model(prompt, use_cache=True)
+                else:
+                    logits, past_key_values = model(
+                        next_token,
+                        past_key_values=past_key_values,
+                        use_cache=True,
+                    )
+            except Exception as e:
+                print(e)
     return output_text

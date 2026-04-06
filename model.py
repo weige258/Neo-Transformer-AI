@@ -14,6 +14,8 @@ CONFIG: Dict[str, int | float] = {
     "temperature": 0.8,
 }
 
+KVCache = tuple[torch.Tensor, torch.Tensor]
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
@@ -37,8 +39,18 @@ class RotaryPositionEmbedding(nn.Module):
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
-    def forward(self, seq_len: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+    def forward(
+        self,
+        seq_len: int,
+        device: torch.device,
+        start_pos: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.arange(
+            start_pos,
+            start_pos + seq_len,
+            device=device,
+            dtype=torch.float32,
+        )
         freqs = torch.outer(positions, self.inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
         return emb.cos()[None, None, :, :], emb.sin()[None, None, :, :]
@@ -48,53 +60,6 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, emb_size: int, num_heads: int, dropout: float) -> None:
-        super().__init__()
-        if emb_size % num_heads != 0:
-            raise ValueError("emb_size must be divisible by num_heads.")
-
-        self.num_heads = num_heads
-        self.head_dim = emb_size // num_heads
-        self.scale = self.head_dim ** -0.5
-
-        # Single linear layer for QKV projection (faster than 3 separate projections)
-        self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
-        self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.rope = RotaryPositionEmbedding(self.head_dim)
-
-    def _shape(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, hidden = x.shape
-        return x.view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch, seq_len, _ = x.shape
-        
-        # Project to QKV and split
-        qkv = self.qkv_proj(x)
-        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, batch, num_heads, seq_len, head_dim]
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        cos, sin = self.rope(seq_len=seq_len, device=x.device)
-        q = (q * cos) + (rotate_half(q) * sin)
-        k = (k * cos) + (rotate_half(k) * sin)
-
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=x.device, dtype=torch.bool),
-            diagonal=1,
-        )
-        attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
-        attn = torch.softmax(attn_scores, dim=-1)
-        attn = self.dropout(attn)
-
-        output = torch.matmul(attn, v)
-        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
-        return self.out_proj(output)
 
 
 class SwiGLUFeedForward(nn.Module):
@@ -112,17 +77,127 @@ class SwiGLUFeedForward(nn.Module):
         return self.dropout(x)
 
 
+class MultiHeadFeedForward(nn.Module):
+    def __init__(self, emb_size: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        if emb_size % num_heads != 0:
+            raise ValueError("emb_size must be divisible by num_heads.")
+
+        self.num_heads = num_heads
+        self.head_dim = emb_size // num_heads
+        self.multi_head_ffn = nn.ModuleList(
+            [
+                SwiGLUFeedForward(self.head_dim, dropout)
+                for _ in range(num_heads)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        split_heads = torch.chunk(x, self.num_heads, dim=-1)
+        head_outputs = [
+            ffn(head_x)
+            for ffn, head_x in zip(self.multi_head_ffn, split_heads)
+        ]
+        return torch.cat(head_outputs, dim=-1)
+
+
+class CausalSelfAttention(nn.Module):
+    def __init__(self, emb_size: int, num_heads: int, dropout: float) -> None:
+        super().__init__()
+        if emb_size % num_heads != 0:
+            raise ValueError("emb_size must be divisible by num_heads.")
+
+        self.num_heads = num_heads
+        self.head_dim = emb_size // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
+        self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        self.rope = RotaryPositionEmbedding(self.head_dim)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_key_value: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
+        batch, seq_len, _ = x.shape
+
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        past_len = 0 if past_key_value is None else past_key_value[0].size(-2)
+        cos, sin = self.rope(seq_len=seq_len, device=x.device, start_pos=past_len)
+        q = (q * cos) + (rotate_half(q) * sin)
+        k = (k * cos) + (rotate_half(k) * sin)
+
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=-2)
+            v = torch.cat([past_v, v], dim=-2)
+
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        total_kv_len = k.size(-2)
+
+        if seq_len > 1 or past_len == 0:
+            key_positions = torch.arange(total_kv_len, device=x.device)
+            query_positions = torch.arange(
+                past_len,
+                past_len + seq_len,
+                device=x.device,
+            )
+            causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
+            attn_scores = attn_scores.masked_fill(
+                causal_mask.unsqueeze(0).unsqueeze(0),
+                float("-inf"),
+            )
+
+        attn = torch.softmax(attn_scores, dim=-1)
+        attn = self.dropout(attn)
+
+        output = torch.matmul(attn, v)
+        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        output = self.out_proj(output)
+
+        if use_cache:
+            return output, (k, v)
+        return output
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, emb_size: int, num_heads: int, dropout: float) -> None:
         super().__init__()
         self.rms_norm1 = RMSNorm(emb_size)
         self.rms_norm2 = RMSNorm(emb_size)
         self.attention = CausalSelfAttention(emb_size, num_heads, dropout)
-        self.feed_forward = SwiGLUFeedForward(emb_size, dropout)
+        self.feed_forward = MultiHeadFeedForward(emb_size, num_heads, dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = x + self.attention(self.rms_norm1(x))
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_key_value: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
+        attn_output = self.attention(
+            self.rms_norm1(x),
+            past_key_value=past_key_value,
+            use_cache=use_cache,
+        )
+
+        if use_cache:
+            attention_output, present_key_value = attn_output
+        else:
+            attention_output = attn_output
+            present_key_value = None
+
+        x = x + attention_output
         x = x + self.feed_forward(self.rms_norm2(x))
+
+        if use_cache:
+            return x, present_key_value
         return x
 
 
@@ -160,7 +235,12 @@ class MainModel(nn.Module):
             if isinstance(module, nn.Linear) and module.weight is not self.output_linear.weight:
                 nn.init.xavier_uniform_(module.weight)
 
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens: torch.Tensor,
+        past_key_values: list[KVCache | None] | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache]]:
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
             squeeze_batch = True
@@ -170,17 +250,40 @@ class MainModel(nn.Module):
             raise ValueError("tokens must have shape [seq_len] or [batch, seq_len].")
 
         seq_len = tokens.size(1)
-        if seq_len > int(CONFIG["max_length"]):
+        past_len = 0
+        if past_key_values:
+            first_cache = past_key_values[0]
+            if first_cache is not None:
+                past_len = first_cache[0].size(-2)
+
+        total_len = seq_len + past_len
+        if total_len > int(CONFIG["max_length"]):
             raise ValueError(
-                f"Input length {seq_len} exceeds max_length={CONFIG['max_length']}."
+                f"Input length {total_len} exceeds max_length={CONFIG['max_length']}."
             )
 
         x = self.token_embedding(tokens)
         x = self.embedding_dropout(x)
 
-        for block in self.transformers:
-            x = block(x)
+        next_key_values: list[KVCache] = []
+        if past_key_values is None:
+            past_key_values = [None] * len(self.transformers)
+
+        for block, past_key_value in zip(self.transformers, past_key_values):
+            if use_cache:
+                x, present_key_value = block(
+                    x,
+                    past_key_value=past_key_value,
+                    use_cache=True,
+                )
+                next_key_values.append(present_key_value)
+            else:
+                x = block(x)
 
         x = self.final_norm(x)
         logits = self.output_linear(x)
-        return logits.squeeze(0) if squeeze_batch else logits
+        logits = logits.squeeze(0) if squeeze_batch else logits
+
+        if use_cache:
+            return logits, next_key_values
+        return logits
