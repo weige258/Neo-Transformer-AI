@@ -55,8 +55,7 @@ def main() -> None:
     data_count = len(human_queries)
     logging.info(f"Loaded {data_count} training pairs.")
 
-    training_rounds = 0
-    save_interval = 500
+   
 
     try:
         while True:
@@ -65,36 +64,15 @@ def main() -> None:
             ask = human_queries[i]
             answer = assistant_responses[i]
 
-            # Skip empty queries or responses
-            if not ask or not answer:
-                continue
-
-            # Train on this pair
             try:
-                train(ask, answer)
-
-                training_rounds += 1
-                print("*" * 100)
-
-                # Save model periodically
-                if training_rounds % save_interval == 0:
-                    torch.save(obj=model.state_dict(), f="model.pth")
-                    logging.info(f"Model saved, training rounds: {training_rounds}")
-
+                print("\nask-------------\n")
+                print(ask,flush=True)
+                generation(ask)
             except Exception as e:
                 logging.error(f"Training error: {e}")
                 continue
-
-    except KeyboardInterrupt:
-        logging.info("Training interrupted by user.")
-        # Save final model
-        torch.save(obj=model.state_dict(), f="model.pth")
-        logging.info(f"Final model saved, training rounds: {training_rounds}")
-    except Exception as e:
-        logging.error(f"Training loop error: {e}")
-        # Save model before exiting
-        torch.save(obj=model.state_dict(), f="model.pth")
-
+    except :
+        pass
 
 if __name__ == "__main__":
     main()

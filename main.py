@@ -50,7 +50,7 @@ print(f"Using device: {device}", flush=True)
 model = _load_model()
 
 total_params = sum(param.numel() for param in model.parameters())
-print(f"Model parameter count: {total_params / 1e6:.2f}M", flush=True)
+print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 
 loss_func = torch.nn.CrossEntropyLoss().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
