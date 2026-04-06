@@ -135,7 +135,7 @@ class MainModel(nn.Module):
         dropout = float(CONFIG["dropout"])
 
         self.token_embedding = nn.Embedding(dict_size, emb_size)
-        self.position_embedding = nn.Embedding(max_length, emb_size)
+        self.position_embedding = nn.Embedding(emb_size, emb_size)
         self.embedding_dropout = nn.Dropout(dropout)
         self.transformers = nn.ModuleList(
             [
