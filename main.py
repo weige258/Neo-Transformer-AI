@@ -119,12 +119,12 @@ def train(ask: str, answer: str = "") -> None:
         try:
             _safe_console_write(TextTokenizer.decode(preview[preview != 0]))
         except Exception as e:
-            print(e)
-        print("", flush=True)
+            print(e, flush=True)
+    
 
     if not answer:
-        print(f"\n---Single text training:\n{ask}")
-        print("\n---Learning tokens:")
+        print(f"\n---Single text training:\n{ask}", flush=True)
+        print("\n---Learning tokens:", flush=True)
 
         text_tensor = TextTokenizer.encode(ask).to(device)
         if text_tensor.numel() == 0:
@@ -147,8 +147,8 @@ def train(ask: str, answer: str = "") -> None:
         _run_train_step(train_tensor, target_mask, preview)
         return
 
-    print(f"\n---Train question:\n{ask}")
-    print("\n---Train answer:")
+    print(f"\n---Train question:\n{ask}", flush=True)
+    print("\n---Train answer:", flush=True)
 
     ask_tensor = TextTokenizer.encode(ask).to(device)
     answer_tensor = TextTokenizer.encode(answer).to(device)
@@ -187,7 +187,7 @@ def generation(text: str) -> str:
     if prompt.numel() > CONFIG["max_length"]:
         prompt = prompt[-CONFIG["max_length"]:]
 
-    print("\n---Generated reply:")
+    print("\n---Generated reply:", flush=True)
 
     end_threshold = random.randint(3, 5)
     end_hits = 0
