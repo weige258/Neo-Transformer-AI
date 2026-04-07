@@ -16,7 +16,7 @@ while True:
         if text != None:
             train(text)
 
-            generation(text)
+            generation(text[0:random.randint(1, len(text))])
         
         training_rounds += 1
         print("*" * 100)
