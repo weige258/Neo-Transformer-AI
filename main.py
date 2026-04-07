@@ -127,9 +127,15 @@ def train(ask: str, answer: str = "") -> None:
         if text_tensor.numel() < 2:
             return
 
-        train_tensor = text_tensor
-        target_mask = torch.ones(text_tensor.numel(), dtype=torch.bool, device=device)
-        preview = text_tensor
+        train_tensor = torch.cat(
+            [
+                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                text_tensor,
+                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+            ]
+        )
+        target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
+        preview = train_tensor
         _run_train_step(train_tensor, target_mask, preview)
         return
 
