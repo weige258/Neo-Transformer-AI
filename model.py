@@ -13,7 +13,8 @@ CONFIG: Dict[str, int | float] = {
     "temperature": 0.8,
     "moe_num_experts": 6,  
     "moe_top_k": 2,        
-    "moe_capacity_factor": 1.25,  
+    "moe_capacity_factor": 1.25,
+    "gradient_accumulation_steps": 4,  # 梯度累积步数，模拟batch_size=4
 }
 
 KVCache = tuple[torch.Tensor, torch.Tensor]

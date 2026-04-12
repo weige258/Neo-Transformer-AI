@@ -59,6 +59,15 @@ print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 loss_func = torch.nn.CrossEntropyLoss().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
 
+# ==================== 梯度累积配置 ====================
+gradient_accumulation_steps = int(CONFIG.get("gradient_accumulation_steps", 1))
+accumulation_counter = 0
+accumulated_loss = 0.0
+
+print(f"Gradient accumulation steps: {gradient_accumulation_steps}", flush=True)
+if gradient_accumulation_steps > 1:
+    print(f"Effective batch size increased by {gradient_accumulation_steps}x for better MoE utilization", flush=True)
+
 # ==================== 学习率调度器配置 ====================
 # 配置总训练步数(根据实际情况调整)
 TOTAL_TRAINING_STEPS = 100000
@@ -104,6 +113,8 @@ def train(ask: str, answer: str = "") -> None:
         target_mask: torch.Tensor,
         preview: torch.Tensor,
     ) -> None:
+        global accumulation_counter, accumulated_loss
+        
         if train_tensor.numel() < 2:
             return
 
@@ -114,7 +125,11 @@ def train(ask: str, answer: str = "") -> None:
             return
 
         model.train()
-        optimizer.zero_grad(set_to_none=True)
+        
+        # 如果不是第一步，不清除梯度（用于累积）
+        should_zero_grad = (accumulation_counter % gradient_accumulation_steps == 0)
+        if should_zero_grad:
+            optimizer.zero_grad(set_to_none=True)
 
         def compute_loss():
             result = model(prompt)
@@ -138,42 +153,59 @@ def train(ask: str, answer: str = "") -> None:
 
             main_loss = loss_func(masked_logits, masked_targets)
             aux_loss_weight = 0.01
-            return main_loss + aux_loss_weight * aux_loss
+            total_loss = main_loss + aux_loss_weight * aux_loss
+            
+            # 梯度累积：将损失除以累积步数
+            if gradient_accumulation_steps > 1:
+                total_loss = total_loss / gradient_accumulation_steps
+            
+            return total_loss
 
         if use_amp:
             with torch.amp.autocast('cuda'):
                 loss = compute_loss()
                 if loss is None:
                     return
-                record_loss(loss.item())
+                record_loss(loss.item() * gradient_accumulation_steps)  # 记录真实loss
+                accumulated_loss += loss.item() * gradient_accumulation_steps
             
             scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss = compute_loss()
             if loss is None:
                 return
             
-            record_loss(loss.item())
+            record_loss(loss.item() * gradient_accumulation_steps)  # 记录真实loss
+            accumulated_loss += loss.item() * gradient_accumulation_steps
             loss.backward()
-            optimizer.step()
         
-        # 更新学习率调度器
-        if current_scheduler_type == 'cosine':
-            cosine_scheduler.step()
-        elif current_scheduler_type == 'plateau':
-            plateau_scheduler.step(loss.item())
+        accumulation_counter += 1
         
-        # 打印当前学习率(每100步打印一次)
-        global _step_counter
-        if not hasattr(_run_train_step, '_step_counter'):
-            _run_train_step._step_counter = 0
-        _run_train_step._step_counter += 1
-        
-        if _run_train_step._step_counter % 100 == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"[LR] Current learning rate: {current_lr:.6f} (scheduler: {current_scheduler_type})", flush=True)
+        # 只在累积足够步数后才更新参数
+        if accumulation_counter % gradient_accumulation_steps == 0:
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            
+            # 更新学习率调度器
+            if current_scheduler_type == 'cosine':
+                cosine_scheduler.step()
+            elif current_scheduler_type == 'plateau':
+                plateau_scheduler.step(accumulated_loss / gradient_accumulation_steps)
+            
+            # 打印当前学习率(每100步打印一次)
+            if not hasattr(_run_train_step, '_step_counter'):
+                _run_train_step._step_counter = 0
+            _run_train_step._step_counter += 1
+            
+            if _run_train_step._step_counter % 100 == 0:
+                current_lr = optimizer.param_groups[0]['lr']
+                avg_loss = accumulated_loss / gradient_accumulation_steps
+                print(f"[LR] Current learning rate: {current_lr:.6f} (scheduler: {current_scheduler_type}, effective_batch={gradient_accumulation_steps})", flush=True)
+            
+            accumulated_loss = 0.0
 
         try:
             print(TextTokenizer.decode(preview[preview != 0]), end="", flush=True)
