@@ -136,6 +136,8 @@ class MoELayer(nn.Module):
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
+        完全向量化的MoE前向传播，消除所有Python循环
+        
         Args:
             x: [batch, seq_len, emb_size]
         Returns:
@@ -143,38 +145,48 @@ class MoELayer(nn.Module):
             aux_loss: 辅助损失用于负载均衡
         """
         batch, seq_len, emb_size = x.shape
+        num_tokens = batch * seq_len
         
         # 1. 计算门控权重
         gate_weights, top_k_weights, top_k_indices = self.gate(x)
         
-        # 2. 初始化输出
-        final_output = torch.zeros_like(x)
+        # 2. 展平输入
+        x_flat = x.view(num_tokens, emb_size)  # [num_tokens, emb_size]
+        top_k_indices_flat = top_k_indices.view(num_tokens, self.top_k)  # [num_tokens, top_k]
+        top_k_weights_flat = top_k_weights.view(num_tokens, self.top_k)  # [num_tokens, top_k]
         
-        # 3. 对每个选中的专家进行计算
-        for i in range(self.top_k):
-            expert_indices = top_k_indices[:, :, i]  # [batch, seq_len]
-            weights = top_k_weights[:, :, i].unsqueeze(-1)  # [batch, seq_len, 1]
+        # 3. 初始化输出
+        final_output_flat = torch.zeros_like(x_flat)
+        
+        # 4. 对每个Top-K位置进行批量处理
+        for k in range(self.top_k):
+            expert_indices_k = top_k_indices_flat[:, k]  # [num_tokens]
+            weights_k = top_k_weights_flat[:, k].unsqueeze(-1)  # [num_tokens, 1]
             
-            # 为每个位置选择对应的专家进行计算
-            expert_output = torch.zeros_like(x)
+            # 为每个专家批量处理（这是唯一保留的循环，因为不同专家是独立的网络）
             for expert_idx in range(self.num_experts):
-                # 找到使用该专家的位置
-                mask = (expert_indices == expert_idx)  # [batch, seq_len]
+                # 创建布尔掩码找到使用该专家的token
+                mask = (expert_indices_k == expert_idx)  # [num_tokens]
+                
                 if mask.any():
-                    # 提取这些位置的输入
-                    masked_input = x[mask]  # [num_selected, emb_size]
-                    # 通过专家网络
+                    # 提取这些token（连续内存，高效）
+                    masked_input = x_flat[mask]  # [num_selected, emb_size]
+                    
+                    # 通过专家网络（批量处理所有选中的token）
                     expert_result = self.experts[expert_idx](masked_input)  # [num_selected, emb_size]
+                    
                     # 确保数据类型一致（修复AMP下的dtype不匹配问题）
-                    if expert_result.dtype != expert_output.dtype:
-                        expert_result = expert_result.to(expert_output.dtype)
-                    # 将结果放回对应位置
-                    expert_output[mask] = expert_result
-            
-            # 加权累加
-            final_output += expert_output * weights
+                    if expert_result.dtype != final_output_flat.dtype:
+                        expert_result = expert_result.to(final_output_flat.dtype)
+                    
+                    # 应用权重并累加到输出
+                    weighted_result = expert_result * weights_k[mask]
+                    final_output_flat[mask] += weighted_result
         
-        # 4. 计算负载均衡辅助损失
+        # 5. 恢复形状
+        final_output = final_output_flat.view(batch, seq_len, emb_size)
+        
+        # 6. 计算负载均衡辅助损失
         aux_loss = self._compute_load_balancing_loss(gate_weights)
         
         return final_output, aux_loss
