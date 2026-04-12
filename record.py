@@ -100,3 +100,11 @@ def record_loss(loss: float):
             
     except Exception as e:
         print(f"记录损失失败: {e}")
+
+def get_loss() -> float:
+    """返回当前平均loss，如果分母是0就返回10"""
+    global total_loss, record_count
+    if record_count > 0:
+        return total_loss / record_count
+    else:
+        return 10.0

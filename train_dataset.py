@@ -4,6 +4,7 @@ import random
 import logging
 from typing import List, Tuple
 from main import train, generation, model, optimizer
+from record import get_loss
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -137,9 +138,10 @@ def main() -> None:
             # Train on this pair
             try:
                 train(prompt, response)
-                
-                # Generate response to see the progress
-                generation(prompt)
+                    
+                if(get_loss()<2.0):
+                    # Generate response to see the progress
+                    generation(prompt)
                 
                 training_rounds += 1
                 
@@ -154,7 +156,6 @@ def main() -> None:
                     if len(recent_losses) > loss_window_size:
                         recent_losses.pop(0)
                 
-                print(f"[Training Round {training_rounds}] Current Learning Rate: {current_lr:.6f}")
                 print("*" * 100)
 
                 # Save model periodically

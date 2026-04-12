@@ -45,7 +45,12 @@ def _load_model() -> MainModel:
         return model
 
 
+# 启用自动混合精度训练
+scaler = torch.amp.GradScaler('cuda')
+use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 7
+
 print(f"Using device: {device}", flush=True)
+print(f"AMP enabled: {use_amp}", flush=True)
 model = _load_model()
 
 total_params = sum(param.numel() for param in model.parameters())
@@ -110,34 +115,49 @@ def train(ask: str, answer: str = "") -> None:
 
         model.train()
         optimizer.zero_grad(set_to_none=True)
-        
-        # 前向传播,获取logits和辅助损失
-        result = model(prompt)
-        if isinstance(result, tuple):
-            logits, aux_loss = result
-        else:
-            logits = result
-            aux_loss = torch.tensor(0.0, device=device)
+
+        def compute_loss():
+            result = model(prompt)
+            if isinstance(result, tuple):
+                logits, aux_loss = result
+            else:
+                logits = result
+                aux_loss = torch.tensor(0.0, device=device)
+
+            if logits.dim() == 1:
+                logits = logits.unsqueeze(0)
+
+            masked_logits = logits[loss_mask]
+            masked_targets = targets[loss_mask]
+            if masked_targets.numel() == 0:
+                return None
             
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
+            if masked_logits.dim() == 1:
+                masked_logits = masked_logits.unsqueeze(0)
+                masked_targets = masked_targets.unsqueeze(0)
 
-        masked_logits = logits[loss_mask]
-        masked_targets = targets[loss_mask]
-        if masked_targets.numel() == 0:
-            return
-        if masked_logits.dim() == 1:
-            masked_logits = masked_logits.unsqueeze(0)
-            masked_targets = masked_targets.unsqueeze(0)
+            main_loss = loss_func(masked_logits, masked_targets)
+            aux_loss_weight = 0.01
+            return main_loss + aux_loss_weight * aux_loss
 
-        # 主损失 + 辅助损失(MoE负载均衡)
-        main_loss = loss_func(masked_logits, masked_targets)
-        aux_loss_weight = 0.01  # 辅助损失权重
-        loss = main_loss + aux_loss_weight * aux_loss
-        
-        record_loss(loss.item())
-        loss.backward()
-        optimizer.step()
+        if use_amp:
+            with torch.amp.autocast('cuda'):
+                loss = compute_loss()
+                if loss is None:
+                    return
+                record_loss(loss.item())
+            
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss = compute_loss()
+            if loss is None:
+                return
+            
+            record_loss(loss.item())
+            loss.backward()
+            optimizer.step()
         
         # 更新学习率调度器
         if current_scheduler_type == 'cosine':

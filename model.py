@@ -6,12 +6,12 @@ from torch import nn
 
 CONFIG: Dict[str, int | float] = {
     "dict_size": 60000,
-    "emb_size": 512,
-    "num_heads": 16,
-    "num_layers": 16,
+    "emb_size": 256,
+    "num_heads": 8,
+    "num_layers": 8,
     "dropout": 0.1,
     "temperature": 0.8,
-    "moe_num_experts": 8,  
+    "moe_num_experts": 6,  
     "moe_top_k": 2,        
     "moe_capacity_factor": 1.25,  
 }
@@ -165,6 +165,9 @@ class MoELayer(nn.Module):
                     masked_input = x[mask]  # [num_selected, emb_size]
                     # 通过专家网络
                     expert_result = self.experts[expert_idx](masked_input)  # [num_selected, emb_size]
+                    # 确保数据类型一致（修复AMP下的dtype不匹配问题）
+                    if expert_result.dtype != expert_output.dtype:
+                        expert_result = expert_result.to(expert_output.dtype)
                     # 将结果放回对应位置
                     expert_output[mask] = expert_result
             
