@@ -57,7 +57,7 @@ total_params = sum(param.numel() for param in model.parameters())
 print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 
 loss_func = torch.nn.CrossEntropyLoss().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
 
 # ==================== 梯度累积配置 ====================
 gradient_accumulation_steps = int(CONFIG.get("gradient_accumulation_steps", 1))
@@ -99,15 +99,7 @@ print(f"  - ReduceLROnPlateau: factor=0.5, patience={PATIENCE}, min_lr={MIN_LR}"
 print(f"  - Current scheduler: {current_scheduler_type}", flush=True)
 
 
-@overload
-def train(ask: str, answer: str) -> None: ...
-
-
-@overload
-def train(text: str) -> None: ...
-
-
-def train(ask: str, answer: str = "") -> None:
+def train(ask: str = None, answer: str = None, history_context: str = None) -> None:
     def _run_train_step(
         train_tensor: torch.Tensor,
         target_mask: torch.Tensor,
@@ -213,11 +205,14 @@ def train(ask: str, answer: str = "") -> None:
             print(e, flush=True)
         print("", flush=True)
 
-    if not answer:
-        print(f"\n---Single text training:\n{ask}", flush=True)
+    if ask is None and answer is None:
+        return
+    
+    if ask is None:
+        print(f"\n---Single text training:\n{answer}", flush=True)
         print("\n---Learning tokens:", flush=True)
 
-        text_tensor = TextTokenizer.encode(ask).to(device)
+        text_tensor = TextTokenizer.encode(answer).to(device)
         if text_tensor.numel() < 2:
             return
 
@@ -241,27 +236,56 @@ def train(ask: str, answer: str = "") -> None:
     if answer_tensor.numel() == 0:
         return
 
-    train_tensor = torch.cat(
-        [
-            ask_tensor,
-            torch.tensor([TextTokenizer.START_TOKEN], device=device),
-            answer_tensor,
-            torch.tensor([TextTokenizer.END_TOKEN], device=device),
-        ]
-    )
-    target_mask = torch.cat(
-        [
-            torch.zeros(ask_tensor.numel() + 1, dtype=torch.bool, device=device),
-            torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
-        ]
-    )
-    preview = torch.cat(
-        [answer_tensor, torch.tensor([TextTokenizer.END_TOKEN], device=device)]
-    )
+    if history_context is not None and history_context.strip():
+        history_tensor = TextTokenizer.encode(history_context).to(device)
+        train_tensor = torch.cat(
+            [
+                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                history_tensor,
+                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+                torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
+                ask_tensor,
+                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                answer_tensor,
+                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+            ]
+        )
+        target_mask = torch.cat(
+            [
+                torch.zeros(ask_tensor.numel() + 1, dtype=torch.bool, device=device),
+                torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
+            ]
+        )
+        history_mask_len = 1 + history_tensor.numel() + 1
+        target_mask = torch.cat([
+            torch.zeros(history_mask_len, dtype=torch.bool, device=device),
+            target_mask
+        ])
+        preview = torch.cat(
+            [answer_tensor, torch.tensor([TextTokenizer.END_TOKEN], device=device)]
+        )
+    else:
+        train_tensor = torch.cat(
+            [
+                ask_tensor,
+                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                answer_tensor,
+                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+            ]
+        )
+        target_mask = torch.cat(
+            [
+                torch.zeros(ask_tensor.numel() + 1, dtype=torch.bool, device=device),
+                torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
+            ]
+        )
+        preview = torch.cat(
+            [answer_tensor, torch.tensor([TextTokenizer.END_TOKEN], device=device)]
+        )
     _run_train_step(train_tensor, target_mask, preview)
 
 
-def generation(text: str, max_generate_tokens: int = 256) -> str:
+def generation(text: str, max_generate_tokens: int|None = None) -> str:
     model.eval()
     output_text = ""
 
@@ -275,8 +299,9 @@ def generation(text: str, max_generate_tokens: int = 256) -> str:
     print("\n---Generated reply:", flush=True)
 
     min_new_tokens = 1
-    max_generate_tokens = max(1, int(max_generate_tokens))
-
+    if max_generate_tokens is not None:
+        max_generate_tokens = max(1, int(max_generate_tokens))
+ 
     with torch.inference_mode():
         # 推理时不需要辅助损失
         result = model(prompt, use_cache=True)
@@ -288,7 +313,8 @@ def generation(text: str, max_generate_tokens: int = 256) -> str:
         else:
             logits = result
 
-        for step in range(max_generate_tokens):
+        step = 0
+        while max_generate_tokens is None or step < max_generate_tokens:
             try:
                 next_logits = logits[-1]
                 if step < min_new_tokens:
@@ -322,9 +348,12 @@ def generation(text: str, max_generate_tokens: int = 256) -> str:
                         logits, past_key_values = result
                 else:
                     logits = result
+                
+                step += 1
             except Exception as e:
-                print(e, flush=True)
-    return output_text
+                print(f"Error during generation: {e}", flush=True)
+                break
+        return output_text
 
 
 def switch_scheduler(scheduler_type: str = 'cosine'):

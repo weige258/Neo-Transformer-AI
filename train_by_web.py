@@ -3,6 +3,7 @@ import random
 import logging
 from main import train, generation, model
 from crawler import WebCrawler
+from record import get_loss
 
 crawler = WebCrawler()
 
@@ -16,7 +17,9 @@ while True:
         if text != None:
             train(text)
 
-            generation(text[0:random.randint(1, len(text))])
+            if(get_loss()<2.0):
+                    # Generate response to see the progress
+                    generation(text)
         
         training_rounds += 1
         print("*" * 100)

@@ -20,15 +20,17 @@ class Tokenizer:
 class TextTokenizer(Tokenizer):
     UNKNOWN_TOKEN = 0
     START_TOKEN = 1
-    END_TOKEN = int(CONFIG["dict_size"]) - 1
-    THINK_TOKEN = 2
-    THINK_END_TOKEN = 3
+    END_TOKEN = 2
+    HISTORY_CONTEXT_START_TOKEN = 3
+    HISTORY_CONTEXT_END_TOKEN = 4
+    THINK_START_TOKEN = 5
+    THINK_END_TOKEN = 6
     _SURROGATE_START = 0xD800
     _SURROGATE_END = 0xDFFF
 
     @staticmethod
     def _is_valid_token(idx: int) -> bool:
-        if idx <= 0 or idx >= TextTokenizer.END_TOKEN:
+        if idx <= 0:
             return False
         return not (TextTokenizer._SURROGATE_START <= idx <= TextTokenizer._SURROGATE_END)
 
@@ -48,7 +50,7 @@ class TextTokenizer(Tokenizer):
         text: list[str] = []
         for idx in tokens:
             idx_int = int(idx)
-            if idx_int in (TextTokenizer.UNKNOWN_TOKEN, TextTokenizer.START_TOKEN, TextTokenizer.END_TOKEN, TextTokenizer.THINK_TOKEN, TextTokenizer.THINK_END_TOKEN):
+            if idx_int in (TextTokenizer.UNKNOWN_TOKEN, TextTokenizer.START_TOKEN, TextTokenizer.END_TOKEN, TextTokenizer.HISTORY_CONTEXT_START_TOKEN, TextTokenizer.HISTORY_CONTEXT_END_TOKEN, TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN):
                 continue
             if not TextTokenizer._is_valid_token(idx_int):
                 continue

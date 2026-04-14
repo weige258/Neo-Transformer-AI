@@ -137,7 +137,7 @@ class MoELayer(nn.Module):
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        完全向量化的MoE前向传播，消除所有Python循环
+        使用Masked Parallelism的MoE前向传播，彻底消除Python循环
         
         Args:
             x: [batch, seq_len, emb_size]
@@ -156,38 +156,33 @@ class MoELayer(nn.Module):
         top_k_indices_flat = top_k_indices.view(num_tokens, self.top_k)  # [num_tokens, top_k]
         top_k_weights_flat = top_k_weights.view(num_tokens, self.top_k)  # [num_tokens, top_k]
         
-        # 3. 初始化输出
+        # 3. 【核心优化】批量调用所有专家，生成 [num_experts, num_tokens, emb_size]
+        # 这样GPU可以并行处理所有专家的计算
+        expert_outputs = torch.stack([expert(x_flat) for expert in self.experts])  # [num_experts, num_tokens, emb_size]
+        
+        # 确保数据类型一致（修复AMP下的dtype不匹配问题）
+        if expert_outputs.dtype != x_flat.dtype:
+            expert_outputs = expert_outputs.to(x_flat.dtype)
+        
+        # 4. 初始化输出
         final_output_flat = torch.zeros_like(x_flat)
         
-        # 4. 对每个Top-K位置进行批量处理
+        # 5. 只对Top-K进行聚合（循环次数从num_experts降到top_k，通常k=2）
         for k in range(self.top_k):
             expert_indices_k = top_k_indices_flat[:, k]  # [num_tokens]
             weights_k = top_k_weights_flat[:, k].unsqueeze(-1)  # [num_tokens, 1]
             
-            # 为每个专家批量处理（这是唯一保留的循环，因为不同专家是独立的网络）
-            for expert_idx in range(self.num_experts):
-                # 创建布尔掩码找到使用该专家的token
-                mask = (expert_indices_k == expert_idx)  # [num_tokens]
-                
-                if mask.any():
-                    # 提取这些token（连续内存，高效）
-                    masked_input = x_flat[mask]  # [num_selected, emb_size]
-                    
-                    # 通过专家网络（批量处理所有选中的token）
-                    expert_result = self.experts[expert_idx](masked_input)  # [num_selected, emb_size]
-                    
-                    # 确保数据类型一致（修复AMP下的dtype不匹配问题）
-                    if expert_result.dtype != final_output_flat.dtype:
-                        expert_result = expert_result.to(final_output_flat.dtype)
-                    
-                    # 应用权重并累加到输出
-                    weighted_result = expert_result * weights_k[mask]
-                    final_output_flat[mask] += weighted_result
+            # 使用高级索引提取对应专家的输出
+            batch_indices = torch.arange(num_tokens, device=x.device)
+            selected_expert_output = expert_outputs[expert_indices_k, batch_indices]  # [num_tokens, emb_size]
+            
+            # 加权累加
+            final_output_flat += weights_k * selected_expert_output
         
-        # 5. 恢复形状
+        # 6. 恢复形状
         final_output = final_output_flat.view(batch, seq_len, emb_size)
         
-        # 6. 计算负载均衡辅助损失
+        # 7. 计算负载均衡辅助损失
         aux_loss = self._compute_load_balancing_loss(gate_weights)
         
         return final_output, aux_loss
