@@ -57,7 +57,7 @@ total_params = sum(param.numel() for param in model.parameters())
 print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 
 loss_func = torch.nn.CrossEntropyLoss().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.01)
+optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
 
 # ==================== 梯度累积配置 ====================
 gradient_accumulation_steps = int(CONFIG.get("gradient_accumulation_steps", 1))
@@ -319,7 +319,7 @@ def generation(text: str, max_generate_tokens: int|None = None) -> str:
                 next_logits = logits[-1]
                 if step < min_new_tokens:
                     next_logits = next_logits.clone()
-                    next_logits[TextTokenizer.END_TOKEN] = float("-inf")
+                    next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
 
                 probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
                 index = int(torch.multinomial(probs, 1).item())

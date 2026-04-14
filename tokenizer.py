@@ -37,12 +37,20 @@ class TextTokenizer(Tokenizer):
     @staticmethod
     def encode(text: str) -> torch.Tensor:
         tensor: list[int] = []
+        dict_size = int(CONFIG["dict_size"])  # 获取词表大小
+        
         for letter in text:
             idx = ord(letter)
-            if TextTokenizer._is_valid_token(idx):
+            # 关键修复：任何超出词表大小或无效的字符都映射为UNKNOWN_TOKEN
+            if TextTokenizer._is_valid_token(idx) and 0 <= idx < dict_size:
                 tensor.append(idx)
             else:
-                tensor.append(TextTokenizer.UNKNOWN_TOKEN)
+                tensor.append(TextTokenizer.UNKNOWN_TOKEN)  # 映射为0
+        
+        # 防止空序列
+        if len(tensor) == 0:
+            tensor = [TextTokenizer.UNKNOWN_TOKEN]
+        
         return torch.tensor(tensor, dtype=torch.long)
 
     @staticmethod
