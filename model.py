@@ -183,19 +183,32 @@ class MoELayer(nn.Module):
         final_output = final_output_flat.view(batch, seq_len, emb_size)
         
         # 7. 计算负载均衡辅助损失
-        aux_loss = self._compute_load_balancing_loss(gate_weights)
+        aux_loss = self._compute_load_balancing_loss(gate_weights, top_k_indices)
         
         return final_output, aux_loss
     
-    def _compute_load_balancing_loss(self, gate_weights: torch.Tensor) -> torch.Tensor:
+    def _compute_load_balancing_loss(self, gate_weights: torch.Tensor, top_k_indices: torch.Tensor) -> torch.Tensor:
         """
         计算负载均衡损失,确保所有专家被均匀使用
         """
-        # 计算每个专家的平均激活概率
+        # 计算每个专家的平均激活概率（重要性）
         importance = gate_weights.mean(dim=[0, 1])  # [num_experts]
         
-        # 计算负载(每个专家处理的token比例)
-        load = (gate_weights > 0).float().mean(dim=[0, 1])  # [num_experts]
+        # 修复：基于top_k_indices计算实际负载（每个专家被选中的比例）
+        batch, seq_len = top_k_indices.shape[:2]
+        num_tokens = batch * seq_len
+        
+        # 展平top_k_indices
+        top_k_indices_flat = top_k_indices.view(num_tokens, self.top_k)
+        
+        # 计算每个专家被选中的次数
+        load = torch.zeros(self.num_experts, device=gate_weights.device)
+        for k in range(self.top_k):
+            load.scatter_add_(0, top_k_indices_flat[:, k], 
+                              torch.ones(num_tokens, device=gate_weights.device))
+        
+        # 归一化为比例
+        load = load / num_tokens  # [num_experts]
         
         # 负载均衡损失 = 重要性与负载的点积 * 专家数
         loss = self.num_experts * torch.sum(importance * load)

@@ -46,7 +46,7 @@ def _load_model() -> MainModel:
 
 
 # 启用自动混合精度训练
-scaler = torch.amp.GradScaler('cuda')
+scaler = torch.amp.GradScaler()
 use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 7
 
 print(f"Using device: {device}", flush=True)
