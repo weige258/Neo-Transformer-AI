@@ -218,9 +218,9 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
 
         train_tensor = torch.cat(
             [
-                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
                 text_tensor,
-                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
             ]
         )
         target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
@@ -240,14 +240,14 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
         history_tensor = TextTokenizer.encode(history_context).to(device)
         train_tensor = torch.cat(
             [
-                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
                 history_tensor,
-                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
                 torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
                 ask_tensor,
-                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
                 answer_tensor,
-                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
             ]
         )
         target_mask = torch.cat(
@@ -262,15 +262,15 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
             target_mask
         ])
         preview = torch.cat(
-            [answer_tensor, torch.tensor([TextTokenizer.END_TOKEN], device=device)]
+            [answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device)]
         )
     else:
         train_tensor = torch.cat(
             [
                 ask_tensor,
-                torch.tensor([TextTokenizer.START_TOKEN], device=device),
+                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
                 answer_tensor,
-                torch.tensor([TextTokenizer.END_TOKEN], device=device),
+                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
             ]
         )
         target_mask = torch.cat(
@@ -280,7 +280,7 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
             ]
         )
         preview = torch.cat(
-            [answer_tensor, torch.tensor([TextTokenizer.END_TOKEN], device=device)]
+            [answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device)]
         )
     _run_train_step(train_tensor, target_mask, preview)
 
@@ -292,7 +292,7 @@ def generation(text: str, max_generate_tokens: int|None = None) -> str:
     prompt = torch.cat(
         [
             TextTokenizer.encode(text).to(device),
-            torch.tensor([TextTokenizer.START_TOKEN], device=device),
+            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
         ]
     )
 
@@ -324,7 +324,7 @@ def generation(text: str, max_generate_tokens: int|None = None) -> str:
                 probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
                 index = int(torch.multinomial(probs, 1).item())
 
-                if index == TextTokenizer.END_TOKEN:
+                if index == TextTokenizer.END_GENERATION_TOKEN:
                     break
 
                 decoded_piece = TextTokenizer.decode(torch.tensor([index]))
