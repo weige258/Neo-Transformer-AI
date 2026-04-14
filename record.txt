@@ -70,3 +70,10 @@
 <system_time>2026/04/14 16:05:04</system_time><time>18:48:44</time><avg_loss>3.203654</avg_loss>
 <system_time>2026/04/14 16:23:29</system_time><time>19:06:49</time><avg_loss>3.119246</avg_loss>
 <system_time>2026/04/14 16:40:05</system_time><time>19:23:03</time><avg_loss>3.176424</avg_loss>
+<system_time>2026/04/14 18:33:08</system_time><time>19:36:52</time><avg_loss>2.963986</avg_loss>
+<system_time>2026/04/14 18:48:49</system_time><time>19:52:07</time><avg_loss>2.933511</avg_loss>
+<system_time>2026/04/14 19:05:06</system_time><time>20:08:03</time><avg_loss>2.951856</avg_loss>
+<system_time>2026/04/14 19:25:22</system_time><time>20:27:55</time><avg_loss>2.930985</avg_loss>
+<system_time>2026/04/14 19:41:12</system_time><time>20:43:24</time><avg_loss>2.893858</avg_loss>
+<system_time>2026/04/14 19:56:04</system_time><time>20:57:52</time><avg_loss>2.957585</avg_loss>
+<system_time>2026/04/14 20:12:34</system_time><time>21:13:58</time><avg_loss>2.897088</avg_loss>

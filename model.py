@@ -2,6 +2,7 @@ from typing import Dict
 
 import torch
 from torch import nn
+import torch.utils.checkpoint as checkpoint
 
 
 CONFIG: Dict[str, int | float] = {
@@ -137,7 +138,7 @@ class MoELayer(nn.Module):
     
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        使用Masked Parallelism的MoE前向传播，彻底消除Python循环
+        使用完全向量化的MoE前向传播，彻底消除Python循环
         
         Args:
             x: [batch, seq_len, emb_size]
@@ -156,28 +157,28 @@ class MoELayer(nn.Module):
         top_k_indices_flat = top_k_indices.view(num_tokens, self.top_k)  # [num_tokens, top_k]
         top_k_weights_flat = top_k_weights.view(num_tokens, self.top_k)  # [num_tokens, top_k]
         
-        # 3. 【核心优化】批量调用所有专家，生成 [num_experts, num_tokens, emb_size]
-        # 这样GPU可以并行处理所有专家的计算
+        # 3. 【核心优化】批量并行调用所有专家，生成 [num_experts, num_tokens, emb_size]
+        # 使用torch.stack批量处理，GPU自动并行化
         expert_outputs = torch.stack([expert(x_flat) for expert in self.experts])  # [num_experts, num_tokens, emb_size]
         
         # 确保数据类型一致（修复AMP下的dtype不匹配问题）
         if expert_outputs.dtype != x_flat.dtype:
             expert_outputs = expert_outputs.to(x_flat.dtype)
         
-        # 4. 初始化输出
-        final_output_flat = torch.zeros_like(x_flat)
+        # 4. 【向量化聚合】使用einsum替代for循环
+        # 构建one-hot选择矩阵：[num_tokens, num_experts]
+        one_hot_selection = torch.zeros(num_tokens, self.num_experts, device=x.device)
+        one_hot_selection.scatter_(1, top_k_indices_flat, 1.0)  # 对每个token的top-k专家位置设为1
         
-        # 5. 只对Top-K进行聚合（循环次数从num_experts降到top_k，通常k=2）
-        for k in range(self.top_k):
-            expert_indices_k = top_k_indices_flat[:, k]  # [num_tokens]
-            weights_k = top_k_weights_flat[:, k].unsqueeze(-1)  # [num_tokens, 1]
-            
-            # 使用高级索引提取对应专家的输出
-            batch_indices = torch.arange(num_tokens, device=x.device)
-            selected_expert_output = expert_outputs[expert_indices_k, batch_indices]  # [num_tokens, emb_size]
-            
-            # 加权累加
-            final_output_flat += weights_k * selected_expert_output
+        # 加权选择：将top_k权重分散到对应专家位置
+        weighted_selection = torch.zeros(num_tokens, self.num_experts, device=x.device)
+        weighted_selection.scatter_add_(1, top_k_indices_flat, top_k_weights_flat)
+        
+        # 5. 使用einsum进行批量加权求和
+        # expert_outputs: [num_experts, num_tokens, emb_size]
+        # weighted_selection: [num_tokens, num_experts]
+        # 结果: [num_tokens, emb_size]
+        final_output_flat = torch.einsum('nte,tn->te', expert_outputs, weighted_selection)
         
         # 6. 恢复形状
         final_output = final_output_flat.view(batch, seq_len, emb_size)
@@ -317,12 +318,8 @@ class TransformerBlock(nn.Module):
         top_k = int(CONFIG.get("moe_top_k", 2))
         self.feed_forward = MoELayer(emb_size, num_experts, top_k, dropout)
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        past_key_value: KVCache | None = None,
-        use_cache: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, KVCache, torch.Tensor]:
+    def _forward_impl(self, x: torch.Tensor, past_key_value: KVCache | None = None, use_cache: bool = False):
+        """实际的前向传播实现"""
         attn_output = self.attention(
             self.rms_norm1(x),
             past_key_value=past_key_value,
@@ -344,6 +341,28 @@ class TransformerBlock(nn.Module):
         if use_cache:
             return x, present_key_value, aux_loss
         return x, aux_loss
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_key_value: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCache, torch.Tensor]:
+        """
+        使用梯度检查点的前向传播，训练时节省显存
+        """
+        # 只在训练且不使用cache时使用checkpoint
+        if self.training and not use_cache:
+            # checkpoint需要保存输入以便反向传播时重新计算
+            return checkpoint.checkpoint(
+                self._forward_impl, 
+                x, 
+                past_key_value, 
+                use_cache,
+                use_reentrant=False  # 推荐使用非reentrant模式
+            )
+        else:
+            return self._forward_impl(x, past_key_value, use_cache)
 
 
 class MainModel(nn.Module):
