@@ -7,20 +7,19 @@ import torch.utils.checkpoint as checkpoint
 
 CONFIG: Dict[str, int | float] = {
     "dict_size": 60000,
-    "emb_size": 384,
+    "emb_size": 512,
     "num_heads": 8,
     "num_layers_global": 6,   # 全局Transformer层数
     "num_layers_dynamic": 10, # 动态窗口层数
     "dropout": 0.1,
     "temperature": 0.8,
-    "gradient_accumulation_steps": 4,
     # 动态Token选择配置
-    "dynamic_token_top_k_ratio": 0.3,  # 降低到0.2，减少全局注意力计算量，节省显存
-    "attention_sink_tokens": 4,         # StreamingLLM注意力锚点数量
+    "dynamic_token_top_k_ratio": 0.3,
+    "attention_sink_tokens": 4,
     # 动态窗口配置（针对6GB显存优化）
-    "min_window_size": 256,              # 降低最小窗口，简单文本更省显存
-    "max_window_size": 1024,             # 降低最大窗口，防止长序列OOM
-    "window_complexity_threshold": 0.5, # 复杂度阈值
+    "min_window_size": 256,
+    "max_window_size": 1024,
+    "window_complexity_threshold": 0.5,
 }
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
@@ -121,8 +120,15 @@ class VariableDimAdaptiveFFN(nn.Module):
         up = self.up_proj(x)  # [batch, seq_len, max_ffn_size]
         hidden = gate * up
         
-        # 3. 添加残差缩放因子，防止梯度爆炸
-        hidden = hidden * (self.emb_size / self.max_ffn_size) ** 0.5
+        # 【修复】移除不稳定的缩放因子,改用LayerNorm稳定化
+        # hidden = hidden * (self.emb_size / self.max_ffn_size) ** 0.5  # 删除这行
+        
+        # 【新增】添加LayerNorm防止梯度爆炸
+        hidden = torch.nn.functional.layer_norm(hidden, hidden.shape[-1:])
+        
+        # 【新增】添加数值稳定性检查
+        if not torch.isfinite(hidden).all():
+            hidden = torch.nan_to_num(hidden, nan=0.0, posinf=1e5, neginf=-1e5)
         
         # 4. 输出投影
         down = self.down_proj(hidden)  # [batch, seq_len, emb_size]
@@ -362,8 +368,8 @@ class AdaptiveWindowAttention(nn.Module):
         # 因果掩码：不能关注未来的tokens
         causal_mask = rel_positions >= 0
         
-        # 组合掩码
-        combined_mask = window_mask & causal_mask
+        # 组合掩码：取反，因为masked_fill是用value填充mask为True的位置
+        combined_mask = ~(window_mask & causal_mask)
         
         # 应用掩码
         attn_scores = attn_scores.masked_fill(
@@ -455,7 +461,7 @@ class GlobalTransformerBlock(nn.Module):
         self.attention = CausalSelfAttention(emb_size, num_heads, dropout)
         self.feed_forward = VariableDimAdaptiveFFN(emb_size, dropout)
         
-        # 动态Token选择器
+        # 动态Token选择器 - 【修复】现在真正被使用了
         self.token_selector = DynamicTokenSelector(
             top_k_ratio=top_k_ratio,
             sink_tokens=int(CONFIG.get("attention_sink_tokens", 4))
@@ -468,21 +474,49 @@ class GlobalTransformerBlock(nn.Module):
         past_key_value: KVCache | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
-        # 计算Token重要性分数
+        batch, seq_len, emb_size = x.shape
+        
+        # 【修复】计算Token重要性分数并选择Top-K tokens
         importance_scores = self.importance_scorer(x)  # [batch, seq_len]
         
-        # 标准注意力（所有tokens）
-        attn_output = self.attention(
-            self.rms_norm1(x),
-            past_key_value=past_key_value,
-            use_cache=use_cache,
-        )
-        
-        if use_cache:
-            attention_output, present_key_value = attn_output
+        # 【修复】动态选择重要tokens
+        if seq_len > 50:  # 只在序列较长时启用token选择
+            selected_x, selected_indices, mask = self.token_selector.select_tokens(x, importance_scores)
+            
+            # 对选中的tokens进行注意力计算
+            attn_output_selected = self.attention(
+                self.rms_norm1(selected_x),
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+            )
+            
+            if use_cache:
+                attention_output_selected, present_key_value = attn_output_selected
+            else:
+                attention_output_selected = attn_output_selected
+                present_key_value = None
+            
+            # 【修复】将选中的tokens的注意力输出还原到完整序列
+            # 确保数据类型一致，防止scatter_报错
+            attention_output = torch.zeros_like(x)
+            attention_output.scatter_(
+                1,
+                selected_indices.unsqueeze(-1).expand(-1, -1, emb_size),
+                attention_output_selected.to(attention_output.dtype)  # 显式转换dtype
+            )
         else:
-            attention_output = attn_output
-            present_key_value = None
+            # 短序列直接使用标准注意力
+            attn_output = self.attention(
+                self.rms_norm1(x),
+                past_key_value=past_key_value,
+                use_cache=use_cache,
+            )
+            
+            if use_cache:
+                attention_output, present_key_value = attn_output
+            else:
+                attention_output = attn_output
+                present_key_value = None
         
         x = x + attention_output
         
@@ -717,6 +751,10 @@ class MainModel(nn.Module):
                 next_key_values.append(present_key_value)
             else:
                 x = block(x)
+            
+            # 【新增】添加数值稳定性检查
+            if not torch.isfinite(x).all():
+                x = torch.nan_to_num(x, nan=0.0, posinf=1e5, neginf=-1e5)
 
         x = self.final_norm(x)
         logits = self.output_linear(x)
