@@ -7,7 +7,7 @@ import torch.utils.checkpoint as checkpoint
 
 CONFIG: Dict[str, int | float] = {
     "dict_size": 60000,
-    "emb_size": 512,
+    "emb_size": 384,
     "num_heads": 8,
     "num_layers_global": 6,   # 全局Transformer层数
     "num_layers_dynamic": 10, # 动态窗口层数
@@ -15,11 +15,11 @@ CONFIG: Dict[str, int | float] = {
     "temperature": 0.8,
     "gradient_accumulation_steps": 4,
     # 动态Token选择配置
-    "dynamic_token_top_k_ratio": 0.3,  # 保留Top-K重要token的比例
+    "dynamic_token_top_k_ratio": 0.3,  # 降低到0.2，减少全局注意力计算量，节省显存
     "attention_sink_tokens": 4,         # StreamingLLM注意力锚点数量
-    # 动态窗口配置
-    "min_window_size": 64,              # 最小窗口大小
-    "max_window_size": 256,             # 最大窗口大小
+    # 动态窗口配置（针对6GB显存优化）
+    "min_window_size": 256,              # 降低最小窗口，简单文本更省显存
+    "max_window_size": 1024,             # 降低最大窗口，防止长序列OOM
     "window_complexity_threshold": 0.5, # 复杂度阈值
 }
 
