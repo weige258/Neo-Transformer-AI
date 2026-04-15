@@ -7,7 +7,7 @@ import torch.utils.checkpoint as checkpoint
 
 CONFIG: Dict[str, int | float] = {
     "dict_size": 60000,
-    "emb_size": 512,
+    "emb_size": 384,
     "num_heads": 8,
     "num_layers_global": 6,   # 全局Transformer层数
     "num_layers_dynamic": 10, # 动态窗口层数

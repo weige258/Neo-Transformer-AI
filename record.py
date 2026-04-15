@@ -56,7 +56,7 @@ def load_run_time():
                     time_str = last_line[time_start:time_end]
                     running_time = hours_minutes_seconds_to_seconds(time_str)
     except Exception as e:
-        print(f"加载运行时间失败: {e}")
+        print(f"加载运行时间失败: {e}", flush=True)
         running_time = 0
 
 
@@ -96,10 +96,10 @@ def record_loss(loss: float):
             # Reset counters
             total_loss = 0
             record_count = 0
-            print(f"记录损失 - 系统时间: {system_time}, 运行时间: {time_str}, 平均损失: {avg_loss:.6f}")
+            print(f"记录损失 - 系统时间: {system_time}, 运行时间: {time_str}, 平均损失: {avg_loss:.6f}", flush=True)
             
     except Exception as e:
-        print(f"记录损失失败: {e}")
+        print(f"记录损失失败: {e}", flush=True)
 
 def get_loss() -> float:
     """返回当前平均loss，如果分母是0就返回10"""

@@ -22,7 +22,7 @@ while True:
                     generation(text)
         
         training_rounds += 1
-        print("*" * 100)
+        print("*" * 100, flush=True)
 
         # Save model periodically
         if training_rounds % save_interval == 0:

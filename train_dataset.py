@@ -156,7 +156,7 @@ def main() -> None:
                     if len(recent_losses) > loss_window_size:
                         recent_losses.pop(0)
                 
-                print("*" * 100)
+                print("*" * 100, flush=True)
 
                 # Save model periodically
                 if training_rounds % save_interval == 0:
