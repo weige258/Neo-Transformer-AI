@@ -112,25 +112,19 @@ class VariableDimAdaptiveFFN(nn.Module):
         """
         batch, seq_len, emb_size = x.shape
         
-        # 1. 计算自适应维度比例
-        # 对序列维度取平均，得到每个样本的复杂度表示
+        # 1. 计算自适应维度比例（增加数值稳定性）
         x_mean = x.mean(dim=1)  # [batch, emb_size]
         dim_ratio = self.dim_predictor(x_mean)  # [batch, 1]
         
-        # 2. 计算实际使用的FFN尺寸
-        # 在 [base_ffn_size * (1-range), base_ffn_size * (1+range)] 范围内调整
-        min_ratio = 1.0 - self.adaptive_range
-        max_ratio = 1.0 + self.adaptive_range
-        actual_ratio = min_ratio + dim_ratio * (max_ratio - min_ratio)  # [batch, 1]
-        actual_ffn_size = (self.base_ffn_size * actual_ratio).int().clamp(min=16, max=self.max_ffn_size)
-        
-        # 3. 应用SwiGLU激活（使用完整维度）
+        # 2. 应用SwiGLU激活（使用完整维度）
         gate = torch.nn.functional.silu(self.gate_proj(x))  # [batch, seq_len, max_ffn_size]
         up = self.up_proj(x)  # [batch, seq_len, max_ffn_size]
         hidden = gate * up
         
-        # 4. 根据自适应维度进行掩码（可选优化：实际只计算需要的维度）
-        # 这里为了保持GPU效率，仍然计算全部维度，但通过正则化鼓励稀疏性
+        # 3. 添加残差缩放因子，防止梯度爆炸
+        hidden = hidden * (self.emb_size / self.max_ffn_size) ** 0.5
+        
+        # 4. 输出投影
         down = self.down_proj(hidden)  # [batch, seq_len, emb_size]
         
         return self.dropout(down)
@@ -145,11 +139,15 @@ class TokenImportanceScorer(nn.Module):
     def __init__(self, emb_size: int, reduced_dim: int = 64) -> None:
         super().__init__()
         self.reduced_dim = reduced_dim
-        # 低维投影层用于快速评分
+        # 低维投影层用于快速评分（使用较小的初始化）
         self.proj_query = nn.Linear(emb_size, reduced_dim, bias=False)
         self.proj_key = nn.Linear(emb_size, reduced_dim, bias=False)
         # 可学习的评分向量
-        self.scoring_vector = nn.Parameter(torch.randn(reduced_dim) * 0.02)
+        self.scoring_vector = nn.Parameter(torch.randn(reduced_dim) * 0.01)  # 减小初始方差
+        
+        # 初始化权重
+        nn.init.xavier_uniform_(self.proj_query.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.proj_key.weight, gain=0.1)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -283,13 +281,18 @@ class AdaptiveWindowAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.rope = RotaryPositionEmbedding(self.head_dim)
         
-        # 复杂度评估器：基于激活值的方差判断复杂度
+        # 复杂度评估器：基于激活值的方差判断复杂度（优化初始化）
         self.complexity_scorer = nn.Sequential(
             nn.Linear(emb_size, emb_size // 4, bias=False),
             nn.SiLU(),
             nn.Linear(emb_size // 4, 1, bias=False),
             nn.Sigmoid()
         )
+        
+        # 初始化复杂度评估器权重
+        for module in self.complexity_scorer:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight, gain=0.1)
     
     def compute_complexity(self, x: torch.Tensor) -> torch.Tensor:
         """
