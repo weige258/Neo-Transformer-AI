@@ -1,3 +1,5 @@
 model.pth
 __pycache__/
-dataset/
+dataset/*
+!dataset/dataset_1.json
+record.txt
