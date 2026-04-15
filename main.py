@@ -66,7 +66,7 @@ accumulated_loss = 0.0
 
 print(f"Gradient accumulation steps: {gradient_accumulation_steps}", flush=True)
 if gradient_accumulation_steps > 1:
-    print(f"Effective batch size increased by {gradient_accumulation_steps}x for better MoE utilization", flush=True)
+    print(f"Effective batch size increased by {gradient_accumulation_steps}x", flush=True)
 
 # ==================== 学习率调度器配置 ====================
 # 配置总训练步数(根据实际情况调整)
@@ -124,12 +124,9 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
             optimizer.zero_grad(set_to_none=True)
 
         def compute_loss():
-            result = model(prompt)
-            if isinstance(result, tuple):
-                logits, aux_loss = result
-            else:
-                logits = result
-                aux_loss = torch.tensor(0.0, device=device)
+            logits = model(prompt)
+            if isinstance(logits, tuple):
+                logits = logits[0]
 
             if logits.dim() == 1:
                 logits = logits.unsqueeze(0)
@@ -143,15 +140,13 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
                 masked_logits = masked_logits.unsqueeze(0)
                 masked_targets = masked_targets.unsqueeze(0)
 
-            main_loss = loss_func(masked_logits, masked_targets)
-            aux_loss_weight = 0.01
-            total_loss = main_loss + aux_loss_weight * aux_loss
+            loss = loss_func(masked_logits, masked_targets)
             
             # 梯度累积：将损失除以累积步数
             if gradient_accumulation_steps > 1:
-                total_loss = total_loss / gradient_accumulation_steps
+                loss = loss / gradient_accumulation_steps
             
-            return total_loss
+            return loss
 
         if use_amp:
             with torch.amp.autocast('cuda'):
@@ -306,10 +301,7 @@ def generation(text: str, max_generate_tokens: int|None = None) -> str:
         # 推理时不需要辅助损失
         result = model(prompt, use_cache=True)
         if isinstance(result, tuple):
-            if len(result) == 3:
-                logits, past_key_values, _ = result
-            else:
-                logits, past_key_values = result
+            logits, past_key_values = result
         else:
             logits = result
 
@@ -342,10 +334,7 @@ def generation(text: str, max_generate_tokens: int|None = None) -> str:
                     use_cache=True,
                 )
                 if isinstance(result, tuple):
-                    if len(result) == 3:
-                        logits, past_key_values, _ = result
-                    else:
-                        logits, past_key_values = result
+                    logits, past_key_values = result
                 else:
                     logits = result
                 
