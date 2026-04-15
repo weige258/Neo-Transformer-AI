@@ -57,7 +57,7 @@ total_params = sum(param.numel() for param in model.parameters())
 print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 
 loss_func = torch.nn.CrossEntropyLoss().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.01)
 
 # ==================== 梯度累积配置 ====================
 gradient_accumulation_steps = int(CONFIG.get("gradient_accumulation_steps", 1))

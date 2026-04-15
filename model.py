@@ -11,7 +11,7 @@ CONFIG: Dict[str, int | float] = {
     "num_heads": 8,
     "num_layers": 8,
     "dropout": 0.1,
-    "temperature": 0.8,
+    "temperature": 1.0,
     "moe_num_experts": 6,  
     "moe_top_k": 2,        
     "moe_capacity_factor": 1.25,
