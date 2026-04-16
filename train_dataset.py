@@ -138,11 +138,7 @@ def main() -> None:
             # Train on this pair
             try:
                 train(prompt, response)
-                    
-                if(get_loss()<2.0):
-                    # Generate response to see the progress
-                    generation(prompt)
-                
+                            
                 training_rounds += 1
                 
                 # 获取当前学习率
