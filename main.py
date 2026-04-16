@@ -483,8 +483,8 @@ def _tree_search(prompt: torch.Tensor, question: str) -> tuple[torch.Tensor, str
     """执行简化的蒙特卡洛树搜索
     
     Returns:
-        best_tokens: 最佳路径的token序列
-        best_text: 最佳路径的文本
+        best_new_tokens: 新生成的token序列（不包含prompt）
+        best_text: 完整文本（包含prompt + 新生成部分）
         best_reward: 最佳路径的奖励
     """
     # 【优化】初始化根节点时预计算KV-Cache
@@ -542,7 +542,15 @@ def _tree_search(prompt: torch.Tensor, question: str) -> tuple[torch.Tensor, str
             best_node = child
     
     best_reward = best_node.value / best_node.visits if best_node.visits > 0 else 0.0
-    return best_node.tokens, best_node.text, best_reward
+    
+    # 【关键修复】提取新生成的tokens（去除prompt部分）
+    prompt_len = len(prompt)
+    if len(best_node.tokens) > prompt_len:
+        best_new_tokens = best_node.tokens[prompt_len:]
+    else:
+        best_new_tokens = torch.tensor([], device=device, dtype=torch.long)
+    
+    return best_new_tokens, best_node.text, best_reward
 
 
 def train(ask: str = None, answer: str = None, history_context: str = None) -> None:
@@ -571,10 +579,19 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
         _run_train_step(train_tensor, target_mask, preview, show_preview=True)  # 单文本模式显示预览
         return
 
-    # QA训练模式 - 使用GRPO增强(移除树搜索,移植到生成阶段)
+    # QA训练模式
     print(f"\n---Train question:\n{ask}", flush=True)
     print(f"\n---Train answer:\n{answer}", flush=True)
     
+    # 【关键修复】如果有明确的参考答案，直接执行标准SFT
+    if answer and answer.strip():
+        train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
+        if train_tensor is None:
+            return
+        _run_train_step(train_tensor, target_mask, preview, show_preview=False)  # QA模式不重复显示
+        return
+    
+    # 【GRPO】无标签场景：使用模型生成的样本来进行强化学习
     prompt = torch.cat(
         [
             TextTokenizer.encode(ask).to(device),
@@ -585,11 +602,6 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
     # 【GRPO】为问题生成多个候选答案
     samples = _generate_with_sampling(prompt, GRPO_CONFIG["num_samples"])
     if not samples:
-        # 如果采样失败,直接使用参考答案训练
-        train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
-        if train_tensor is None:
-            return
-        _run_train_step(train_tensor, target_mask, preview, advantage_weight=1.0, show_preview=False)  # QA模式不重复显示
         return
     
     # 【GRPO】计算每个候选答案的奖励
@@ -602,30 +614,31 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
     # 【GRPO】计算优势函数
     advantages = _compute_grpo_advantages(rewards)
     
-    # 【GRPO】多数投票选择共识答案
-    consensus_answer = _majority_vote([sample[1] for sample in samples])
+    # 【GRPO正确实现】对每个样本分别计算加权Loss并累加
+    total_loss = torch.tensor(0.0, device=device)
+    valid_samples = 0
     
-    # 【关键修复】优先使用参考答案,其次使用共识答案
-    # 如果有明确的参考答案,应该用它来监督训练
-    training_answer = answer if answer and answer.strip() else consensus_answer
+    for idx, (sample_tokens, sample_text) in enumerate(samples):
+        advantage = advantages[idx]
+        
+        # 跳过优势为0的样本（组内表现平均）
+        if abs(advantage) < 1e-6:
+            continue
+        
+        # 构建该样本的训练数据
+        full_tokens = torch.cat([prompt, sample_tokens])
+        # 只对生成的部分计算loss（mask掉prompt部分）
+        target_mask = torch.cat([
+            torch.zeros(len(prompt), dtype=torch.bool, device=device),
+            torch.ones(len(sample_tokens), dtype=torch.bool, device=device),
+        ])
+        
+        # 执行带优势加权的训练步骤
+        _run_train_step(full_tokens, target_mask, sample_tokens, advantage_weight=advantage, show_preview=False)
+        valid_samples += 1
     
-    # 【GRPO】准备训练数据
-    train_tensor, target_mask, preview = _prepare_training_data(ask, training_answer, history_context)
-    if train_tensor is None:
-        return
-    
-    # 【GRPO】计算优势值并进行稳定化处理
-    if advantages:
-        # 对优势值进行归一化和裁剪，避免梯度爆炸或不稳定
-        # 首先计算平均优势值
-        mean_advantage = sum(advantages) / len(advantages)
-        # 裁剪优势值到合理范围
-        clipped_advantage = max(min(mean_advantage, 2.0), 0.1)
-    else:
-        clipped_advantage = 1.0
-    
-    # 【GRPO】执行训练步骤 - 应用优势加权
-    _run_train_step(train_tensor, target_mask, preview, advantage_weight=clipped_advantage, show_preview=False)  # QA模式不重复显示
+    if valid_samples > 0:
+        print(f"[GRPO] Trained on {valid_samples} samples with advantages: {[f'{a:.2f}' for a in advantages]}", flush=True)
 
 
 def generation(text: str, max_generate_tokens: int|None = None, history_context: str = None) -> str:
@@ -668,16 +681,25 @@ def generation(text: str, max_generate_tokens: int|None = None, history_context:
  
     with torch.inference_mode():
         # 【树状搜索强化学习】在生成阶段执行MCTS搜索
-        best_tokens, best_text, tree_reward = _tree_search(prompt, text)
+        best_new_tokens, best_full_text, tree_reward = _tree_search(prompt, text)
         
-        # 如果树搜索找到高质量结果且长度足够,直接使用
-        if best_text and len(best_text) > 10 and tree_reward > 0.5:
-            output_text = best_text
-            print(output_text, end="", flush=True)
-            return output_text
+        # 【关键修复】MCTS只决定前N个token，然后继续自回归生成
+        # 如果MCTS找到了高质量的前缀且长度合理，使用它作为起始
+        mcts_used = False
+        if len(best_new_tokens) > 0 and tree_reward > 0.3:
+            # 将MCTS生成的tokens拼接到prompt
+            current_prompt = torch.cat([prompt, best_new_tokens])
+            # 解码MCTS生成的部分
+            mcts_text = TextTokenizer.decode(best_new_tokens[best_new_tokens != 0])
+            if mcts_text:
+                print(mcts_text, end="", flush=True)
+                output_text += mcts_text
+                mcts_used = True
+        else:
+            current_prompt = prompt.clone()
         
-        # 否则使用标准自回归生成
-        result = model(prompt, use_cache=True)
+        # 【修复】继续标准自回归生成（无论是否使用了MCTS）
+        result = model(current_prompt, use_cache=True)
         if isinstance(result, tuple):
             logits, past_key_values = result
         else:
@@ -703,7 +725,7 @@ def generation(text: str, max_generate_tokens: int|None = None, history_context:
                     output_text += decoded_piece
 
                 next_token = torch.tensor([index], device=device)
-                prompt = torch.cat([prompt, next_token])
+                current_prompt = torch.cat([current_prompt, next_token])
                 
                 # 推理时也需要处理返回值
                 result = model(

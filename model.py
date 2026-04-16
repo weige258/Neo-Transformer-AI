@@ -120,13 +120,11 @@ class VariableDimAdaptiveFFN(nn.Module):
         up = self.up_proj(x)  # [batch, seq_len, max_ffn_size]
         hidden = gate * up
         
-        # 【修复】移除不稳定的缩放因子,改用LayerNorm稳定化
-        # hidden = hidden * (self.emb_size / self.max_ffn_size) ** 0.5  # 删除这行
+        # 【修复】移除破坏性的LayerNorm，保留非线性激活的特征强度
+        # LayerNorm会抹杀gate*up的幅度信息，严重损害表达能力
+        # 输入端已有rms_norm2提供归一化，此处无需额外操作
         
-        # 【新增】添加LayerNorm防止梯度爆炸
-        hidden = torch.nn.functional.layer_norm(hidden, hidden.shape[-1:])
-        
-        # 【新增】添加数值稳定性检查
+        # 【新增】添加数值稳定性检查（仅在必要时进行裁剪）
         if not torch.isfinite(hidden).all():
             hidden = torch.nan_to_num(hidden, nan=0.0, posinf=1e5, neginf=-1e5)
         
