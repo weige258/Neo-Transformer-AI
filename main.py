@@ -207,7 +207,7 @@ def _majority_vote(outputs: list[str]) -> str:
     return max(count_dict, key=count_dict.get)
 
 
-def _generate_with_sampling(prompt: torch.Tensor, num_samples: int, max_tokens: int = 50) -> list[tuple[torch.Tensor, str]]:
+def _generate_with_sampling(prompt: torch.Tensor, num_samples: int) -> list[tuple[torch.Tensor, str]]:
     """带采样的生成函数,用于GRPO/TTRL"""
     samples = []
     
@@ -221,7 +221,10 @@ def _generate_with_sampling(prompt: torch.Tensor, num_samples: int, max_tokens: 
                 logits = result
             
             generated_tokens = []
-            for step in range(max_tokens):
+            # 移除采样长度限制，让模型生成更完整的回答
+            step = 0
+            max_steps = 100  # 设置一个合理的最大步数，避免无限循环
+            while step < max_steps:
                 try:
                     next_logits = logits[-1]
                     probs = torch.softmax(next_logits / GRPO_CONFIG["temperature"], dim=-1)
@@ -243,6 +246,8 @@ def _generate_with_sampling(prompt: torch.Tensor, num_samples: int, max_tokens: 
                         logits, past_key_values = result
                     else:
                         logits = result
+                    
+                    step += 1
                 except Exception:
                     break
             
@@ -268,6 +273,10 @@ class TreeNode:
     
     def is_fully_expanded(self) -> bool:
         """检查是否所有动作都已尝试"""
+        # 如果untried_actions为None，表示尚未生成，返回False
+        if self.untried_actions is None:
+            return False
+        # 否则检查是否为空
         return len(self.untried_actions) == 0
     
     def best_child(self, exploration_constant: float) -> 'TreeNode':
@@ -334,12 +343,21 @@ def _expand_node(node: TreeNode, prompt: torch.Tensor, branch_factor: int) -> Tr
                 continue
     
     if not candidates:
+        # 如果没有候选动作，标记为已完全扩展
+        node.untried_actions = []
         return None
+    
+    # 首次扩展时，初始化未尝试的动作列表
+    if node.untried_actions is None:
+        node.untried_actions = [(c[0], c[1]) for c in candidates]
     
     # 选择一个未尝试的动作
     action = candidates[0]
     action_index, action_text, action_kv_cache = action
-    node.untried_actions.remove((action_index, action_text)) if (action_index, action_text) in node.untried_actions else None
+    
+    # 从未尝试动作列表中移除
+    if (action_index, action_text) in node.untried_actions:
+        node.untried_actions.remove((action_index, action_text))
     
     # 创建新节点 - 【优化】传递KV-Cache给子节点
     new_tokens = torch.cat([node.tokens, torch.tensor([action_index], device=device)])
@@ -402,23 +420,61 @@ def _compute_heuristic_reward(text: str) -> float:
     
     reward = 0.0
     
-    # 1. 长度奖励(鼓励生成完整回答)
-    length_score = min(len(text) / 50.0, 1.0)  # 归一化到[0,1]
-    reward += length_score * 0.3
+    # 1. 长度奖励(鼓励生成完整回答，但避免过长或过短)
+    length = len(text)
+    if length < 5:
+        # 对过短文本进行强惩罚
+        length_score = length / 10.0 * 0.5
+    elif length > 100:
+        # 对过长文本进行惩罚
+        length_score = 1.0 - (length - 100) / 200.0
+        length_score = max(0.3, length_score)
+    else:
+        length_score = 1.0
+    reward += length_score * 0.2
     
-    # 2. 多样性奖励(鼓励不同字符)
+    # 2. 多样性奖励(鼓励不同字符和词汇)
     unique_chars = len(set(text))
     diversity_score = min(unique_chars / 20.0, 1.0)
-    reward += diversity_score * 0.3
+    # 对重复字符进行额外惩罚
+    if unique_chars < len(text) * 0.3:
+        diversity_score *= 0.5
+    reward += diversity_score * 0.25
     
-    # 3. 连贯性奖励(简单启发:避免重复)
+    # 3. 连贯性奖励(避免重复)
     words = text.split()
     if len(words) > 1:
         unique_words = len(set(words))
         repetition_ratio = unique_words / len(words)
-        reward += repetition_ratio * 0.4
+        # 对重复词汇进行强惩罚
+        if repetition_ratio < 0.5:
+            repetition_ratio *= 0.5
+        reward += repetition_ratio * 0.3
     else:
-        reward += 0.2
+        # 对单字回答进行惩罚
+        reward += 0.05
+    
+    # 4. 自一致性奖励(检查文本是否自相矛盾)
+    consistency_score = 1.0
+    # 简单检查：避免明显的自相矛盾
+    if "不是" in text and "是" in text:
+        consistency_score = 0.5
+    # 检查是否有重复的短语
+    if len(text) > 10:
+        for i in range(len(text) - 2):
+            phrase = text[i:i+3]
+            if text.count(phrase) > 2:
+                consistency_score *= 0.7
+                break
+    reward += consistency_score * 0.1
+    
+    # 5. 格式奖励(鼓励完整的句子结构)
+    format_score = 0.0
+    if text.endswith(".") or text.endswith("！") or text.endswith("？"):
+        format_score = 1.0
+    elif text.endswith(",") or text.endswith("；"):
+        format_score = 0.5
+    reward += format_score * 0.15
     
     return reward
 
@@ -445,8 +501,8 @@ def _tree_search(prompt: torch.Tensor, question: str) -> tuple[torch.Tensor, str
     
     root = TreeNode(root_tokens, root_text, past_key_values=root_past_kv)
     
-    # 初始化未尝试动作为空(将在扩展时动态生成)
-    root.untried_actions = []  # 占位,实际在_expand_node中处理
+    # 初始化未尝试动作为None,表示尚未生成
+    root.untried_actions = None  # 实际在_expand_node中动态生成
     
     max_depth = TREE_SEARCH_CONFIG["max_depth"]
     branch_factor = TREE_SEARCH_CONFIG["branch_factor"]
@@ -512,12 +568,12 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
         )
         target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
         preview = train_tensor
-        _run_train_step(train_tensor, target_mask, preview)
+        _run_train_step(train_tensor, target_mask, preview, show_preview=True)  # 单文本模式显示预览
         return
 
-    # QA训练模式 - 使用GRPO和树搜索增强
+    # QA训练模式 - 使用GRPO增强(移除树搜索,移植到生成阶段)
     print(f"\n---Train question:\n{ask}", flush=True)
-    print("\n---Train answer:", flush=True)
+    print(f"\n---Train answer:\n{answer}", flush=True)
     
     prompt = torch.cat(
         [
@@ -525,177 +581,84 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
         ]
     )
-    
-    # 【树状搜索强化学习】执行MCTS搜索(静默模式)
-    best_tokens, best_text, tree_reward = _tree_search(prompt, ask)
   
     # 【GRPO】为问题生成多个候选答案
-    num_samples = GRPO_CONFIG["num_samples"]
-    samples = _generate_with_sampling(prompt, num_samples, max_tokens=50)
-    
+    samples = _generate_with_sampling(prompt, GRPO_CONFIG["num_samples"])
     if not samples:
-        # 如果采样失败,使用树搜索结果或回退到标准训练
-        if best_text and len(best_text) > 5:
-            train_tensor, target_mask, preview = _prepare_training_data(ask, best_text, history_context)
-        else:
-            train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
-        
+        # 如果采样失败,直接使用参考答案训练
+        train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
         if train_tensor is None:
             return
-        _run_train_step(train_tensor, target_mask, preview)
+        _run_train_step(train_tensor, target_mask, preview, advantage_weight=1.0, show_preview=False)  # QA模式不重复显示
         return
     
-    # 【TTRL】多数投票确定共识答案
-    generated_texts = [text for _, text in samples]
-    consensus_answer = _majority_vote(generated_texts)
-    
-    # 计算每个样本的奖励(结合树搜索奖励和一致性奖励)
+    # 【GRPO】计算每个候选答案的奖励
     rewards = []
-    for _, text in samples:
-        # 与共识的一致性奖励
-        consensus_reward = 1.0 if text == consensus_answer else 0.0
-        # 综合奖励:70%共识奖励 + 30%树搜索启发式奖励
-        heuristic_reward = _compute_heuristic_reward(text) * 0.3
-        reward = consensus_reward * 0.7 + heuristic_reward
+    for sample in samples:
+        _, decoded_text = sample
+        reward = _compute_heuristic_reward(decoded_text)
         rewards.append(reward)
     
     # 【GRPO】计算优势函数
     advantages = _compute_grpo_advantages(rewards)
     
-    # 选择最高奖励的样本进行训练
-    best_idx = rewards.index(max(rewards))
-    best_generated_tensor, best_generated_text = samples[best_idx]
+    # 【GRPO】多数投票选择共识答案
+    consensus_answer = _majority_vote([sample[1] for sample in samples])
     
-    # 构建训练数据(优先级:参考答案 > 树搜索结果 > TTRL共识)
-    if answer and answer.strip():
-        # 如果有参考答案,优先使用参考答案
-        train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
-    elif best_text and len(best_text) > len(consensus_answer):
-        # 否则使用树搜索的高质量结果
-        train_tensor, target_mask, preview = _prepare_training_data(ask, best_text, history_context)
-    else:
-        # 无标签时使用生成的共识答案(TTRL)
-        train_tensor, target_mask, preview = _prepare_training_data(ask, consensus_answer, history_context)
+    # 【关键修复】优先使用参考答案,其次使用共识答案
+    # 如果有明确的参考答案,应该用它来监督训练
+    training_answer = answer if answer and answer.strip() else consensus_answer
     
+    # 【GRPO】准备训练数据
+    train_tensor, target_mask, preview = _prepare_training_data(ask, training_answer, history_context)
     if train_tensor is None:
         return
     
-    # 【GRPO+Tree Search】使用优势加权损失
-    advantage_weight = advantages[best_idx] if best_idx < len(advantages) else 1.0
-    # 如果树搜索结果被采用,额外增加权重
-    if best_text and len(best_text) > len(consensus_answer) and not (answer and answer.strip()):
-        advantage_weight *= 1.5  # 树搜索高质量路径赋予更高权重
+    # 【GRPO】计算优势值并进行稳定化处理
+    if advantages:
+        # 对优势值进行归一化和裁剪，避免梯度爆炸或不稳定
+        # 首先计算平均优势值
+        mean_advantage = sum(advantages) / len(advantages)
+        # 裁剪优势值到合理范围
+        clipped_advantage = max(min(mean_advantage, 2.0), 0.1)
+    else:
+        clipped_advantage = 1.0
     
-    _run_train_step(train_tensor, target_mask, preview, advantage_weight=advantage_weight)
+    # 【GRPO】执行训练步骤 - 应用优势加权
+    _run_train_step(train_tensor, target_mask, preview, advantage_weight=clipped_advantage, show_preview=False)  # QA模式不重复显示
 
 
-def _run_train_step(
-    train_tensor: torch.Tensor,
-    target_mask: torch.Tensor,
-    preview: torch.Tensor,
-    advantage_weight: float = 1.0,
-) -> None:
-    """执行单步训练"""
-    if train_tensor.numel() < 2:
-        return
-
-    prompt = train_tensor[:-1]
-    targets = train_tensor[1:]
-    loss_mask = target_mask[1:] & (targets != 0)
-    if loss_mask.numel() == 0 or not bool(loss_mask.any()):
-        return
-
-    model.train()
-    optimizer.zero_grad(set_to_none=True)
-
-    def compute_loss():
-        logits = model(prompt)
-        if isinstance(logits, tuple):
-            logits = logits[0]
-
-        if logits.dim() == 1:
-            logits = logits.unsqueeze(0)
-
-        masked_logits = logits[loss_mask]
-        masked_targets = targets[loss_mask]
-        if masked_targets.numel() == 0:
-            return None
-        
-        if masked_logits.dim() == 1:
-            masked_logits = masked_logits.unsqueeze(0)
-            masked_targets = masked_targets.unsqueeze(0)
-
-        loss = loss_func(masked_logits, masked_targets)
-        
-        # 【GRPO】应用优势加权
-        if advantage_weight != 1.0:
-            loss = loss * abs(advantage_weight)
-        
-        return loss
-
-    try:
-        if use_amp:
-            with torch.amp.autocast('cuda'):
-                loss = compute_loss()
-                if loss is None:
-                    return
-                
-                # 【增强】检测NaN或Inf
-                loss_value = loss.item()
-                if not torch.isfinite(loss).item():
-                    print(f"[WARNING] Loss is NaN or Inf! Skipping this sample.", flush=True)
-                    return
-                
-                record_loss(loss_value)
-            
-            scaler.scale(loss).backward()
-            
-            # 【修复】梯度裁剪
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss = compute_loss()
-            if loss is None:
-                return
-            
-            loss_value = loss.item()
-            if not torch.isfinite(loss).item():
-                print(f"[WARNING] Loss is NaN or Inf! Skipping this sample.", flush=True)
-                return
-            
-            record_loss(loss_value)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
-        
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            print(f"[ERROR] CUDA OOM detected! Clearing cache and skipping sample...", flush=True)
-            torch.cuda.empty_cache()
-            return
-        else:
-            raise
+def generation(text: str, max_generate_tokens: int|None = None, history_context: str = None) -> str:
+    """生成函数 - 集成树状搜索强化学习
     
-    try:
-        print(TextTokenizer.decode(preview[preview != 0]), end="", flush=True)
-    except Exception as e:
-        print(e, flush=True)
-    print("", flush=True)
-
-
-def generation(text: str, max_generate_tokens: int|None = None) -> str:
+    Args:
+        text: 输入文本/问题
+        max_generate_tokens: 最大生成token数
+        history_context: 历史上下文(可选)
+    
+    Returns:
+        生成的文本
+    """
     model.eval()
     output_text = ""
 
-    prompt = torch.cat(
-        [
+    # 构建prompt(支持历史上下文)
+    if history_context and history_context.strip():
+        history_tensor = TextTokenizer.encode(history_context).to(device)
+        text_tensor = TextTokenizer.encode(text).to(device)
+        prompt = torch.cat([
+            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            history_tensor,
+            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+            torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
+            text_tensor,
+            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+        ])
+    else:
+        prompt = torch.cat([
             TextTokenizer.encode(text).to(device),
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-        ]
-    )
+        ])
 
     print("\n---Generated reply:", flush=True)
 
@@ -704,7 +667,16 @@ def generation(text: str, max_generate_tokens: int|None = None) -> str:
         max_generate_tokens = max(1, int(max_generate_tokens))
  
     with torch.inference_mode():
-        # 推理时不需要辅助损失
+        # 【树状搜索强化学习】在生成阶段执行MCTS搜索
+        best_tokens, best_text, tree_reward = _tree_search(prompt, text)
+        
+        # 如果树搜索找到高质量结果且长度足够,直接使用
+        if best_text and len(best_text) > 10 and tree_reward > 0.5:
+            output_text = best_text
+            print(output_text, end="", flush=True)
+            return output_text
+        
+        # 否则使用标准自回归生成
         result = model(prompt, use_cache=True)
         if isinstance(result, tuple):
             logits, past_key_values = result
@@ -749,3 +721,56 @@ def generation(text: str, max_generate_tokens: int|None = None) -> str:
                 print(f"Error during generation: {e}", flush=True)
                 break
         return output_text
+
+
+def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, advantage_weight: float = 1.0, show_preview: bool = True) -> None:
+    """执行单步训练
+    
+    Args:
+        train_tensor: 训练张量
+        target_mask: 目标掩码
+        preview: 预览张量
+        advantage_weight: 优势加权因子(用于GRPO)
+        show_preview: 是否显示预览输出(默认True,QA模式下可设为False避免重复)
+    """
+    model.train()
+    optimizer.zero_grad()
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+        result = model(train_tensor, use_cache=False)
+        if isinstance(result, tuple):
+            logits = result[0]
+        else:
+            logits = result
+
+        # 应用目标掩码并进行 next-token prediction 对齐
+        # 对于 next-token prediction，targets 应该是 train_tensor 右移一位
+        # 确保 logits 和 targets 长度相同
+        if len(train_tensor) > 1:
+            # 正确的 next-token prediction 对齐
+            # logits 对应位置 i，targets 对应位置 i+1
+            masked_logits = logits[:-1][target_mask[:-1]]
+            masked_targets = train_tensor[1:][target_mask[:-1]]
+            
+            if len(masked_logits) > 0 and len(masked_targets) > 0:
+                loss = loss_func(masked_logits, masked_targets)
+            else:
+                loss = torch.tensor(0.0, device=device)
+        else:
+            loss = torch.tensor(0.0, device=device)
+        # 应用GRPO优势加权
+        loss = loss * advantage_weight
+        record_loss(loss.item())
+
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+
+    # 输出训练预览(可选)
+    if show_preview:
+        try:
+            decoded_preview = TextTokenizer.decode(preview[preview != 0])
+            print(decoded_preview, end="", flush=True)
+        except Exception as e:
+            print(f"[Warning] Failed to decode preview: {e}", flush=True)
+        print("", flush=True)
