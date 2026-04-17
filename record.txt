@@ -1,13 +1,1 @@
-<system_time>2026/04/16 19:15:11</system_time><time>00:00:00</time><avg_loss>0</avg_loss>
-<system_time>2026/04/16 19:31:47</system_time><time>00:16:13</time><avg_loss>5.302418</avg_loss>
-<system_time>2026/04/17 07:29:33</system_time><time>00:30:33</time><avg_loss>3.885471</avg_loss>
-<system_time>2026/04/17 07:46:01</system_time><time>00:46:38</time><avg_loss>3.725970</avg_loss>
-<system_time>2026/04/17 08:01:38</system_time><time>01:01:55</time><avg_loss>3.573923</avg_loss>
-<system_time>2026/04/17 08:48:41</system_time><time>01:23:04</time><avg_loss>3.399315</avg_loss>
-<system_time>2026/04/17 09:17:01</system_time><time>01:39:41</time><avg_loss>3.306201</avg_loss>
-<system_time>2026/04/17 09:46:55</system_time><time>02:09:06</time><avg_loss>3.191512</avg_loss>
-<system_time>2026/04/17 10:05:14</system_time><time>02:27:02</time><avg_loss>3.139087</avg_loss>
-<system_time>2026/04/17 10:17:45</system_time><time>02:39:11</time><avg_loss>3.088356</avg_loss>
-<system_time>2026/04/17 10:46:08</system_time><time>03:07:13</time><avg_loss>3.025620</avg_loss>
-<system_time>2026/04/17 11:16:31</system_time><time>03:37:15</time><avg_loss>3.023330</avg_loss>
-<system_time>2026/04/17 11:39:08</system_time><time>03:59:31</time><avg_loss>2.933836</avg_loss>
+<system_time>2026/04/17 12:23:46</system_time><time>00:00:00</time><avg_loss>0</avg_loss>

@@ -101,6 +101,9 @@ class VariableDimAdaptiveFFN(nn.Module):
         self.up_proj = nn.Linear(emb_size, self.max_ffn_size, bias=False)
         self.down_proj = nn.Linear(self.max_ffn_size, emb_size, bias=False)
         self.dropout = nn.Dropout(dropout)
+        
+        # 添加RMSNorm以提高数值稳定性
+        self.hidden_norm = RMSNorm(self.max_ffn_size)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -120,13 +123,8 @@ class VariableDimAdaptiveFFN(nn.Module):
         up = self.up_proj(x)  # [batch, seq_len, max_ffn_size]
         hidden = gate * up
         
-        # 【修复】移除破坏性的LayerNorm，保留非线性激活的特征强度
-        # LayerNorm会抹杀gate*up的幅度信息，严重损害表达能力
-        # 输入端已有rms_norm2提供归一化，此处无需额外操作
-        
-        # 【新增】添加数值稳定性检查（仅在必要时进行裁剪）
-        if not torch.isfinite(hidden).all():
-            hidden = torch.nan_to_num(hidden, nan=0.0, posinf=1e5, neginf=-1e5)
+        # 3. 添加RMSNorm以提高数值稳定性
+        hidden = self.hidden_norm(hidden)
         
         # 4. 输出投影
         down = self.down_proj(hidden)  # [batch, seq_len, emb_size]
@@ -739,20 +737,22 @@ class MainModel(nn.Module):
         if past_key_values is None:
             past_key_values = [None] * len(self.transformers)
         
-        for block, past_key_value in zip(self.transformers, past_key_values):
-            if use_cache:
+        if use_cache:
+            # 使用缓存时，不应用 gradient checkpoint
+            for block, past_key_value in zip(self.transformers, past_key_values):
                 x, present_key_value = block(
                     x,
                     past_key_value=past_key_value,
                     use_cache=True,
                 )
                 next_key_values.append(present_key_value)
-            else:
-                x = block(x)
+        else:
+            # 不使用缓存时，应用 gradient checkpoint 来节省内存
+            def checkpoint_forward(block, x):
+                return block(x)
             
-            # 【新增】添加数值稳定性检查
-            if not torch.isfinite(x).all():
-                x = torch.nan_to_num(x, nan=0.0, posinf=1e5, neginf=-1e5)
+            for block in self.transformers:
+                x = checkpoint.checkpoint(checkpoint_forward, block, x)
 
         x = self.final_norm(x)
         logits = self.output_linear(x)

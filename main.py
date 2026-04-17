@@ -786,8 +786,8 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         if len(train_tensor) > 1:
             # 正确的 next-token prediction 对齐
             # logits 对应位置 i，targets 对应位置 i+1
-            masked_logits = logits[:-1][target_mask[:-1]]
-            masked_targets = train_tensor[1:][target_mask[:-1]]
+            masked_logits = logits[:-1][target_mask[1:]]
+            masked_targets = train_tensor[1:][target_mask[1:]]
             
             if len(masked_logits) > 0 and len(masked_targets) > 0:
                 loss = loss_func(masked_logits, masked_targets)

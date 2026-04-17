@@ -302,17 +302,11 @@ class WebCrawler:
                 if not self.is_running:
                     break
                 
-                # 清理所有成员集合和缓存
-                print("【内存清理】开始清理成员数据...", flush=True)
+                # 清理缓存（保留visited_urls和failed_urls以防止重复爬取）
+                print("【内存清理】开始清理缓存...", flush=True)
                 print(f"  清理前 - visited_urls: {len(self.visited_urls)}, "
                       f"failed_urls: {len(self.failed_urls)}, "
                       f"cache: {len(self.cache)}", flush=True)
-                
-                # 清理已访问URL集合
-                self.visited_urls.clear()
-                
-                # 清理失败URL集合
-                self.failed_urls.clear()
                 
                 # 清理缓存
                 with self.cache_lock:
@@ -408,4 +402,3 @@ class WebCrawler:
         """析构函数"""
         if self.is_running:
             self.stop()
-
