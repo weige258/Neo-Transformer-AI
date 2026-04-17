@@ -15,7 +15,7 @@ while True:
     try:
         text = crawler.get()
         if text != None:
-            train(text)
+            train(answer=text)
 
             if(get_loss()<2.0):
                     # Generate response to see the progress

@@ -143,17 +143,17 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
                 torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
             ]
         )
-        target_mask = torch.cat(
-            [
-                torch.zeros(ask_tensor.numel() + 1, dtype=torch.bool, device=device),
-                torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
-            ]
-        )
-        history_mask_len = 1 + history_tensor.numel() + 1
+        # 【关键修复】正确计算target_mask长度
+        # train_tensor结构: START + history + END + HIST_START + ask + START + answer + END
+        # 非目标部分: START + history + END + HIST_START + ask + START = 1 + h + 1 + 1 + a + 1 = h + a + 4
+        # 目标部分: answer + END = ans + 1
+        non_target_len = 1 + history_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1
         target_mask = torch.cat([
-            torch.zeros(history_mask_len, dtype=torch.bool, device=device),
-            target_mask
+            torch.zeros(non_target_len, dtype=torch.bool, device=device),
+            torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
         ])
+        # 验证长度匹配
+        assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
         preview = torch.cat(
             [answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device)]
         )
@@ -568,15 +568,28 @@ def _tree_search(prompt: torch.Tensor, question: str) -> tuple[torch.Tensor, str
     return best_new_tokens, best_node.text, best_reward
 
 
-def train(ask: str = None, answer: str = None, history_context: str = None) -> None:
-    """单步训练函数 - 集成GRPO和TTRL"""
+def train(ask: str = None, think: str = None, answer: str = None, history_context: str = None) -> None:
+    """单步训练函数 - 集成GRPO和TTRL
+    
+    Args:
+        ask: 问题文本
+        think: 思维链/推理过程（可选，用于CoT训练）
+        answer: 答案文本
+        history_context: 历史对话上下文
+    """
+    # ANSI颜色代码
+    WHITE = '\033[97m'     # 问题 - 白色
+    BLUE = '\033[94m'      # 思考 - 蓝色
+    GREEN = '\033[92m'     # 回答 - 绿色
+    YELLOW = '\033[93m'    # 单文本 - 黄色
+    RESET = '\033[0m'      # 重置颜色
+    
     # 单文本训练模式
     if ask is None and answer is None:
         return
     
     if ask is None:
-        print(f"\n---Single text training:\n{answer}", flush=True)
-        print("\n---Learning tokens:", flush=True)
+        print(f"\n---Train{RESET}", flush=True)
 
         text_tensor = TextTokenizer.encode(answer).to(device)
         if text_tensor.numel() < 2:
@@ -591,15 +604,83 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
         )
         target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
         preview = train_tensor
-        _run_train_step(train_tensor, target_mask, preview, show_preview=True)  # 单文本模式显示预览
+        # 单文本模式：在_run_train_step中输出黄色预览
+        _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
         return
 
     # QA训练模式
-    print(f"\n---Train question:\n{ask}", flush=True)
-    print(f"\n---Train answer:\n{answer}", flush=True)
+    print(f"\n---Train{RESET}", flush=True)
+    print(f"{WHITE}{ask}{RESET}", flush=True)
     
     # 【关键修复】如果有明确的参考答案，直接执行标准SFT
     if answer and answer.strip():
+        # 如果提供了思维链，构建带思考的训练数据
+        if think and think.strip():
+            print(f"{BLUE}{think}{RESET}", flush=True)
+            print(f"{GREEN}{answer}{RESET}", flush=True)
+            
+            # 构建带思维链的训练序列
+            ask_tensor = TextTokenizer.encode(ask).to(device)
+            think_tensor = TextTokenizer.encode(think).to(device)
+            answer_tensor = TextTokenizer.encode(answer).to(device)
+            
+            if hist_context := history_context:
+                history_tensor = TextTokenizer.encode(hist_context).to(device)
+                train_tensor = torch.cat(
+                    [
+                        torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                        history_tensor,
+                        torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+                        torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
+                        ask_tensor,
+                        torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                        torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device),
+                        think_tensor,
+                        torch.tensor([TextTokenizer.THINK_END_TOKEN], device=device),
+                        answer_tensor,
+                        torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+                    ]
+                )
+                # 只对思维过程和答案部分计算loss
+                # train_tensor结构: START + history + END + HIST_START + ask + START + THINK_START + think + THINK_END + answer + END
+                non_target_len = 1 + history_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1 + 1  # START + history + END + HIST_START + ask + START + THINK_START
+                target_len = think_tensor.numel() + 1 + answer_tensor.numel() + 1  # think + THINK_END + answer + END
+                target_mask = torch.cat([
+                    torch.zeros(non_target_len, dtype=torch.bool, device=device),
+                    torch.ones(target_len, dtype=torch.bool, device=device),
+                ])
+                # 【关键修复】确保target_mask长度与train_tensor完全一致
+                assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
+                preview = torch.cat([think_tensor, answer_tensor])
+            else:
+                train_tensor = torch.cat(
+                    [
+                        ask_tensor,
+                        torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                        torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device),
+                        think_tensor,
+                        torch.tensor([TextTokenizer.THINK_END_TOKEN], device=device),
+                        answer_tensor,
+                        torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+                    ]
+                )
+                # 只对思维过程和答案部分计算loss
+                # train_tensor结构: ask + START + THINK_START + think + THINK_END + answer + END
+                non_target_len = ask_tensor.numel() + 1 + 1  # ask + START + THINK_START
+                target_len = think_tensor.numel() + 1 + answer_tensor.numel() + 1  # think + THINK_END + answer + END
+                target_mask = torch.cat([
+                    torch.zeros(non_target_len, dtype=torch.bool, device=device),
+                    torch.ones(target_len, dtype=torch.bool, device=device),
+                ])
+                # 【关键修复】确保target_mask长度与train_tensor完全一致
+                assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
+                preview = torch.cat([think_tensor, answer_tensor])
+            
+            _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+            return
+        
+        # 没有思维链，使用标准QA训练
+        print(f"{GREEN}{answer}{RESET}", flush=True)
         train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
         if train_tensor is None:
             return
@@ -656,17 +737,23 @@ def train(ask: str = None, answer: str = None, history_context: str = None) -> N
         print(f"[GRPO] Trained on {valid_samples} samples with advantages: {[f'{a:.2f}' for a in advantages]}", flush=True)
 
 
-def generation(text: str, max_generate_tokens: int|None = None, history_context: str = None) -> str:
+def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
     """生成函数 - 集成树状搜索强化学习
     
     Args:
         text: 输入文本/问题
-        max_generate_tokens: 最大生成token数
         history_context: 历史上下文(可选)
+        max_generate_tokens: 最大生成token数
+        thinking_available: 是否启用思维链生成（默认True）
     
     Returns:
         生成的文本
     """
+    # ANSI颜色代码
+    BLUE = '\033[94m'      # 思考内容 - 蓝色
+    GREEN = '\033[92m'     # 回答内容 - 绿色
+    RESET = '\033[0m'      # 重置颜色
+    
     model.eval()
     output_text = ""
 
@@ -713,6 +800,14 @@ def generation(text: str, max_generate_tokens: int|None = None, history_context:
         else:
             current_prompt = prompt.clone()
         
+        # 【新增】如果启用思维链且MCTS没有生成THINK_START_TOKEN，手动添加
+        thinking_started = False
+        if thinking_available and not mcts_used:
+            thinking_started = True
+            # 添加THINK_START_TOKEN到prompt
+            think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
+            current_prompt = torch.cat([current_prompt, think_start_tensor])
+        
         # 【修复】继续标准自回归生成（无论是否使用了MCTS）
         result = model(current_prompt, use_cache=True)
         if isinstance(result, tuple):
@@ -721,6 +816,9 @@ def generation(text: str, max_generate_tokens: int|None = None, history_context:
             logits = result
 
         step = 0
+        thinking_content = ""
+        answer_content = ""
+        
         while max_generate_tokens is None or step < max_generate_tokens:
             try:
                 next_logits = logits[-1]
@@ -731,14 +829,49 @@ def generation(text: str, max_generate_tokens: int|None = None, history_context:
                 probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
                 index = int(torch.multinomial(probs, 1).item())
 
-                if index == TextTokenizer.END_GENERATION_TOKEN:
+                # 【关键修复】先处理特殊token，再决定是否continue
+                should_skip_output = False
+                
+                # 检查是否遇到THINK_END_TOKEN，切换到答案生成模式
+                if index == TextTokenizer.THINK_END_TOKEN:
+                    if thinking_available and thinking_started:
+                        # 思维链结束，切换到答案模式
+                        thinking_started = False
+                        print(f"{RESET}\n", end="", flush=True)  # 重置颜色并换行
+                        should_skip_output = True  # 不输出THINK_END_TOKEN本身
+                    else:
+                        break
+                
+                # 检查是否遇到END_GENERATION_TOKEN
+                elif index == TextTokenizer.END_GENERATION_TOKEN:
                     break
 
-                decoded_piece = TextTokenizer.decode(torch.tensor([index]))
-                if decoded_piece:
-                    print(decoded_piece, end="", flush=True)
-                    output_text += decoded_piece
+                # 处理思维链开始标记
+                elif index == TextTokenizer.THINK_START_TOKEN:
+                    if thinking_available:
+                        thinking_started = True
+                        should_skip_output = True  # 不输出THINK_START_TOKEN本身
+                    else:
+                        # 如果不启用思维链，跳过思考过程
+                        should_skip_output = True
+                
+                # 【普通token】解码并输出（带颜色）
+                if not should_skip_output:
+                    decoded_piece = TextTokenizer.decode(torch.tensor([index]))
+                    
+                    if decoded_piece:
+                        if thinking_started:
+                            # 正在生成思考内容 - 蓝色
+                            thinking_content += decoded_piece
+                            print(f"{BLUE}{decoded_piece}{RESET}", end="", flush=True)
+                        else:
+                            # 正在生成答案内容 - 绿色
+                            answer_content += decoded_piece
+                            print(f"{GREEN}{decoded_piece}{RESET}", end="", flush=True)
+                        
+                        output_text += decoded_piece
 
+                # 【统一处理】更新prompt和logits
                 next_token = torch.tensor([index], device=device)
                 current_prompt = torch.cat([current_prompt, next_token])
                 
@@ -757,10 +890,15 @@ def generation(text: str, max_generate_tokens: int|None = None, history_context:
             except Exception as e:
                 print(f"Error during generation: {e}", flush=True)
                 break
+        
+        # 输出总结（无颜色）
+        if thinking_available and thinking_content:
+            print(f"\n\n{answer_content}", flush=True)
+        
         return output_text
 
 
-def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, advantage_weight: float = 1.0, show_preview: bool = True) -> None:
+def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, advantage_weight: float = 1.0, show_preview: bool = True, preview_color: str = None) -> None:
     """执行单步训练
     
     Args:
@@ -769,6 +907,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         preview: 预览张量
         advantage_weight: 优势加权因子(用于GRPO)
         show_preview: 是否显示预览输出(默认True,QA模式下可设为False避免重复)
+        preview_color: 预览文本颜色(可选)
     """
     model.train()
     optimizer.zero_grad()
@@ -807,7 +946,11 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     if show_preview:
         try:
             decoded_preview = TextTokenizer.decode(preview[preview != 0])
-            print(decoded_preview, end="", flush=True)
+            RESET = '\033[0m'
+            if preview_color:
+                print(f"{preview_color}{decoded_preview}{RESET}", end="", flush=True)
+            else:
+                print(decoded_preview, end="", flush=True)
         except Exception as e:
             print(f"[Warning] Failed to decode preview: {e}", flush=True)
         print("", flush=True)

@@ -2,7 +2,7 @@ import json
 import torch
 import random
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Optional, Dict
 from main import train, generation, model, optimizer
 from record import get_loss
 
@@ -51,21 +51,22 @@ class StreamingDataset:
             
             count = 0
             for item in data:
-                if "prompt" in item and "response" in item:
-                    prompt_raw = item.get("prompt")
-                    response_raw = item.get("response")
-                    if prompt_raw is not None and response_raw is not None:
-                        prompt = str(prompt_raw).strip()
-                        response = str(response_raw).strip()
-                        if prompt and response:
+                # 新格式：检查 ask 和 answer 字段
+                if "ask" in item and "answer" in item:
+                    ask_raw = item.get("ask")
+                    answer_raw = item.get("answer")
+                    if ask_raw is not None and answer_raw is not None:
+                        ask = str(ask_raw).strip()
+                        answer = str(answer_raw).strip()
+                        if ask and answer:
                             count += 1
             return count
         except Exception as e:
             logging.error(f"Failed to count entries in {file_path}: {e}")
             return 0
     
-    def get_random_pair(self) -> Tuple[str, str]:
-        """随机获取一个训练对"""
+    def get_random_sample(self) -> Dict[str, Optional[str]]:
+        """随机获取一个训练样本（包含ask, think, answer, history）"""
         if self.total_entries == 0:
             raise ValueError("No training data available")
         
@@ -80,7 +81,7 @@ class StreamingDataset:
         
         raise IndexError("Failed to locate entry")
     
-    def _load_entry_from_file(self, file_path: str, target_local_idx: int) -> Tuple[str, str]:
+    def _load_entry_from_file(self, file_path: str, target_local_idx: int) -> Dict[str, Optional[str]]:
         """从文件中加载指定索引的条目"""
         try:
             with open(file_path, "r", encoding="utf-8") as f:
@@ -88,17 +89,48 @@ class StreamingDataset:
             
             current_idx = 0
             for item in data:
-                if "prompt" in item and "response" in item:
-                    prompt_raw = item.get("prompt")
-                    response_raw = item.get("response")
+                # 新格式：检查 ask 和 answer 字段
+                if "ask" in item and "answer" in item:
+                    ask_raw = item.get("ask")
+                    answer_raw = item.get("answer")
                     
-                    if prompt_raw is not None and response_raw is not None:
-                        prompt = str(prompt_raw).strip()
-                        response = str(response_raw).strip()
+                    if ask_raw is not None and answer_raw is not None:
+                        ask = str(ask_raw).strip()
+                        answer = str(answer_raw).strip()
                         
-                        if prompt and response:
+                        if ask and answer:
                             if current_idx == target_local_idx:
-                                return prompt, response
+                                # 提取所有字段
+                                think_raw = item.get("think", "")
+                                think = str(think_raw).strip() if think_raw is not None else ""
+                                
+                                history_raw = item.get("history", [])
+                                # 将history数组转换为字符串格式
+                                if isinstance(history_raw, list) and len(history_raw) > 0:
+                                    # 假设history是 [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}] 格式
+                                    history_parts = []
+                                    for msg in history_raw:
+                                        if isinstance(msg, dict):
+                                            role = msg.get("role", "unknown")
+                                            content = msg.get("content", "")
+                                            if role == "user":
+                                                history_parts.append(f"用户: {content}")
+                                            elif role == "assistant":
+                                                history_parts.append(f"助手: {content}")
+                                            else:
+                                                history_parts.append(f"{role}: {content}")
+                                        elif isinstance(msg, str):
+                                            history_parts.append(str(msg))
+                                    history_context = "\n".join(history_parts)
+                                else:
+                                    history_context = ""
+                                
+                                return {
+                                    "ask": ask,
+                                    "think": think,
+                                    "answer": answer,
+                                    "history_context": history_context
+                                }
                             current_idx += 1
             
             raise IndexError(f"Entry {target_local_idx} not found in {file_path}")
@@ -117,7 +149,7 @@ def main() -> None:
         logging.error("No training data found, please check dataset files")
         return
 
-    logging.info(f"Initialized streaming dataset with {dataset.total_entries} training pairs.")
+    logging.info(f"Initialized streaming dataset with {dataset.total_entries} training samples.")
 
     training_rounds = 0
     save_interval = 500  # Save model every 500 rounds
@@ -128,16 +160,26 @@ def main() -> None:
 
     try:
         while True:
-            # 流式获取随机训练对，每次只加载一条数据
-            prompt, response = dataset.get_random_pair()
+            # 流式获取随机训练样本
+            sample = dataset.get_random_sample()
             
-            # Skip empty prompts or responses
-            if not prompt or not response:
+            ask = sample.get("ask", "")
+            think = sample.get("think", "")
+            answer = sample.get("answer", "")
+            history_context = sample.get("history_context", "")
+            
+            # Skip empty asks or answers
+            if not ask or not answer:
                 continue
 
-            # Train on this pair
+            # Train on this sample (支持问-思考-答-历史上下文格式)
             try:
-                train(prompt, response)
+                train(
+                    ask=ask,
+                    think=think if think else None,
+                    answer=answer,
+                    history_context=history_context if history_context else None
+                )
                             
                 training_rounds += 1
                 
