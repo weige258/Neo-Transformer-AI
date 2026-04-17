@@ -1,4 +1,5 @@
 import sys
+import math
 
 import torch
 
@@ -290,7 +291,7 @@ class TreeNode:
                 uct_scores.append(float('inf'))
             else:
                 exploitation = child.value / child.visits
-                exploration = exploration_constant * (2 * (self.visits ** 0.5) / child.visits) ** 0.5
+                exploration = exploration_constant * (math.log(self.visits) / child.visits) ** 0.5
                 uct_scores.append(exploitation + exploration)
         
         best_idx = uct_scores.index(max(uct_scores))
@@ -307,57 +308,71 @@ def _expand_node(node: TreeNode, prompt: torch.Tensor, branch_factor: int) -> Tr
     if node.is_fully_expanded():
         return None
     
-    # 采样多个候选动作
-    candidates = []
-    with torch.inference_mode():
-        for _ in range(branch_factor):
-            # 【关键优化】复用父节点的KV-Cache,只传入最后一个token
-            if node.past_key_values is not None and len(node.tokens) > 0:
-                # 只传入最新的一个token,利用缓存加速
-                last_token = node.tokens[-1:].clone()
-                result = model(last_token, past_key_values=node.past_key_values, use_cache=True)
-            else:
-                # 根节点或无缓存时,传入完整序列
-                result = model(node.tokens, use_cache=True)
-            
-            if isinstance(result, tuple):
-                logits, past_key_values = result
-            else:
-                logits = result
-                past_key_values = None
-            
-            try:
-                next_logits = logits[-1]
-                probs = torch.softmax(next_logits / GRPO_CONFIG["temperature"], dim=-1)
-                index = int(torch.multinomial(probs, 1).item())
-                
-                if index == TextTokenizer.END_GENERATION_TOKEN:
-                    continue
-                
-                decoded_piece = TextTokenizer.decode(torch.tensor([index]))
-                if not decoded_piece:
-                    continue
-                
-                candidates.append((index, decoded_piece, past_key_values))
-            except Exception:
-                continue
-    
-    if not candidates:
-        # 如果没有候选动作，标记为已完全扩展
-        node.untried_actions = []
-        return None
-    
-    # 首次扩展时，初始化未尝试的动作列表
+    # 首次扩展时，生成候选动作并初始化untried_actions
     if node.untried_actions is None:
+        candidates = []
+        with torch.inference_mode():
+            for _ in range(branch_factor):
+                # 【关键优化】复用父节点的KV-Cache,只传入最后一个token
+                if node.past_key_values is not None and len(node.tokens) > 0:
+                    # 只传入最新的一个token,利用缓存加速
+                    last_token = node.tokens[-1:].clone()
+                    result = model(last_token, past_key_values=node.past_key_values, use_cache=True)
+                else:
+                    # 根节点或无缓存时,传入完整序列
+                    result = model(node.tokens, use_cache=True)
+                
+                if isinstance(result, tuple):
+                    logits, past_key_values = result
+                else:
+                    logits = result
+                    past_key_values = None
+                
+                try:
+                    next_logits = logits[-1]
+                    probs = torch.softmax(next_logits / GRPO_CONFIG["temperature"], dim=-1)
+                    index = int(torch.multinomial(probs, 1).item())
+                    
+                    if index == TextTokenizer.END_GENERATION_TOKEN:
+                        continue
+                    
+                    decoded_piece = TextTokenizer.decode(torch.tensor([index]))
+                    if not decoded_piece:
+                        continue
+                    
+                    candidates.append((index, decoded_piece, past_key_values))
+                except Exception:
+                    continue
+        
+        if not candidates:
+            # 如果没有候选动作，标记为已完全扩展
+            node.untried_actions = []
+            return None
+        
+        # 初始化未尝试的动作列表
         node.untried_actions = [(c[0], c[1]) for c in candidates]
     
-    # 选择一个未尝试的动作
-    action = candidates[0]
-    action_index, action_text, action_kv_cache = action
+    # 从现有的未尝试动作中选择一个
+    if not node.untried_actions:
+        return None
+    
+    # 获取第一个未尝试的动作
+    action_index, action_text = node.untried_actions[0]
+    
+    # 重新获取该动作的KV-Cache
+    action_kv_cache = None
+    with torch.inference_mode():
+        if node.past_key_values is not None and len(node.tokens) > 0:
+            last_token = node.tokens[-1:].clone()
+            result = model(last_token, past_key_values=node.past_key_values, use_cache=True)
+        else:
+            result = model(node.tokens, use_cache=True)
+        
+        if isinstance(result, tuple):
+            _, action_kv_cache = result
     
     # 从未尝试动作列表中移除
-    if (action_index, action_text) in node.untried_actions:
-        node.untried_actions.remove((action_index, action_text))
+    node.untried_actions.pop(0)
     
     # 创建新节点 - 【优化】传递KV-Cache给子节点
     new_tokens = torch.cat([node.tokens, torch.tensor([action_index], device=device)])

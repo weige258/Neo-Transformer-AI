@@ -12,7 +12,7 @@ CONFIG: Dict[str, int | float] = {
     "num_layers_global": 2,   # 全局Transformer层数
     "num_layers_dynamic": 6, # 动态窗口层数
     "dropout": 0.1,
-    "temperature": 0.8,
+    "temperature": 1.0,
     # 动态Token选择配置
     "dynamic_token_top_k_ratio": 0.3,
     "attention_sink_tokens": 4,
