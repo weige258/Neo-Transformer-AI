@@ -893,7 +893,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         
         # 输出总结（无颜色）
         if thinking_available and thinking_content:
-            print(f"\n\n{answer_content}", flush=True)
+            pass
         
         return output_text
 
