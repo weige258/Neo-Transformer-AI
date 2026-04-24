@@ -198,24 +198,10 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             return None
         return text
     
-    # 【修复2】在train()入口增加输入长度限制
-    def _check_length(text, max_len=800):
-        if text is None:
-            return None
-        # 按字符截断，避免超长序列
-        if len(text) > max_len:
-            text = text[:max_len]
-        return text
-    
     ask = _sanitize(ask)
     think = _sanitize(think)
     answer = _sanitize(answer)
     history_context = _sanitize(history_context)
-    
-    ask = _check_length(ask)
-    think = _check_length(think)
-    answer = _check_length(answer)
-    history_context = _check_length(history_context)
     
     # ANSI颜色代码
     WHITE = '\033[97m'     # 问题 - 白色
