@@ -6,6 +6,11 @@ import torch
 from model import CONFIG, MainModel
 from record import record_loss
 from tokenizer import TextTokenizer
+from rl import (
+    GRPO_CONFIG, TREE_SEARCH_CONFIG, 
+    _compute_grpo_advantages, _majority_vote, _generate_with_sampling,
+    _tree_search, _compute_heuristic_reward
+)
 
 
 if hasattr(sys.stdin, "reconfigure"):
@@ -86,9 +91,10 @@ if torch.cuda.is_available():
                 _ = model(test_input)
             
             compile_success = True
-        except Exception:
-            # 编译失败,回退到标准模式
-            model = _load_model()
+        except Exception as e:
+            # 编译失败,回退到标准模式，保留原模型
+            print(f"[Warning] Torch compile failed: {e}, continuing with original model", flush=True)
+            # 不重新加载模型，保留当前权重
         finally:
             # 恢复日志级别
             inductor_logger.setLevel(old_level)
@@ -101,21 +107,6 @@ print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 
 loss_func = torch.nn.CrossEntropyLoss().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
-
-# GRPO配置
-GRPO_CONFIG = {
-    "num_samples": 4,  # 每组采样数量
-    "temperature": 1.0,  # 采样温度(提高多样性)
-    "kl_coefficient": 0.01,  # KL散度系数
-}
-
-# 树状搜索强化学习配置
-TREE_SEARCH_CONFIG = {
-    "max_depth": 3,  # 树的最大深度
-    "branch_factor": 2,  # 每个节点的分支数
-    "num_simulations": 4,  # 模拟次数
-    "exploration_constant": 1.0,  # UCT探索常数
-}
 
 
 def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = None):
@@ -177,395 +168,6 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
         )
     
     return train_tensor, target_mask, preview
-
-
-def _compute_grpo_advantages(rewards: list[float]) -> list[float]:
-    """计算GRPO的优势函数(组内标准化)"""
-    if len(rewards) < 2:
-        return [0.0] * len(rewards)
-    
-    mean_reward = sum(rewards) / len(rewards)
-    std_reward = (sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)) ** 0.5
-    
-    if std_reward < 1e-8:
-        return [0.0] * len(rewards)
-    
-    advantages = [(r - mean_reward) / std_reward for r in rewards]
-    return advantages
-
-
-def _majority_vote(outputs: list[str]) -> str:
-    """多数投票选择共识答案"""
-    if not outputs:
-        return ""
-    
-    # 简单统计出现次数最多的输出
-    count_dict = {}
-    for output in outputs:
-        count_dict[output] = count_dict.get(output, 0) + 1
-    
-    # 返回出现次数最多的
-    return max(count_dict, key=count_dict.get)
-
-
-def _generate_with_sampling(prompt: torch.Tensor, num_samples: int) -> list[tuple[torch.Tensor, str]]:
-    """带采样的生成函数,用于GRPO/TTRL"""
-    samples = []
-    
-    with torch.inference_mode():
-        for _ in range(num_samples):
-            current_prompt = prompt.clone()
-            result = model(current_prompt, use_cache=True)
-            if isinstance(result, tuple):
-                logits, past_key_values = result
-            else:
-                logits = result
-            
-            generated_tokens = []
-            # 移除采样长度限制，让模型生成更完整的回答
-            step = 0
-            max_steps = 100  # 设置一个合理的最大步数，避免无限循环
-            while step < max_steps:
-                try:
-                    next_logits = logits[-1]
-                    probs = torch.softmax(next_logits / GRPO_CONFIG["temperature"], dim=-1)
-                    index = int(torch.multinomial(probs, 1).item())
-                    
-                    if index == TextTokenizer.END_GENERATION_TOKEN:
-                        break
-                    
-                    generated_tokens.append(index)
-                    next_token = torch.tensor([index], device=device)
-                    current_prompt = torch.cat([current_prompt, next_token])
-                    
-                    result = model(
-                        next_token,
-                        past_key_values=past_key_values,
-                        use_cache=True,
-                    )
-                    if isinstance(result, tuple):
-                        logits, past_key_values = result
-                    else:
-                        logits = result
-                    
-                    step += 1
-                except Exception:
-                    break
-            
-            if generated_tokens:
-                generated_tensor = torch.tensor(generated_tokens, device=device)
-                decoded_text = TextTokenizer.decode(generated_tensor)
-                samples.append((generated_tensor, decoded_text))
-    
-    return samples
-
-
-class TreeNode:
-    """树搜索节点"""
-    def __init__(self, tokens: torch.Tensor, text: str, parent=None, past_key_values=None):
-        self.tokens = tokens  # 到当前节点的token序列
-        self.text = text  # 解码后的文本
-        self.parent = parent
-        self.children: list['TreeNode'] = []
-        self.visits = 0  # 访问次数
-        self.value = 0.0  # 节点价值(奖励)
-        self.untried_actions: list[tuple[int, str]] = []  # 未尝试的动作
-        self.past_key_values = past_key_values  # 【优化】缓存KV状态,避免重复计算
-    
-    def is_fully_expanded(self) -> bool:
-        """检查是否所有动作都已尝试"""
-        # 如果untried_actions为None，表示尚未生成，返回False
-        if self.untried_actions is None:
-            return False
-        # 否则检查是否为空
-        return len(self.untried_actions) == 0
-    
-    def best_child(self, exploration_constant: float) -> 'TreeNode':
-        """使用UCT公式选择最佳子节点"""
-        if not self.children:
-            return None
-        
-        uct_scores = []
-        for child in self.children:
-            if child.visits == 0:
-                uct_scores.append(float('inf'))
-            else:
-                exploitation = child.value / child.visits
-                exploration = exploration_constant * (math.log(self.visits) / child.visits) ** 0.5
-                uct_scores.append(exploitation + exploration)
-        
-        best_idx = uct_scores.index(max(uct_scores))
-        return self.children[best_idx]
-    
-    def update(self, reward: float):
-        """更新节点统计信息"""
-        self.visits += 1
-        self.value += reward
-
-
-def _expand_node(node: TreeNode, prompt: torch.Tensor, branch_factor: int) -> TreeNode | None:
-    """扩展节点:生成新的子节点"""
-    if node.is_fully_expanded():
-        return None
-    
-    # 首次扩展时，生成候选动作并初始化untried_actions
-    if node.untried_actions is None:
-        candidates = []
-        with torch.inference_mode():
-            for _ in range(branch_factor):
-                # 【关键优化】复用父节点的KV-Cache,只传入最后一个token
-                if node.past_key_values is not None and len(node.tokens) > 0:
-                    # 只传入最新的一个token,利用缓存加速
-                    last_token = node.tokens[-1:].clone()
-                    result = model(last_token, past_key_values=node.past_key_values, use_cache=True)
-                else:
-                    # 根节点或无缓存时,传入完整序列
-                    result = model(node.tokens, use_cache=True)
-                
-                if isinstance(result, tuple):
-                    logits, past_key_values = result
-                else:
-                    logits = result
-                    past_key_values = None
-                
-                try:
-                    next_logits = logits[-1]
-                    probs = torch.softmax(next_logits / GRPO_CONFIG["temperature"], dim=-1)
-                    index = int(torch.multinomial(probs, 1).item())
-                    
-                    if index == TextTokenizer.END_GENERATION_TOKEN:
-                        continue
-                    
-                    decoded_piece = TextTokenizer.decode(torch.tensor([index]))
-                    if not decoded_piece:
-                        continue
-                    
-                    candidates.append((index, decoded_piece, past_key_values))
-                except Exception:
-                    continue
-        
-        if not candidates:
-            # 如果没有候选动作，标记为已完全扩展
-            node.untried_actions = []
-            return None
-        
-        # 初始化未尝试的动作列表
-        node.untried_actions = [(c[0], c[1]) for c in candidates]
-    
-    # 从现有的未尝试动作中选择一个
-    if not node.untried_actions:
-        return None
-    
-    # 获取第一个未尝试的动作
-    action_index, action_text = node.untried_actions[0]
-    
-    # 重新获取该动作的KV-Cache
-    action_kv_cache = None
-    with torch.inference_mode():
-        if node.past_key_values is not None and len(node.tokens) > 0:
-            last_token = node.tokens[-1:].clone()
-            result = model(last_token, past_key_values=node.past_key_values, use_cache=True)
-        else:
-            result = model(node.tokens, use_cache=True)
-        
-        if isinstance(result, tuple):
-            _, action_kv_cache = result
-    
-    # 从未尝试动作列表中移除
-    node.untried_actions.pop(0)
-    
-    # 创建新节点 - 【优化】传递KV-Cache给子节点
-    new_tokens = torch.cat([node.tokens, torch.tensor([action_index], device=device)])
-    new_text = node.text + action_text
-    child_node = TreeNode(new_tokens, new_text, parent=node, past_key_values=action_kv_cache)
-    node.children.append(child_node)
-    
-    return child_node
-
-
-def _simulate(node: TreeNode, max_steps: int = 10) -> float:
-    """模拟:从当前节点随机rollout到终止"""
-    current_tokens = node.tokens.clone()
-    current_text = node.text
-    
-    with torch.inference_mode():
-        # 【关键优化】复用节点的KV-Cache作为起始状态
-        past_kv = node.past_key_values
-        
-        for step in range(max_steps):
-            # 如果有缓存,只传入最后一个token;否则传入完整序列
-            if past_kv is not None and len(current_tokens) > 0:
-                last_token = current_tokens[-1:].clone()
-                result = model(last_token, past_key_values=past_kv, use_cache=True)
-            else:
-                result = model(current_tokens, use_cache=True)
-            
-            if isinstance(result, tuple):
-                logits, past_kv = result  # 更新缓存供下一步使用
-            else:
-                logits = result
-                past_kv = None
-            
-            try:
-                next_logits = logits[-1]
-                probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
-                index = int(torch.multinomial(probs, 1).item())
-                
-                if index == TextTokenizer.END_GENERATION_TOKEN:
-                    break
-                
-                decoded_piece = TextTokenizer.decode(torch.tensor([index]))
-                if not decoded_piece:
-                    break
-                
-                current_tokens = torch.cat([current_tokens, torch.tensor([index], device=device)])
-                current_text += decoded_piece
-            except Exception:
-                break
-    
-    # 返回基于文本质量的奖励(无标签时使用启发式规则)
-    reward = _compute_heuristic_reward(current_text)
-    return reward
-
-
-def _compute_heuristic_reward(text: str) -> float:
-    """计算启发式奖励(无标签场景)"""
-    if not text:
-        return 0.0
-    
-    reward = 0.0
-    
-    # 1. 长度奖励(鼓励生成完整回答，但避免过长或过短)
-    length = len(text)
-    if length < 5:
-        # 对过短文本进行强惩罚
-        length_score = length / 10.0 * 0.5
-    elif length > 100:
-        # 对过长文本进行惩罚
-        length_score = 1.0 - (length - 100) / 200.0
-        length_score = max(0.3, length_score)
-    else:
-        length_score = 1.0
-    reward += length_score * 0.2
-    
-    # 2. 多样性奖励(鼓励不同字符和词汇)
-    unique_chars = len(set(text))
-    diversity_score = min(unique_chars / 20.0, 1.0)
-    # 对重复字符进行额外惩罚
-    if unique_chars < len(text) * 0.3:
-        diversity_score *= 0.5
-    reward += diversity_score * 0.25
-    
-    # 3. 连贯性奖励(避免重复)
-    words = text.split()
-    if len(words) > 1:
-        unique_words = len(set(words))
-        repetition_ratio = unique_words / len(words)
-        # 对重复词汇进行强惩罚
-        if repetition_ratio < 0.5:
-            repetition_ratio *= 0.5
-        reward += repetition_ratio * 0.3
-    else:
-        # 对单字回答进行惩罚
-        reward += 0.05
-    
-    # 4. 自一致性奖励(检查文本是否自相矛盾)
-    consistency_score = 1.0
-    # 简单检查：避免明显的自相矛盾
-    if "不是" in text and "是" in text:
-        consistency_score = 0.5
-    # 检查是否有重复的短语
-    if len(text) > 10:
-        for i in range(len(text) - 2):
-            phrase = text[i:i+3]
-            if text.count(phrase) > 2:
-                consistency_score *= 0.7
-                break
-    reward += consistency_score * 0.1
-    
-    # 5. 格式奖励(鼓励完整的句子结构)
-    format_score = 0.0
-    if text.endswith(".") or text.endswith("！") or text.endswith("？"):
-        format_score = 1.0
-    elif text.endswith(",") or text.endswith("；"):
-        format_score = 0.5
-    reward += format_score * 0.15
-    
-    return reward
-
-
-def _tree_search(prompt: torch.Tensor, question: str) -> tuple[torch.Tensor, str, float]:
-    """执行简化的蒙特卡洛树搜索
-    
-    Returns:
-        best_new_tokens: 新生成的token序列（不包含prompt）
-        best_text: 完整文本（包含prompt + 新生成部分）
-        best_reward: 最佳路径的奖励
-    """
-    # 【优化】初始化根节点时预计算KV-Cache
-    root_tokens = prompt.clone()
-    root_text = TextTokenizer.decode(root_tokens[root_tokens != 0])
-    
-    # 预计算根节点的KV状态,避免后续重复计算
-    with torch.inference_mode():
-        result = model(root_tokens, use_cache=True)
-        if isinstance(result, tuple):
-            _, root_past_kv = result
-        else:
-            root_past_kv = None
-    
-    root = TreeNode(root_tokens, root_text, past_key_values=root_past_kv)
-    
-    # 初始化未尝试动作为None,表示尚未生成
-    root.untried_actions = None  # 实际在_expand_node中动态生成
-    
-    max_depth = TREE_SEARCH_CONFIG["max_depth"]
-    branch_factor = TREE_SEARCH_CONFIG["branch_factor"]
-    num_simulations = TREE_SEARCH_CONFIG["num_simulations"]
-    exploration_constant = TREE_SEARCH_CONFIG["exploration_constant"]
-    
-    # MCTS主循环
-    for _ in range(num_simulations):
-        # 1. Selection: 选择节点
-        node = root
-        while node.children and node.is_fully_expanded():
-            node = node.best_child(exploration_constant)
-            if node is None:
-                break
-        
-        if node is None:
-            continue
-        
-        # 2. Expansion: 扩展节点
-        if not node.is_fully_expanded() and len(node.text.split()) < max_depth * 5:
-            child = _expand_node(node, prompt, branch_factor)
-            if child:
-                node = child
-        
-        # 3. Simulation: 模拟
-        reward = _simulate(node)
-        
-        # 4. Backpropagation: 反向传播
-        while node:
-            node.update(reward)
-            node = node.parent
-    
-    # 选择访问次数最多的节点作为最佳路径
-    best_node = root
-    for child in root.children:
-        if child.visits > best_node.visits:
-            best_node = child
-    
-    best_reward = best_node.value / best_node.visits if best_node.visits > 0 else 0.0
-    
-    # 【关键修复】提取新生成的tokens（去除prompt部分）
-    prompt_len = len(prompt)
-    if len(best_node.tokens) > prompt_len:
-        best_new_tokens = best_node.tokens[prompt_len:]
-    else:
-        best_new_tokens = torch.tensor([], device=device, dtype=torch.long)
-    
-    return best_new_tokens, best_node.text, best_reward
 
 
 def train(ask: str = None, think: str = None, answer: str = None, history_context: str = None) -> None:
@@ -694,9 +296,9 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
         ]
     )
-  
+    
     # 【GRPO】为问题生成多个候选答案
-    samples = _generate_with_sampling(prompt, GRPO_CONFIG["num_samples"])
+    samples = _generate_with_sampling(model, prompt, GRPO_CONFIG["num_samples"])
     if not samples:
         return
     
@@ -710,9 +312,35 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
     # 【GRPO】计算优势函数
     advantages = _compute_grpo_advantages(rewards)
     
-    # 【GRPO正确实现】对每个样本分别计算加权Loss并累加
+    # 【修复GRPO】累积所有样本的梯度后再更新
     total_loss = torch.tensor(0.0, device=device)
     valid_samples = 0
+    
+    # 首先清空梯度
+    optimizer.zero_grad()
+    
+    # 【优化】预计算所有样本的完整tokens
+    full_tokens_list = []
+    target_mask_list = []
+    for sample_tokens, _ in samples:
+        full_tokens = torch.cat([prompt, sample_tokens])
+        target_mask = torch.cat([
+            torch.zeros(len(prompt), dtype=torch.bool, device=device),
+            torch.ones(len(sample_tokens), dtype=torch.bool, device=device),
+        ])
+        full_tokens_list.append(full_tokens)
+        target_mask_list.append(target_mask)
+    
+    # 【优化】一次性计算所有样本的参考策略logits
+    with torch.no_grad():
+        ref_logits_list = []
+        for full_tokens in full_tokens_list:
+            ref_result = model(full_tokens, use_cache=False)
+            if isinstance(ref_result, tuple):
+                ref_logits = ref_result[0]
+            else:
+                ref_logits = ref_result
+            ref_logits_list.append(ref_logits)
     
     for idx, (sample_tokens, sample_text) in enumerate(samples):
         advantage = advantages[idx]
@@ -721,20 +349,76 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         if abs(advantage) < 1e-6:
             continue
         
-        # 构建该样本的训练数据
-        full_tokens = torch.cat([prompt, sample_tokens])
-        # 只对生成的部分计算loss（mask掉prompt部分）
-        target_mask = torch.cat([
-            torch.zeros(len(prompt), dtype=torch.bool, device=device),
-            torch.ones(len(sample_tokens), dtype=torch.bool, device=device),
-        ])
+        # 获取预计算的完整tokens和目标掩码
+        full_tokens = full_tokens_list[idx]
+        target_mask = target_mask_list[idx]
+        ref_logits = ref_logits_list[idx]
         
-        # 执行带优势加权的训练步骤
-        _run_train_step(full_tokens, target_mask, sample_tokens, advantage_weight=advantage, show_preview=False)
-        valid_samples += 1
+        # 【修复】使用相同的训练步骤但不立即更新，而是累积梯度
+        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+            # 【修复1】对完整序列计算当前策略的logits
+            result = model(full_tokens, use_cache=False)
+            if isinstance(result, tuple):
+                logits = result[0]
+            else:
+                logits = result
+
+            # 应用目标掩码并进行 next-token prediction 对齐
+            if len(full_tokens) > 1:
+                # 正确的 next-token prediction 对齐
+                masked_logits = logits[:-1][target_mask[1:]]
+                masked_targets = full_tokens[1:][target_mask[1:]]
+                
+                if len(masked_logits) > 0 and len(masked_targets) > 0:
+                    # 【修复1】获取参考策略的logits（对应生成部分）
+                    ref_logits_for_gen = ref_logits[:-1][target_mask[1:]]
+                    
+                    # 计算当前策略和参考策略的log概率
+                    curr_log_probs = torch.log_softmax(masked_logits, dim=-1)
+                    ref_log_probs = torch.log_softmax(ref_logits_for_gen, dim=-1)
+                    
+                    # 计算策略比率
+                    curr_log_prob_selected = torch.gather(curr_log_probs, -1, masked_targets.unsqueeze(-1)).squeeze(-1)
+                    ref_log_prob_selected = torch.gather(ref_log_probs, -1, masked_targets.unsqueeze(-1)).squeeze(-1)
+                    
+                    # 计算策略比率
+                    ratio = torch.exp(curr_log_prob_selected - ref_log_prob_selected)
+                    
+                    # 【修复】GRPO标准损失计算：advantage * ratio * log_prob
+                    pg_loss = -advantage * ratio * curr_log_prob_selected
+                    
+                    # 【修复2】修正KL散度的分布顺序：应该是当前策略在前，参考策略在后
+                    kl_div = torch.distributions.kl_divergence(
+                        torch.distributions.Categorical(logits=masked_logits),
+                        torch.distributions.Categorical(logits=ref_logits_for_gen)
+                    ).mean()
+                    
+                    # 总损失 = 策略梯度损失 + KL散度惩罚
+                    sample_loss = pg_loss.mean() + GRPO_CONFIG["kl_coefficient"] * kl_div
+                    
+                    # 累积损失，按样本数平均以保持梯度尺度稳定
+                    total_loss += sample_loss / GRPO_CONFIG["num_samples"]
+                    valid_samples += 1
+                else:
+                    continue
+            else:
+                continue
     
+    # 【GRPO】只有在有有效样本时才进行参数更新
     if valid_samples > 0:
+        # 应用梯度缩放和更新
+        scaler.scale(total_loss).backward()
+        
+        # 【可选】添加梯度裁剪以提高稳定性
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        scaler.step(optimizer)
+        scaler.update()
+        
         print(f"[GRPO] Trained on {valid_samples} samples with advantages: {[f'{a:.2f}' for a in advantages]}", flush=True)
+    else:
+        print("[GRPO] No valid samples for training, falling back to standard SFT if available", flush=True)
 
 
 def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
@@ -783,7 +467,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
  
     with torch.inference_mode():
         # 【树状搜索强化学习】在生成阶段执行MCTS搜索
-        best_new_tokens, best_full_text, tree_reward = _tree_search(prompt, text)
+        best_new_tokens, best_full_text, tree_reward = _tree_search(model, prompt, text)
         
         # 【关键修复】MCTS只决定前N个token，然后继续自回归生成
         # 如果MCTS找到了高质量的前缀且长度合理，使用它作为起始
@@ -800,13 +484,20 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         else:
             current_prompt = prompt.clone()
         
-        # 【新增】如果启用思维链且MCTS没有生成THINK_START_TOKEN，手动添加
+        # 【新增】如果启用思维链，检查当前prompt是否包含THINK_START_TOKEN
         thinking_started = False
-        if thinking_available and not mcts_used:
-            thinking_started = True
-            # 添加THINK_START_TOKEN到prompt
-            think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
-            current_prompt = torch.cat([current_prompt, think_start_tensor])
+        if thinking_available:
+            # 检查当前prompt是否已经包含THINK_START_TOKEN（包括MCTS生成的部分）
+            has_think_token = (current_prompt == TextTokenizer.THINK_START_TOKEN).any()
+            if has_think_token:
+                # 如果prompt中存在THINK_START_TOKEN，则认为思考已经开始
+                thinking_started = True
+            elif not mcts_used:
+                # 如果MCTS没有使用且没有THINK_START_TOKEN，则手动添加
+                thinking_started = True
+                # 添加THINK_START_TOKEN到prompt
+                think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
+                current_prompt = torch.cat([current_prompt, think_start_tensor])
         
         # 【修复】继续标准自回归生成（无论是否使用了MCTS）
         result = model(current_prompt, use_cache=True)
@@ -846,12 +537,13 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 elif index == TextTokenizer.END_GENERATION_TOKEN:
                     break
 
-                # 处理思维链开始标记
+                # 检查是否遇到THINK_START_TOKEN
                 elif index == TextTokenizer.THINK_START_TOKEN:
-                    if thinking_available:
+                    if thinking_available and not thinking_started:
+                        # 如果思维链尚未开始但遇到了开始标记，则开启思维链
                         thinking_started = True
                         should_skip_output = True  # 不输出THINK_START_TOKEN本身
-                    else:
+                    elif not thinking_available:
                         # 如果不启用思维链，跳过思考过程
                         should_skip_output = True
                 
@@ -929,18 +621,47 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             masked_targets = train_tensor[1:][target_mask[1:]]
             
             if len(masked_logits) > 0 and len(masked_targets) > 0:
+                # 检查masked_logits和masked_targets是否包含NaN或无穷大
+                if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
+                    print(f"[Warning] NaN or Inf detected in logits, skipping this step", flush=True)
+                    return
+                
+                if torch.isnan(masked_targets).any() or torch.isinf(masked_targets).any():
+                    print(f"[Warning] NaN or Inf detected in targets, skipping this step", flush=True)
+                    return
+                
                 loss = loss_func(masked_logits, masked_targets)
+                
+                # 检查loss是否为NaN
+                if torch.isnan(loss):
+                    print(f"[Warning] NaN loss detected, skipping this step", flush=True)
+                    return
             else:
                 loss = torch.tensor(0.0, device=device)
         else:
             loss = torch.tensor(0.0, device=device)
+        
+        # 检查advantage_weight是否为NaN
+        if torch.isnan(torch.tensor(advantage_weight)):
+            print(f"[Warning] NaN advantage_weight detected, using 1.0", flush=True)
+            advantage_weight = 1.0
+            
         # 应用GRPO优势加权
         loss = loss * advantage_weight
         record_loss(loss.item())
 
-    scaler.scale(loss).backward()
-    scaler.step(optimizer)
-    scaler.update()
+    # 检查损失是否有效
+    if not torch.isnan(loss) and not torch.isinf(loss):
+        scaler.scale(loss).backward()
+        
+        # 梯度裁剪以防止梯度爆炸
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        print(f"[Warning] Invalid loss detected: {loss}, skipping optimizer step", flush=True)
 
     # 输出训练预览(可选)
     if show_preview:

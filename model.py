@@ -3,14 +3,15 @@ from typing import Dict
 import torch
 from torch import nn
 import torch.utils.checkpoint as checkpoint
+import torch.nn.functional as F
 
 
 CONFIG: Dict[str, int | float] = {
     "dict_size": 60000,
     "emb_size": 512,
     "num_heads": 8,
-    "num_layers_global": 2,   # 全局Transformer层数
-    "num_layers_dynamic": 6, # 动态窗口层数
+    "num_layers_linear": 4,   # 线性注意力层数
+    "num_layers_dynamic": 4, # 标准注意力层数
     "dropout": 0.1,
     "temperature": 1.0,
     # 动态Token选择配置
@@ -26,14 +27,25 @@ KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6) -> None:
+    """Root Mean Square Layer Normalization for dynamic dimensions"""
+    
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
-
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
-        return x * rms * self.weight
+        # 检查最后一个维度是否与weight维度匹配
+        if x.size(-1) != self.weight.size(0):
+            # 如果不匹配，则使用相应部分的weight
+            weight = self.weight[:x.size(-1)]
+        else:
+            weight = self.weight
+            
+        # 计算RMS
+        rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
+        x = x / rms
+        return x * weight
 
 
 class RotaryPositionEmbedding(nn.Module):
@@ -68,6 +80,329 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
     return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
+
+
+class LinearAttention(nn.Module):
+    """
+    因果线性注意力，O(n) 复杂度。
+    使用 ELU+1 核函数，训练时用 cumsum，推理时用递归状态 (S, Z)。
+    """
+    def __init__(self, emb_size: int, num_heads: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = emb_size // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
+        self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
+        # 【关键】线性注意力与 RoPE 数学不兼容，禁用 RoPE
+        self.rope = None
+
+    def feature_map(self, x: torch.Tensor) -> torch.Tensor:
+        return F.elu(x) + 1.0
+
+    def forward(self, x: torch.Tensor, past_key_value=None, use_cache: bool = False):
+        batch, seq_len, emb_size = x.shape
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # 特征映射
+        q = self.feature_map(q) * self.scale  # [B, H, L, D]
+        k = self.feature_map(k)               # [B, H, L, D]
+
+        if use_cache:
+            # 推理阶段：缓存格式为 (S, Z, past_len)
+            # S: [B, H, D, D] 是累积的 k^T v
+            # Z: [B, H, D]    是累积的 k
+            if past_key_value is not None:
+                S, Z, past_len = past_key_value
+            else:
+                S = torch.zeros(batch, self.num_heads, self.head_dim, self.head_dim,
+                                device=x.device, dtype=x.dtype)
+                Z = torch.zeros(batch, self.num_heads, self.head_dim,
+                                device=x.device, dtype=x.dtype)
+                past_len = 0
+
+            # 更新全局状态
+            kv_new = torch.einsum('bhld,bhle->bhde', k, v)  # [B, H, D, D]
+            S_new = S + kv_new
+            Z_new = Z + k.sum(dim=2)  # [B, H, D]
+
+            # 计算输出
+            num = torch.einsum('bhld,bhde->bhle', q, S_new)  # [B, H, L, D]
+            den = torch.einsum('bhld,bhd->bhl', q, Z_new)  # [B, H, L]
+            den = torch.clamp(den, min=1e-6)  # 更安全的做法
+            out = num / den.unsqueeze(-1)
+
+            present_key_value = (S_new, Z_new, past_len + seq_len)
+        else:
+            # 训练阶段：因果 cumsum
+            # 正确的因果线性注意力实现，添加chunk机制避免内存爆炸
+            seq_len = q.size(2)
+            chunk_size = 256  # 与推理路径一致的分块大小
+            num_chunks = (seq_len + chunk_size - 1) // chunk_size
+            
+            # 初始化输出和累积值
+            num = torch.zeros_like(q)
+            den = torch.zeros(q.size(0), q.size(1), q.size(2), device=q.device, dtype=q.dtype)
+            
+            # 初始化跨chunk累积状态
+            S_carry = torch.zeros(batch, self.num_heads, self.head_dim, self.head_dim,
+                                  device=q.device, dtype=q.dtype)  # [B, H, D, D] - 累积的KV乘积
+            Z_carry = torch.zeros(batch, self.num_heads, self.head_dim,
+                                  device=q.device, dtype=q.dtype)  # [B, H, D] - 累积的K值
+            
+            # 分块处理
+            for i in range(num_chunks):
+                start = i * chunk_size
+                end = min((i + 1) * chunk_size, seq_len)
+                
+                # 获取当前块的q, k, v
+                q_chunk = q[:, :, start:end, :]
+                k_chunk = k[:, :, start:end, :]
+                v_chunk = v[:, :, start:end, :]
+                
+                # 计算当前块的外积 (k^T * v)
+                kv_chunk = torch.einsum('bhld,bhle->bhlde', k_chunk, v_chunk)  # [B, H, C, D, D]
+                
+                # 计算当前块内部的累积
+                kv_cumsum_chunk = kv_chunk.cumsum(dim=2)  # [B, H, C, D, D]
+                # 加上之前所有块的累积值
+                kv_cumsum_chunk = kv_cumsum_chunk + S_carry.unsqueeze(2)  # [B, H, 1, D, D] broadcast to [B, H, C, D, D]
+                
+                k_cumsum_chunk = k_chunk.cumsum(dim=2)  # [B, H, C, D]
+                # 加上之前所有块的累积值
+                k_cumsum_chunk = k_cumsum_chunk + Z_carry.unsqueeze(2)  # [B, H, 1, D] broadcast to [B, H, C, D]
+                
+                # 计算分子和分母
+                num_chunk = torch.einsum('bhld,bhlde->bhle', q_chunk, kv_cumsum_chunk)  # [B, H, C, D]
+                den_chunk = torch.einsum('bhld,bhld->bhl', q_chunk, k_cumsum_chunk)  # [B, H, C]
+                
+                # 存储结果
+                num[:, :, start:end, :] = num_chunk
+                den[:, :, start:end] = den_chunk
+                
+                # 更新carry状态为当前块的总和，供下一个chunk使用
+                S_carry = S_carry + kv_chunk.sum(dim=2)  # [B, H, D, D] - 累积所有之前的KV乘积
+                Z_carry = Z_carry + k_chunk.sum(dim=2)   # [B, H, D] - 累积所有之前的K值
+            
+            den = torch.clamp(den, min=1e-6)  # 更安全的做法
+            out = num / den.unsqueeze(-1)
+
+            present_key_value = None
+
+        # 重新排列维度并应用输出投影
+        out = out.permute(0, 2, 1, 3).contiguous()
+        out = out.view(batch, seq_len, self.num_heads * self.head_dim)
+        out = self.out_proj(out)
+
+        if use_cache:
+            return out, present_key_value
+        return out
+
+
+class H2OKVCompressor:
+    """
+    H2O (Heavy Hitter Oracle) KV缓存压缩实现
+    只保留对输出贡献最大的少量KV向量
+    """
+    @staticmethod
+    def compress(k_cache: torch.Tensor, v_cache: torch.Tensor, keep_ratio=0.5, protected_tokens=4):
+        """
+        压缩KV缓存，只保留最重要的向量
+        """
+        seq_len = k_cache.size(-2)
+        if seq_len <= protected_tokens * 2:
+            return k_cache, v_cache
+        
+        num_keep = max(protected_tokens + 1, int(seq_len * keep_ratio))
+        
+        # 计算重要性得分：使用 K 的 L2 范数（作为 Heavy Hitter 的简化指标）
+        with torch.no_grad():
+            # [batch, heads, seq_len]
+            scores = torch.norm(k_cache, dim=-1)
+            
+            # 保护最新的几个 token 不被删除
+            scores[:, :, -protected_tokens:] = float('inf')
+            
+            # 找到得分最高的前 num_keep 个索引
+            _, indices = torch.topk(scores, num_keep, dim=-1, sorted=True)
+            indices = indices.sort(dim=-1).values # 保持时间顺序
+            
+        # 重新索引获取压缩后的 KV
+        k_compressed = k_cache.gather(-2, 
+                                     indices.unsqueeze(-1).expand(-1, -1, -1, k_cache.size(-1)))
+        v_compressed = v_cache.gather(-2, 
+                                     indices.unsqueeze(-1).expand(-1, -1, -1, v_cache.size(-1)))
+        
+        return k_compressed, v_compressed
+
+
+class BlockwiseAttention(nn.Module):
+    """
+    分块局部-全局注意力机制
+    
+    核心设计:
+    1. 将序列分成固定大小的块
+    2. 块内使用完整的自注意力（局部精细）
+    3. 块间通过全局汇总 token 交互（全局粗粒度）
+    4. 可选: 滑动窗口覆盖相邻块边界
+    """
+    def __init__(
+        self,
+        emb_size: int,
+        num_heads: int,
+        dropout: float,
+        block_size: int = 256,
+        num_global_tokens: int = 4,
+        use_sliding_window: bool = True,
+        sliding_window_size: int = 128,
+    ) -> None:
+        super().__init__()
+        if emb_size % num_heads != 0:
+            raise ValueError("emb_size must be divisible by num_heads.")
+        
+        self.num_heads = num_heads
+        self.head_dim = emb_size // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.block_size = block_size
+        self.num_global_tokens = num_global_tokens
+        self.use_sliding_window = use_sliding_window
+        self.sliding_window_size = sliding_window_size
+        
+        # QKV 投影
+        self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
+        self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
+        self.dropout = nn.Dropout(dropout)
+        
+        # RoPE 位置编码
+        self.rope = RotaryPositionEmbedding(self.head_dim)
+        
+        # 全局 token 的专用投影（用于跨块交互）
+        if num_global_tokens > 0:
+            self.global_q_proj = nn.Linear(emb_size, emb_size, bias=False)
+            self.global_k_proj = nn.Linear(emb_size, emb_size, bias=False)
+            self.global_v_proj = nn.Linear(emb_size, emb_size, bias=False)
+            self.global_out_proj = nn.Linear(emb_size, emb_size, bias=False)
+        
+        # KV 压缩器（复用 H2O）
+        self.kv_compressor = H2OKVCompressor
+
+    def _create_block_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        创建分块局部注意力掩码
+        
+        掩码规则:
+        - 同块内 token 互相可见
+        - 全局 token 可见所有 token
+        - 所有 token 可见全局 token
+        - 滑动窗口内的相邻块 token 可见（可选）
+        """
+        mask = torch.zeros(seq_len, seq_len, dtype=torch.bool, device=device)
+        
+        # 1. 同块内互相可见
+        num_blocks = (seq_len + self.block_size - 1) // self.block_size
+        for b in range(num_blocks):
+            start = b * self.block_size
+            end = min((b + 1) * self.block_size, seq_len)
+            mask[start:end, start:end] = True
+        
+        # 2. 全局 token 机制
+        # 假设前 num_global_tokens 个 token 是全局 token（如 CLS 或特殊标记）
+        if self.num_global_tokens > 0:
+            global_end = min(self.num_global_tokens, seq_len)
+            # 全局 token 可见所有 token
+            mask[:global_end, :] = True
+            # 所有 token 可见全局 token
+            mask[:, :global_end] = True
+        
+        # 3. 滑动窗口（覆盖相邻块边界）
+        if self.use_sliding_window:
+            for i in range(seq_len):
+                window_start = max(0, i - self.sliding_window_size)
+                window_end = min(seq_len, i + self.sliding_window_size + 1)
+                mask[i, window_start:window_end] = True
+        
+        # 4. 保持因果性（只可见当前及之前位置）
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
+        mask = mask & causal_mask
+        
+        return mask
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        past_key_value: KVCache | None = None,
+        use_cache: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
+        batch, seq_len, _ = x.shape
+        
+        # QKV 投影
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        # RoPE 位置编码
+        past_len = 0 if past_key_value is None else past_key_value[0].size(-2)
+        cos, sin = self.rope(seq_len=seq_len, device=x.device, start_pos=past_len)
+        q = (q * cos) + (rotate_half(q) * sin)
+        k = (k * cos) + (rotate_half(k) * sin)
+
+        # KV 缓存处理（与 FlashAttentionWithKVCache 相同）
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = torch.cat([past_k, k], dim=-2)
+            v = torch.cat([past_v, v], dim=-2)
+            
+            # 应用 H2O 压缩
+            if k.size(-2) > 1024:
+                k, v = self.kv_compressor.compress(k, v, keep_ratio=0.5, protected_tokens=4)
+
+        # 生成分块掩码
+        total_len = k.size(-2)  # 包含 past_key_value 的总长度
+        if past_key_value is None:
+            # 训练/首次前向：使用分块稀疏掩码
+            attn_mask = self._create_block_mask(total_len, x.device)
+            # 扩展为 [batch, num_heads, seq_len, total_len] 的布尔掩码
+            attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, total_len, total_len]
+            attn_mask = attn_mask.expand(batch, self.num_heads, -1, -1)
+            
+            # 转换为填充掩码（True 表示需要 mask 的位置）
+            # scaled_dot_product_attention 需要: True = 需要 mask (不参与注意力)
+            # 我们的 mask: True = 可以参与注意力
+            # 所以需要取反
+            attn_mask = ~attn_mask
+        else:
+            # 推理时：不使用掩码（因果性由逐 token 生成保证）
+            attn_mask = None
+
+        # 使用 FlashAttention（支持自定义掩码）
+        if attn_mask is not None:
+            # 需要填充掩码时，使用 attn_mask 参数
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False,  # 我们已经通过 attn_mask 实现了因果性
+            )
+        else:
+            # 推理时无掩码
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.dropout.p if self.training else 0.0,
+                is_causal=False,
+            )
+
+        # 重新整理输出
+        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        output = self.out_proj(output)
+
+        if use_cache:
+            return output, (k, v)
+        return output
 
 
 class VariableDimAdaptiveFFN(nn.Module):
@@ -116,442 +451,61 @@ class VariableDimAdaptiveFFN(nn.Module):
         
         # 1. 计算自适应维度比例（增加数值稳定性）
         x_mean = x.mean(dim=1)  # [batch, emb_size]
-        dim_ratio = self.dim_predictor(x_mean)  # [batch, 1]
+        dim_ratio = self.dim_predictor(x_mean)  # [batch, 1] 范围[0, 1]，已经是Sigmoid输出
         
         # 2. 应用SwiGLU激活（使用完整维度）
-        gate = torch.nn.functional.silu(self.gate_proj(x))  # [batch, seq_len, max_ffn_size]
-        up = self.up_proj(x)  # [batch, seq_len, max_ffn_size]
-        hidden = gate * up
+        gate_full = torch.nn.functional.silu(self.gate_proj(x))  # [batch, seq_len, max_ffn_size]
+        up_full = self.up_proj(x)  # [batch, seq_len, max_ffn_size]
         
-        # 3. 添加RMSNorm以提高数值稳定性
-        hidden = self.hidden_norm(hidden)
+        # 3. 应用动态维度裁剪，只保留前actual_size个维度
+        # 根据维度比例计算实际使用的FFN大小
+        # 将比例映射到 [1-adaptive_range, 1+adaptive_range] 范围内
+        actual_ratio = 1.0 + (dim_ratio - 0.5) * 2 * self.adaptive_range  # [1-range, 1+range]
+        actual_ratio = torch.clamp(actual_ratio, min=1-self.adaptive_range, max=1+self.adaptive_range)
+        actual_ffn_size = int(self.base_ffn_size * actual_ratio.mean().item())  # scalar
         
-        # 4. 输出投影
-        down = self.down_proj(hidden)  # [batch, seq_len, emb_size]
+        # 确保actual_ffn_size不为0
+        actual_ffn_size = max(1, actual_ffn_size)
+        
+        # 裁剪到实际大小
+        gate = gate_full[:, :, :actual_ffn_size]  # [batch, seq_len, actual_size]
+        up = up_full[:, :, :actual_ffn_size]      # [batch, seq_len, actual_size]
+        
+        hidden = gate * up                        # [batch, seq_len, actual_size]
+        
+        # 4. 对裁剪后的hidden进行RMSNorm，而不是对零填充后的张量
+        # 这样可以避免零填充对均值计算的影响
+        hidden = self.hidden_norm(hidden)  # [batch, seq_len, actual_size]
+        
+        # 5. 将hidden扩展到max_ffn_size维度，以适配down_proj
+        # 使用零填充，但这次我们不会对零填充进行归一化
+        padded_hidden = torch.zeros(batch, seq_len, self.max_ffn_size, device=hidden.device, dtype=hidden.dtype)
+        padded_hidden[:, :, :actual_ffn_size] = hidden
+        
+        # 6. 输出投影 - 确保维度匹配
+        # down_proj期望输入是max_ffn_size维度，所以我们需要确保输入是正确维度
+        down = self.down_proj(padded_hidden)  # [batch, seq_len, emb_size]
         
         return self.dropout(down)
 
 
-class TokenImportanceScorer(nn.Module):
-    """轻量级Token重要性评分器
+class AdaptiveAttentionTransformerBlock(nn.Module):
+    """自适应注意力Transformer块
     
-    基于StreamingLLM和H2O的思想，为每个token计算重要性分数。
-    使用低维投影快速评估token的重要性，避免全维度计算。
+    支持多种注意力机制：标准Blockwise注意力、线性注意力，
+    支持GRPO（Group Relative Policy Optimization）强化学习训练。
     """
-    def __init__(self, emb_size: int, reduced_dim: int = 64) -> None:
+    def __init__(self, emb_size: int, num_heads: int, dropout: float, 
+                 top_k_ratio: float = 0.3, attention_type: str = "standard") -> None:
         super().__init__()
-        self.reduced_dim = reduced_dim
-        # 低维投影层用于快速评分（使用较小的初始化）
-        self.proj_query = nn.Linear(emb_size, reduced_dim, bias=False)
-        self.proj_key = nn.Linear(emb_size, reduced_dim, bias=False)
-        # 可学习的评分向量
-        self.scoring_vector = nn.Parameter(torch.randn(reduced_dim) * 0.01)  # 减小初始方差
-        
-        # 初始化权重
-        nn.init.xavier_uniform_(self.proj_query.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.proj_key.weight, gain=0.1)
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, seq_len, emb_size]
-        Returns:
-            importance_scores: [batch, seq_len] 每个token的重要性分数
-        """
-        batch, seq_len, emb_size = x.shape
-        
-        # 投影到低维空间
-        q = self.proj_query(x)  # [batch, seq_len, reduced_dim]
-        k = self.proj_key(x)    # [batch, seq_len, reduced_dim]
-        
-        # 计算token与学习向量的相似度作为重要性分数
-        # 使用余弦相似度
-        q_normalized = q / (q.norm(dim=-1, keepdim=True) + 1e-8)
-        k_normalized = k / (k.norm(dim=-1, keepdim=True) + 1e-8)
-        scoring_vec_normalized = self.scoring_vector / (self.scoring_vector.norm() + 1e-8)
-        
-        # 计算分数：结合query和key的相似度
-        scores_q = (q_normalized * scoring_vec_normalized.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
-        scores_k = (k_normalized * scoring_vec_normalized.unsqueeze(0).unsqueeze(0)).sum(dim=-1)
-        importance_scores = (scores_q + scores_k) / 2.0  # [batch, seq_len]
-        
-        return importance_scores
-
-
-class DynamicTokenSelector(nn.Module):
-    """基于重要性评分的动态Token选择器
-    
-    实现StreamingLLM和Switch Attention的核心思想：
-    1. 保留注意力锚点（初始tokens）
-    2. 根据重要性分数选择Top-K重要tokens
-    3. 自动获得全局注意力权限
-    """
-    def __init__(self, top_k_ratio: float = 0.3, sink_tokens: int = 4) -> None:
-        super().__init__()
-        self.top_k_ratio = top_k_ratio
-        self.sink_tokens = sink_tokens
-        self.importance_scorer = TokenImportanceScorer(512)  # 默认emb_size，会在forward中适配
-    
-    def select_tokens(
-        self, 
-        x: torch.Tensor, 
-        importance_scores: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        选择重要tokens
-        
-        Args:
-            x: [batch, seq_len, emb_size] 输入特征
-            importance_scores: [batch, seq_len] 重要性分数
-        Returns:
-            selected_x: [batch, selected_seq_len, emb_size] 选中的tokens
-            selected_indices: [batch, selected_seq_len] 选中tokens的索引
-            mask: [batch, seq_len] 布尔掩码，标记哪些tokens被选中
-        """
-        batch, seq_len, emb_size = x.shape
-        
-        # 计算需要选择的token数量
-        num_select = max(int(seq_len * self.top_k_ratio), self.sink_tokens + 1)
-        num_select = min(num_select, seq_len)
-        
-        # 确保至少保留sink_tokens个初始tokens
-        if seq_len > self.sink_tokens:
-            # 分离锚点tokens和其余tokens
-            sink_scores = importance_scores[:, :self.sink_tokens]  # [batch, sink_tokens]
-            remaining_scores = importance_scores[:, self.sink_tokens:]  # [batch, seq_len - sink_tokens]
-            
-            # 从剩余tokens中选择Top-K
-            num_remaining_select = num_select - self.sink_tokens
-            if num_remaining_select > 0 and remaining_scores.size(1) > 0:
-                _, top_k_indices = torch.topk(remaining_scores, k=min(num_remaining_select, remaining_scores.size(1)), dim=-1)
-                top_k_indices = top_k_indices + self.sink_tokens  # 调整索引
-                
-                # 合并锚点和Top-K tokens
-                sink_indices = torch.arange(self.sink_tokens, device=x.device).unsqueeze(0).expand(batch, -1)
-                selected_indices = torch.cat([sink_indices, top_k_indices], dim=-1)
-            else:
-                selected_indices = torch.arange(min(num_select, seq_len), device=x.device).unsqueeze(0).expand(batch, -1)
-        else:
-            # 序列长度小于等于sink_tokens，全部保留
-            selected_indices = torch.arange(seq_len, device=x.device).unsqueeze(0).expand(batch, -1)
-        
-        # 创建掩码
-        mask = torch.zeros(batch, seq_len, dtype=torch.bool, device=x.device)
-        mask.scatter_(1, selected_indices, True)
-        
-        # 收集选中的tokens
-        selected_x = torch.gather(
-            x, 
-            1, 
-            selected_indices.unsqueeze(-1).expand(-1, -1, emb_size)
-        )
-        
-        return selected_x, selected_indices, mask
-
-
-class AdaptiveWindowAttention(nn.Module):
-    """自适应动态窗口注意力机制
-    
-    根据输入内容的复杂度动态调整窗口大小：
-    - 简单文本使用小窗口（节省算力）
-    - 复杂文本使用大窗口（提升性能）
-    
-    结合了StreamingLLM的局部窗口和全局token选择。
-    """
-    def __init__(
-        self, 
-        emb_size: int, 
-        num_heads: int, 
-        dropout: float,
-        min_window: int = 64,
-        max_window: int = 256,
-        complexity_threshold: float = 0.5
-    ) -> None:
-        super().__init__()
-        if emb_size % num_heads != 0:
-            raise ValueError("emb_size must be divisible by num_heads.")
-        
-        self.num_heads = num_heads
-        self.head_dim = emb_size // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.min_window = min_window
-        self.max_window = max_window
-        self.complexity_threshold = complexity_threshold
-        
-        self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
-        self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.rope = RotaryPositionEmbedding(self.head_dim)
-        
-        # 复杂度评估器：基于激活值的方差判断复杂度（优化初始化）
-        self.complexity_scorer = nn.Sequential(
-            nn.Linear(emb_size, emb_size // 4, bias=False),
-            nn.SiLU(),
-            nn.Linear(emb_size // 4, 1, bias=False),
-            nn.Sigmoid()
-        )
-        
-        # 初始化复杂度评估器权重
-        for module in self.complexity_scorer:
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight, gain=0.1)
-    
-    def compute_complexity(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        计算输入序列的复杂度
-        
-        Args:
-            x: [batch, seq_len, emb_size]
-        Returns:
-            complexity: [batch] 每个样本的复杂度分数 [0, 1]
-        """
-        # 方法1：基于激活值方差
-        variance = x.var(dim=[1, 2])  # [batch]
-        variance_normalized = torch.sigmoid(variance * 10 - 5)  # 映射到[0, 1]
-        
-        # 方法2：基于学习的复杂度评分
-        x_mean = x.mean(dim=1)  # [batch, emb_size]
-        learned_complexity = self.complexity_scorer(x_mean).squeeze(-1)  # [batch]
-        
-        # 综合两种方法
-        complexity = (variance_normalized + learned_complexity) / 2.0
-        return complexity
-    
-    def get_adaptive_window_size(self, complexity: torch.Tensor, seq_len: int) -> int:
-        """
-        根据复杂度动态计算窗口大小
-        
-        Args:
-            complexity: [batch] 复杂度分数
-            seq_len: 当前序列长度
-        Returns:
-            window_size: 自适应窗口大小
-        """
-        # 线性插值：简单->min_window, 复杂->max_window
-        window_size_float = self.min_window + complexity * (self.max_window - self.min_window)
-        window_size = window_size_float.mean().int().item()
-        
-        # 不能超过序列长度
-        window_size = min(window_size, seq_len)
-        window_size = max(window_size, self.min_window)
-        
-        return window_size
-    
-    def apply_window_mask(
-        self, 
-        attn_scores: torch.Tensor, 
-        query_positions: torch.Tensor,
-        key_positions: torch.Tensor,
-        window_size: int
-    ) -> torch.Tensor:
-        """
-        应用滑动窗口掩码
-        
-        Args:
-            attn_scores: [batch, heads, query_len, key_len]
-            query_positions: [query_len]
-            key_positions: [key_len]
-            window_size: 窗口大小
-        Returns:
-            masked_attn_scores: 应用窗口掩码后的注意力分数
-        """
-        # 计算相对位置
-        rel_positions = query_positions.unsqueeze(1) - key_positions.unsqueeze(0)  # [query_len, key_len]
-        
-        # 窗口掩码：只允许关注window_size范围内的tokens
-        window_mask = (rel_positions >= 0) & (rel_positions < window_size)
-        
-        # 因果掩码：不能关注未来的tokens
-        causal_mask = rel_positions >= 0
-        
-        # 组合掩码：取反，因为masked_fill是用value填充mask为True的位置
-        combined_mask = ~(window_mask & causal_mask)
-        
-        # 应用掩码
-        attn_scores = attn_scores.masked_fill(
-            combined_mask.unsqueeze(0).unsqueeze(0),
-            float("-inf")
-        )
-        
-        return attn_scores
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        past_key_value: KVCache | None = None,
-        use_cache: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
-        batch, seq_len, _ = x.shape
-        
-        # QKV投影
-        qkv = self.qkv_proj(x)
-        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # RoPE位置编码
-        past_len = 0 if past_key_value is None else past_key_value[0].size(-2)
-        cos, sin = self.rope(seq_len=seq_len, device=x.device, start_pos=past_len)
-        q = (q * cos) + (rotate_half(q) * sin)
-        k = (k * cos) + (rotate_half(k) * sin)
-        
-        # KV缓存
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-            k = torch.cat([past_k, k], dim=-2)
-            v = torch.cat([past_v, v], dim=-2)
-        
-        # 计算注意力分数
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        total_kv_len = k.size(-2)
-        
-        # 计算复杂度并获取自适应窗口大小
-        if seq_len > 1 or past_len == 0:
-            complexity = self.compute_complexity(x)  # [batch]
-            window_size = self.get_adaptive_window_size(complexity, total_kv_len)
-            
-            # 位置信息
-            key_positions = torch.arange(total_kv_len, device=x.device)
-            query_positions = torch.arange(past_len, past_len + seq_len, device=x.device)
-            
-            # 应用因果掩码
-            causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
-            attn_scores = attn_scores.masked_fill(
-                causal_mask.unsqueeze(0).unsqueeze(0),
-                float("-inf"),
-            )
-            
-            # 应用自适应窗口掩码（仅在训练时或长序列时）
-            if seq_len > self.min_window:
-                attn_scores = self.apply_window_mask(
-                    attn_scores, 
-                    query_positions, 
-                    key_positions, 
-                    window_size
-                )
-        
-        # Softmax和Dropout
-        attn = torch.softmax(attn_scores, dim=-1)
-        attn = self.dropout(attn)
-        
-        # 输出投影
-        output = torch.matmul(attn, v)
-        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
-        output = self.out_proj(output)
-        
-        if use_cache:
-            return output, (k, v)
-        return output
-
-
-class GlobalTransformerBlock(nn.Module):
-    """全局Transformer块（前6层）
-    
-    使用基于重要性评分的动态Token选择机制，
-    Top-K重要token自动获得全局注意力权限。
-    """
-    def __init__(self, emb_size: int, num_heads: int, dropout: float, top_k_ratio: float = 0.3) -> None:
-        super().__init__()
-        self.rms_norm1 = RMSNorm(emb_size)
-        self.rms_norm2 = RMSNorm(emb_size)
-        self.attention = CausalSelfAttention(emb_size, num_heads, dropout)
-        self.feed_forward = VariableDimAdaptiveFFN(emb_size, dropout)
-        
-        # 动态Token选择器 - 【修复】现在真正被使用了
-        self.token_selector = DynamicTokenSelector(
-            top_k_ratio=top_k_ratio,
-            sink_tokens=int(CONFIG.get("attention_sink_tokens", 4))
-        )
-        self.importance_scorer = TokenImportanceScorer(emb_size)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        past_key_value: KVCache | None = None,
-        use_cache: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
-        batch, seq_len, emb_size = x.shape
-        
-        # 【修复】计算Token重要性分数并选择Top-K tokens
-        importance_scores = self.importance_scorer(x)  # [batch, seq_len]
-        
-        # 【修复】动态选择重要tokens
-        if seq_len > 50:  # 只在序列较长时启用token选择
-            selected_x, selected_indices, mask = self.token_selector.select_tokens(x, importance_scores)
-            
-            # 对选中的tokens进行注意力计算
-            attn_output_selected = self.attention(
-                self.rms_norm1(selected_x),
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-            )
-            
-            if use_cache:
-                attention_output_selected, present_key_value = attn_output_selected
-            else:
-                attention_output_selected = attn_output_selected
-                present_key_value = None
-            
-            # 【修复】将选中的tokens的注意力输出还原到完整序列
-            # 确保数据类型一致，防止scatter_报错
-            attention_output = torch.zeros_like(x)
-            attention_output.scatter_(
-                1,
-                selected_indices.unsqueeze(-1).expand(-1, -1, emb_size),
-                attention_output_selected.to(attention_output.dtype)  # 显式转换dtype
-            )
-        else:
-            # 短序列直接使用标准注意力
-            attn_output = self.attention(
-                self.rms_norm1(x),
-                past_key_value=past_key_value,
-                use_cache=use_cache,
-            )
-            
-            if use_cache:
-                attention_output, present_key_value = attn_output
-            else:
-                attention_output = attn_output
-                present_key_value = None
-        
-        x = x + attention_output
-        
-        # FFN
-        ff_output = self.feed_forward(self.rms_norm2(x))
-        x = x + ff_output
-        
-        if use_cache:
-            return x, present_key_value
-        return x
-
-
-class DynamicWindowBlock(nn.Module):
-    """动态窗口Transformer块（后10层）
-    
-    使用自适应动态窗口大小调整机制，
-    根据输入复杂度自动调整窗口大小。
-    """
-    def __init__(
-        self, 
-        emb_size: int, 
-        num_heads: int, 
-        dropout: float,
-        min_window: int = 64,
-        max_window: int = 256
-    ) -> None:
-        super().__init__()
+        self.attention_type = attention_type
         self.rms_norm1 = RMSNorm(emb_size)
         self.rms_norm2 = RMSNorm(emb_size)
         
-        # 自适应窗口注意力
-        self.attention = AdaptiveWindowAttention(
-            emb_size=emb_size,
-            num_heads=num_heads,
-            dropout=dropout,
-            min_window=min_window,
-            max_window=max_window,
-            complexity_threshold=float(CONFIG.get("window_complexity_threshold", 0.5))
-        )
+        if attention_type == "linear":
+            self.attention = LinearAttention(emb_size, num_heads)
+        else:
+            self.attention = BlockwiseAttention(emb_size, num_heads, dropout)
         
         self.feed_forward = VariableDimAdaptiveFFN(emb_size, dropout)
     
@@ -561,7 +515,9 @@ class DynamicWindowBlock(nn.Module):
         past_key_value: KVCache | None = None,
         use_cache: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
-        # 自适应窗口注意力
+        batch, seq_len, emb_size = x.shape
+        
+        # 使用标准注意力机制处理所有tokens
         attn_output = self.attention(
             self.rms_norm1(x),
             past_key_value=past_key_value,
@@ -585,114 +541,45 @@ class DynamicWindowBlock(nn.Module):
         return x
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, emb_size: int, num_heads: int, dropout: float) -> None:
-        super().__init__()
-        if emb_size % num_heads != 0:
-            raise ValueError("emb_size must be divisible by num_heads.")
-        
-        self.num_heads = num_heads
-        self.head_dim = emb_size // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
-        self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        self.rope = RotaryPositionEmbedding(self.head_dim)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        past_key_value: KVCache | None = None,
-        use_cache: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, KVCache]:
-        batch, seq_len, _ = x.shape
-        
-        # QKV投影
-        qkv = self.qkv_proj(x)
-        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        
-        # RoPE位置编码
-        past_len = 0 if past_key_value is None else past_key_value[0].size(-2)
-        cos, sin = self.rope(seq_len=seq_len, device=x.device, start_pos=past_len)
-        q = (q * cos) + (rotate_half(q) * sin)
-        k = (k * cos) + (rotate_half(k) * sin)
-        
-        # KV缓存
-        if past_key_value is not None:
-            past_k, past_v = past_key_value
-            k = torch.cat([past_k, k], dim=-2)
-            v = torch.cat([past_v, v], dim=-2)
-        
-        # 计算注意力分数
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        
-        # 应用因果掩码
-        key_positions = torch.arange(k.size(-2), device=x.device)
-        query_positions = torch.arange(past_len, past_len + seq_len, device=x.device)
-        causal_mask = key_positions.unsqueeze(0) > query_positions.unsqueeze(1)
-        attn_scores = attn_scores.masked_fill(
-            causal_mask.unsqueeze(0).unsqueeze(0),
-            float("-inf"),
-        )
-        
-        # Softmax和Dropout
-        attn = torch.softmax(attn_scores, dim=-1)
-        attn = self.dropout(attn)
-        
-        # 输出投影
-        output = torch.matmul(attn, v)
-        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
-        output = self.out_proj(output)
-        
-        if use_cache:
-            return output, (k, v)
-        return output
-
-
 class MainModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         dict_size = int(CONFIG["dict_size"])
         emb_size = int(CONFIG["emb_size"])
         num_heads = int(CONFIG["num_heads"])
-        num_layers_global = int(CONFIG.get("num_layers_global", 6))
+        num_layers_linear = int(CONFIG.get("num_layers_linear", 6))
         num_layers_dynamic = int(CONFIG.get("num_layers_dynamic", 10))
         dropout = float(CONFIG["dropout"])
         
         # 动态Token选择配置
         top_k_ratio = float(CONFIG.get("dynamic_token_top_k_ratio", 0.3))
-        min_window = int(CONFIG.get("min_window_size", 64))
-        max_window = int(CONFIG.get("max_window_size", 256))
 
         self.token_embedding = nn.Embedding(dict_size, emb_size)
         self.embedding_dropout = nn.Dropout(dropout)
         
-        # 构建混合架构：6层全局Transformer + 10层动态窗口
+        # 构建混合架构：策略优化Transformer + 动态窗口Transformer
         self.transformers = nn.ModuleList()
         
-        # 前6层：全局Transformer（带动态Token选择）
-        for i in range(num_layers_global):
+        # 顺序排列：先添加所有线性注意力层，再添加所有标准注意力层
+        for _ in range(num_layers_linear):
             self.transformers.append(
-                GlobalTransformerBlock(
+                AdaptiveAttentionTransformerBlock(
                     emb_size=emb_size,
                     num_heads=num_heads,
                     dropout=dropout,
-                    top_k_ratio=top_k_ratio
+                    top_k_ratio=top_k_ratio,
+                    attention_type="linear",  # 线性注意力
                 )
             )
         
-        # 后10层：动态窗口Transformer（自适应窗口大小）
-        for i in range(num_layers_dynamic):
+        for _ in range(num_layers_dynamic):
             self.transformers.append(
-                DynamicWindowBlock(
+                AdaptiveAttentionTransformerBlock(
                     emb_size=emb_size,
                     num_heads=num_heads,
                     dropout=dropout,
-                    min_window=min_window,
-                    max_window=max_window
+                    top_k_ratio=top_k_ratio,
+                    attention_type="standard",  # 标准注意力
                 )
             )
         

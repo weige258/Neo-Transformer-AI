@@ -21,3 +21,7 @@
 <system_time>2026/04/19 20:51:08</system_time><time>06:06:34</time><avg_loss>1.187538</avg_loss>
 <system_time>2026/04/19 21:11:36</system_time><time>06:26:13</time><avg_loss>1.080625</avg_loss>
 <system_time>2026/04/19 21:31:10</system_time><time>06:44:53</time><avg_loss>1.064680</avg_loss>
+<system_time>2026/04/22 16:05:19</system_time><time>09:21:30</time><avg_loss>3.005593</avg_loss>
+<system_time>2026/04/22 19:03:53</system_time><time>10:23:51</time><avg_loss>2.974341</avg_loss>
+<system_time>2026/04/22 21:16:37</system_time><time>12:35:58</time><avg_loss>2.853829</avg_loss>
+<system_time>2026/04/24 11:48:11</system_time><time>14:20:52</time><avg_loss>6.696312</avg_loss>

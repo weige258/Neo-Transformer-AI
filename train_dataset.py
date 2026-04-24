@@ -187,9 +187,9 @@ def main() -> None:
                 current_lr = optimizer.param_groups[0]['lr']
                 
                 # 记录最近loss用于监控
-                from record import total_loss, record_count
-                if record_count > 0:
-                    avg_recent_loss = total_loss / record_count
+                import record
+                if record.record_count > 0:
+                    avg_recent_loss = record.total_loss / record.record_count
                     recent_losses.append(avg_recent_loss)
                     if len(recent_losses) > loss_window_size:
                         recent_losses.pop(0)
@@ -203,8 +203,14 @@ def main() -> None:
                     logging.info(f"Model saved, training rounds: {training_rounds}, current LR: {current_lr:.6f}, avg loss: {avg_loss:.6f}")
 
             except Exception as e:
-                logging.error(f"Training error: {e}")
-                continue
+                if "cannot convert float NaN to integer" in str(e):
+                    logging.error(f"NaN training error: {e}, skipping this sample")
+                    # 尝试清理梯度
+                    optimizer.zero_grad()
+                    continue
+                else:
+                    logging.error(f"Training error: {e}")
+                    continue
 
     except KeyboardInterrupt:
         logging.info("Training interrupted by user.")
