@@ -7,9 +7,9 @@ from model import CONFIG, MainModel
 from record import record_loss
 from tokenizer import TextTokenizer
 from rl import (
-    GRPO_CONFIG, TREE_SEARCH_CONFIG, 
+    GRPO_CONFIG, 
     _compute_grpo_advantages, _majority_vote, _generate_with_sampling,
-    _tree_search, _compute_heuristic_reward
+    _compute_heuristic_reward
 )
 
 
@@ -494,42 +494,25 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         max_generate_tokens = max(1, int(max_generate_tokens))
  
     with torch.inference_mode():
-        # 【树状搜索强化学习】在生成阶段执行MCTS搜索
-        best_new_tokens, best_full_text, tree_reward = _tree_search(model, prompt, text)
-        
-        # 【修改】MCTS结果验证
-        mcts_used = False
-        if best_new_tokens is not None and tree_reward > 0.3:
-            # 只有奖励足够高才使用MCTS结果
-            # 将MCTS生成的tokens拼接到prompt
-            current_prompt = torch.cat([prompt, best_new_tokens])
-            # 解码MCTS生成的部分
-            mcts_text = TextTokenizer.decode(best_new_tokens[best_new_tokens != 0])
-            if mcts_text:
-                print(mcts_text, end="", flush=True)
-                output_text += mcts_text
-                mcts_used = True
-        else:
-            mcts_used = False
-            # 回退到标准生成
-            current_prompt = prompt.clone()
+        # 直接进入标准生成
+        current_prompt = prompt.clone()
         
         # 【新增】如果启用思维链，检查当前prompt是否包含THINK_START_TOKEN
         thinking_started = False
         if thinking_available:
-            # 检查当前prompt是否已经包含THINK_START_TOKEN（包括MCTS生成的部分）
+            # 检查当前prompt是否已经包含THINK_START_TOKEN
             has_think_token = (current_prompt == TextTokenizer.THINK_START_TOKEN).any()
             if has_think_token:
                 # 如果prompt中存在THINK_START_TOKEN，则认为思考已经开始
                 thinking_started = True
-            elif not mcts_used:
-                # 如果MCTS没有使用且没有THINK_START_TOKEN，则手动添加
+            else:
+                # 如果没有THINK_START_TOKEN，则手动添加
                 thinking_started = True
                 # 添加THINK_START_TOKEN到prompt
                 think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
                 current_prompt = torch.cat([current_prompt, think_start_tensor])
         
-        # 【修复】继续标准自回归生成（无论是否使用了MCTS）
+        # 继续标准自回归生成
         result = model(current_prompt, use_cache=True)
         if isinstance(result, tuple):
             logits, past_key_values = result

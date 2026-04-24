@@ -13,7 +13,7 @@ CONFIG: Dict[str, int | float] = {
     "num_layers_linear": 4,   # 线性注意力层数
     "num_layers_dynamic": 4, # 标准注意力层数
     "dropout": 0.1,
-    "temperature": 1.0,
+    "temperature": 1.2,
     # 动态Token选择配置
     "dynamic_token_top_k_ratio": 0.3,
     "attention_sink_tokens": 4,
