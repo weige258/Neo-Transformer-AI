@@ -41,9 +41,15 @@ class RMSNorm(nn.Module):
             weight = self.weight[:x.size(-1)]
         else:
             weight = self.weight
-            
-        # 计算RMS
+        
+        # 【修复】先检查输入是否已有 NaN/Inf
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            # 用零替换异常值，避免污染
+            x = torch.where(torch.isnan(x) | torch.isinf(x), torch.zeros_like(x), x)
+        
+        # 【修复】防止 rms 为 0 或 NaN
         rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
+        rms = torch.clamp(rms, min=1e-6)
         x = x / rms
         return x * weight
 
@@ -462,10 +468,15 @@ class VariableDimAdaptiveFFN(nn.Module):
         # 将比例映射到 [1-adaptive_range, 1+adaptive_range] 范围内
         actual_ratio = 1.0 + (dim_ratio - 0.5) * 2 * self.adaptive_range  # [1-range, 1+range]
         actual_ratio = torch.clamp(actual_ratio, min=1-self.adaptive_range, max=1+self.adaptive_range)
-        actual_ffn_size = int(self.base_ffn_size * actual_ratio.mean().item())  # scalar
+        
+        # 防止 NaN 导致 int() 崩溃
+        if torch.isnan(actual_ratio).any():
+            actual_ffn_size = self.base_ffn_size
+        else:
+            actual_ffn_size = int(self.base_ffn_size * actual_ratio.mean().item())  # scalar
         
         # 确保actual_ffn_size不为0
-        actual_ffn_size = max(1, actual_ffn_size)
+        actual_ffn_size = max(1, actual_ffn_size)  # 确保至少为 1
         
         # 裁剪到实际大小
         gate = gate_full[:, :, :actual_ffn_size]  # [batch, seq_len, actual_size]

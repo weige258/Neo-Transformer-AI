@@ -56,10 +56,19 @@ if torch.cuda.is_available():
 
 # 启用自动混合精度训练
 scaler = torch.amp.GradScaler()
-use_amp = torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 7
+
+# 检查GPU能力，对于较老的GPU（compute capability < 8.0）禁用AMP
+if torch.cuda.is_available():
+    cap = torch.cuda.get_device_capability(device)
+    # bfloat16 有和 float32 一样的动态范围，不会溢出
+    use_amp = cap[0] >= 8  # Ampere (A100, RTX 30xx/40xx) 才支持 bfloat16
+    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+else:
+    use_amp = False
+    amp_dtype = torch.float32
 
 print(f"Using device: {device}", flush=True)
-print(f"AMP enabled: {use_amp}", flush=True)
+print(f"AMP enabled: {use_amp}, AMP dtype: {amp_dtype}", flush=True)
 model = _load_model()
 
 # 【性能优化】启用PyTorch 2.0编译加速(需要Triton支持)
@@ -179,6 +188,35 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         answer: 答案文本
         history_context: 历史对话上下文
     """
+    # 【修复】过滤 NaN 字符串
+    def _sanitize(text):
+        if text is None:
+            return None
+        text = str(text).strip()
+        # 过滤掉表示 NaN 的字符串
+        if text.lower() in ('nan', 'inf', '-inf', 'none', 'null'):
+            return None
+        return text
+    
+    # 【修复2】在train()入口增加输入长度限制
+    def _check_length(text, max_len=800):
+        if text is None:
+            return None
+        # 按字符截断，避免超长序列
+        if len(text) > max_len:
+            text = text[:max_len]
+        return text
+    
+    ask = _sanitize(ask)
+    think = _sanitize(think)
+    answer = _sanitize(answer)
+    history_context = _sanitize(history_context)
+    
+    ask = _check_length(ask)
+    think = _check_length(think)
+    answer = _check_length(answer)
+    history_context = _check_length(history_context)
+    
     # ANSI颜色代码
     WHITE = '\033[97m'     # 问题 - 白色
     BLUE = '\033[94m'      # 思考 - 蓝色
@@ -355,7 +393,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         ref_logits = ref_logits_list[idx]
         
         # 【修复】使用相同的训练步骤但不立即更新，而是累积梯度
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             # 【修复1】对完整序列计算当前策略的logits
             result = model(full_tokens, use_cache=False)
             if isinstance(result, tuple):
@@ -604,7 +642,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     model.train()
     optimizer.zero_grad()
 
-    with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp):
+    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
         result = model(train_tensor, use_cache=False)
         if isinstance(result, tuple):
             logits = result[0]
@@ -621,9 +659,13 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             masked_targets = train_tensor[1:][target_mask[1:]]
             
             if len(masked_logits) > 0 and len(masked_targets) > 0:
-                # 检查masked_logits和masked_targets是否包含NaN或无穷大
+                # 【修复】增强 NaN 诊断
                 if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
-                    print(f"[Warning] NaN or Inf detected in logits, skipping this step", flush=True)
+                    # 【诊断】打印输入统计信息，定位是哪类样本导致
+                    print(f"[Warning] NaN/Inf in logits. "
+                          f"train_tensor range: [{train_tensor.min()}, {train_tensor.max()}], "
+                          f"seq_len: {len(train_tensor)}, "
+                          f"preview: {TextTokenizer.decode(preview[:50])[:100]}", flush=True)
                     return
                 
                 if torch.isnan(masked_targets).any() or torch.isinf(masked_targets).any():

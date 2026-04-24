@@ -1,4 +1,5 @@
 from abc import abstractmethod
+import math
 
 import torch
 
@@ -36,6 +37,13 @@ class TextTokenizer(Tokenizer):
 
     @staticmethod
     def encode(text: str) -> torch.Tensor:
+        # 【修复】确保输入是字符串类型
+        if not isinstance(text, str):
+            if isinstance(text, float) and (math.isnan(text) or math.isinf(text)):
+                text = ""
+            else:
+                text = str(text)
+        
         tensor: list[int] = []
         dict_size = int(CONFIG["dict_size"])  # 获取词表大小
         
