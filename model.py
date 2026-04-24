@@ -21,6 +21,8 @@ CONFIG: Dict[str, int | float] = {
     "min_window_size": 256,
     "max_window_size": 1024,
     "window_complexity_threshold": 0.5,
+    # 强化学习配置
+    "rl_loss_threshold": 0.6, # 启用强化学习的损失阈值
 }
 
 KVCache = tuple[torch.Tensor, torch.Tensor]

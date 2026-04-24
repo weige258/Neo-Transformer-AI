@@ -4,7 +4,7 @@ import math
 import torch
 
 from model import CONFIG, MainModel
-from record import record_loss
+from record import record_loss, get_loss
 from tokenizer import TextTokenizer
 from rl import (
     GRPO_CONFIG, 
@@ -231,7 +231,22 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
         preview = train_tensor
         # 单文本模式：在_run_train_step中输出黄色预览
-        _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
+        current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
+        
+        # 【新增】检查损失是否小于阈值，只有小于阈值才启用强化学习
+        rl_threshold = CONFIG.get("rl_loss_threshold", 1.5)
+        if current_loss < rl_threshold:
+            # 【新增】为单文本模式添加强化学习
+            # 使用实际文本内容作为prompt
+            prompt = torch.cat(
+                [
+                    torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                    text_tensor,
+                    torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+                    torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                ]
+            )
+            _run_grpo_training(prompt)
         return
 
     # QA训练模式
@@ -302,7 +317,19 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                 assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
                 preview = torch.cat([think_tensor, answer_tensor])
             
-            _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+            current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+            
+            # 【新增】检查损失是否小于阈值，只有小于阈值才启用强化学习
+            rl_threshold = CONFIG.get("rl_loss_threshold", 1.5)
+            if current_loss < rl_threshold:
+                # 【新增】为带思维链的QA模式添加强化学习
+                prompt = torch.cat(
+                    [
+                        TextTokenizer.encode(ask).to(device),
+                        torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                    ]
+                )
+                _run_grpo_training(prompt)
             return
         
         # 没有思维链，使用标准QA训练
@@ -310,7 +337,19 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
         if train_tensor is None:
             return
-        _run_train_step(train_tensor, target_mask, preview, show_preview=False)  # QA模式不重复显示
+        current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=False)  # QA模式不重复显示
+        
+        # 【新增】检查损失是否小于阈值，只有小于阈值才启用强化学习
+        rl_threshold = CONFIG.get("rl_loss_threshold", 1.5)
+        if current_loss < rl_threshold:
+            # 【新增】为标准QA模式添加强化学习
+            prompt = torch.cat(
+                [
+                    TextTokenizer.encode(ask).to(device),
+                    torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                ]
+            )
+            _run_grpo_training(prompt)
         return
     
     # 【GRPO】无标签场景：使用模型生成的样本来进行强化学习
@@ -320,7 +359,15 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
         ]
     )
+    _run_grpo_training(prompt)
+
+
+def _run_grpo_training(prompt: torch.Tensor) -> None:
+    """执行GRPO强化学习训练
     
+    Args:
+        prompt: 用于生成的prompt张量
+    """
     # 【GRPO】为问题生成多个候选答案
     samples = _generate_with_sampling(model, prompt, GRPO_CONFIG["num_samples"])
     if not samples:
@@ -603,7 +650,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         return output_text
 
 
-def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, advantage_weight: float = 1.0, show_preview: bool = True, preview_color: str = None) -> None:
+def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, advantage_weight: float = 1.0, show_preview: bool = True, preview_color: str = None) -> float:
     """执行单步训练
     
     Args:
@@ -613,6 +660,9 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         advantage_weight: 优势加权因子(用于GRPO)
         show_preview: 是否显示预览输出(默认True,QA模式下可设为False避免重复)
         preview_color: 预览文本颜色(可选)
+    
+    Returns:
+        当前训练步骤的损失值
     """
     model.train()
     
@@ -648,18 +698,18 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                           f"train_tensor range: [{train_tensor.min()}, {train_tensor.max()}], "
                           f"seq_len: {len(train_tensor)}, "
                           f"preview: {TextTokenizer.decode(preview[:50])[:100]}", flush=True)
-                    return
+                    return float('inf')
                 
                 if torch.isnan(masked_targets).any() or torch.isinf(masked_targets).any():
                     print(f"[Warning] NaN or Inf detected in targets, skipping this step", flush=True)
-                    return
+                    return float('inf')
                 
                 loss = loss_func(masked_logits, masked_targets)
                 
                 # 检查loss是否为NaN
                 if torch.isnan(loss):
                     print(f"[Warning] NaN loss detected, skipping this step", flush=True)
-                    return
+                    return float('inf')
             else:
                 loss = torch.tensor(0.0, device=device)
         else:
@@ -686,12 +736,13 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         if torch.isnan(grad_norm):
             optimizer.zero_grad()
             print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
-            return
+            return float('inf')
         
         scaler.step(optimizer)
         scaler.update()
     else:
         print(f"[Warning] Invalid loss detected: {loss}, skipping optimizer step", flush=True)
+        return float('inf')
 
     # 输出训练预览(可选)
     if show_preview:
@@ -705,3 +756,5 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         except Exception as e:
             print(f"[Warning] Failed to decode preview: {e}", flush=True)
         print("", flush=True)
+    
+    return loss.item()

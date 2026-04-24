@@ -161,3 +161,4 @@ def _compute_heuristic_reward(text: str) -> float:
         format_score = 0.5
     reward += format_score * 0.15
     
+    return reward
