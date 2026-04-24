@@ -476,6 +476,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     GREEN = '\033[92m'     # 回答内容 - 绿色
     RESET = '\033[0m'      # 重置颜色
     
+    # 【新增】输入验证
+    if not text or not isinstance(text, str):
+        return "无效输入"
+    
     model.eval()
     output_text = ""
 
@@ -507,10 +511,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         # 【树状搜索强化学习】在生成阶段执行MCTS搜索
         best_new_tokens, best_full_text, tree_reward = _tree_search(model, prompt, text)
         
-        # 【关键修复】MCTS只决定前N个token，然后继续自回归生成
-        # 如果MCTS找到了高质量的前缀且长度合理，使用它作为起始
+        # 【修改】MCTS结果验证
         mcts_used = False
-        if len(best_new_tokens) > 0 and tree_reward > 0.3:
+        if best_new_tokens is not None and tree_reward > 0.3:
+            # 只有奖励足够高才使用MCTS结果
             # 将MCTS生成的tokens拼接到prompt
             current_prompt = torch.cat([prompt, best_new_tokens])
             # 解码MCTS生成的部分
@@ -520,6 +524,8 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 output_text += mcts_text
                 mcts_used = True
         else:
+            mcts_used = False
+            # 回退到标准生成
             current_prompt = prompt.clone()
         
         # 【新增】如果启用思维链，检查当前prompt是否包含THINK_START_TOKEN
@@ -640,9 +646,16 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         preview_color: 预览文本颜色(可选)
     """
     model.train()
+    
+    # 【新增】训练前梯度清理
     optimizer.zero_grad()
+    
+    # 【新增】损失裁剪（在backward之前）
+    if advantage_weight > 10.0:
+        advantage_weight = 1.0
 
-    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+    # 【修改】更安全的autocast配置
+    with torch.autocast(device_type="cuda", dtype=torch.float32 if amp_dtype == torch.bfloat16 else torch.float32, enabled=use_amp):
         result = model(train_tensor, use_cache=False)
         if isinstance(result, tuple):
             logits = result[0]
@@ -696,9 +709,15 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     if not torch.isnan(loss) and not torch.isinf(loss):
         scaler.scale(loss).backward()
         
-        # 梯度裁剪以防止梯度爆炸
+        # 【新增】梯度裁剪前检查
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        # 【新增】梯度裁剪后检查NaN
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        if torch.isnan(grad_norm):
+            optimizer.zero_grad()
+            print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
+            return
         
         scaler.step(optimizer)
         scaler.update()

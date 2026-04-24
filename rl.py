@@ -33,8 +33,9 @@ def _compute_grpo_advantages(rewards: List[float]) -> List[float]:
     mean_reward = sum(rewards) / len(rewards)
     std_reward = (sum((r - mean_reward) ** 2 for r in rewards) / len(rewards)) ** 0.5
     
-    if std_reward < 1e-8:
-        return [0.0] * len(rewards)
+    # 【关键修复】防止std为0或极小值
+    if std_reward < 1e-6:
+        std_reward = 1e-6  # 使用最小标准差，而非直接返回0
     
     advantages = [(r - mean_reward) / std_reward for r in rewards]
     return advantages

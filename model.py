@@ -42,14 +42,15 @@ class RMSNorm(nn.Module):
         else:
             weight = self.weight
         
-        # 【修复】先检查输入是否已有 NaN/Inf
+        # 【新增】输入前检查
         if torch.isnan(x).any() or torch.isinf(x).any():
-            # 用零替换异常值，避免污染
             x = torch.where(torch.isnan(x) | torch.isinf(x), torch.zeros_like(x), x)
         
-        # 【修复】防止 rms 为 0 或 NaN
         rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
-        rms = torch.clamp(rms, min=1e-6)
+        
+        # 【修改】更安全的clamp
+        rms = torch.clamp(rms, min=1e-6, max=1e6)  # 防止过大或过小
+        
         x = x / rms
         return x * weight
 
