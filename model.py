@@ -11,7 +11,7 @@ CONFIG: Dict[str, int | float] = {
     "num_heads": 8,
     "num_layers": 8,
     "dropout": 0.1,
-    "temperature": 1.3,
+    "temperature": 0.8,
 }
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
