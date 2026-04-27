@@ -6,11 +6,6 @@ import torch
 from model import CONFIG, MainModel
 from record import record_loss, get_loss
 from tokenizer import TextTokenizer
-from rl import (
-    GRPO_CONFIG, 
-    _compute_grpo_advantages, _majority_vote, _generate_with_sampling,
-    _compute_heuristic_reward
-)
 
 
 if hasattr(sys.stdin, "reconfigure"):
@@ -230,23 +225,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         )
         target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
         preview = train_tensor
-        # 单文本模式：在_run_train_step中输出黄色预览
         current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
-        
-        # 【新增】检查损失是否小于阈值，只有小于阈值才启用强化学习
-        rl_threshold = CONFIG.get("rl_loss_threshold", 1.5)
-        if current_loss < rl_threshold:
-            # 【新增】为单文本模式添加强化学习
-            # 使用实际文本内容作为prompt
-            prompt = torch.cat(
-                [
-                    torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                    text_tensor,
-                    torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-                    torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                ]
-            )
-            _run_grpo_training(prompt)
         return
 
     # QA训练模式
@@ -316,20 +295,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                 # 【关键修复】确保target_mask长度与train_tensor完全一致
                 assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
                 preview = torch.cat([think_tensor, answer_tensor])
-            
-            current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=False)
-            
-            # 【新增】检查损失是否小于阈值，只有小于阈值才启用强化学习
-            rl_threshold = CONFIG.get("rl_loss_threshold", 1.5)
-            if current_loss < rl_threshold:
-                # 【新增】为带思维链的QA模式添加强化学习
-                prompt = torch.cat(
-                    [
-                        TextTokenizer.encode(ask).to(device),
-                        torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                    ]
-                )
-                _run_grpo_training(prompt)
+                current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=False)
             return
         
         # 没有思维链，使用标准QA训练
@@ -337,159 +303,8 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
         if train_tensor is None:
             return
-        current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=False)  # QA模式不重复显示
-        
-        # 【新增】检查损失是否小于阈值，只有小于阈值才启用强化学习
-        rl_threshold = CONFIG.get("rl_loss_threshold", 1.5)
-        if current_loss < rl_threshold:
-            # 【新增】为标准QA模式添加强化学习
-            prompt = torch.cat(
-                [
-                    TextTokenizer.encode(ask).to(device),
-                    torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                ]
-            )
-            _run_grpo_training(prompt)
+        current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=False)
         return
-    
-    # 【GRPO】无标签场景：使用模型生成的样本来进行强化学习
-    prompt = torch.cat(
-        [
-            TextTokenizer.encode(ask).to(device),
-            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-        ]
-    )
-    _run_grpo_training(prompt)
-
-
-def _run_grpo_training(prompt: torch.Tensor) -> None:
-    """执行GRPO强化学习训练
-    
-    Args:
-        prompt: 用于生成的prompt张量
-    """
-    # 【GRPO】为问题生成多个候选答案
-    samples = _generate_with_sampling(model, prompt, GRPO_CONFIG["num_samples"])
-    if not samples:
-        return
-    
-    # 【GRPO】计算每个候选答案的奖励
-    rewards = []
-    for sample in samples:
-        _, decoded_text = sample
-        reward = _compute_heuristic_reward(decoded_text)
-        rewards.append(reward)
-    
-    # 【GRPO】计算优势函数
-    advantages = _compute_grpo_advantages(rewards)
-    
-    # 【修复GRPO】累积所有样本的梯度后再更新
-    total_loss = torch.tensor(0.0, device=device)
-    valid_samples = 0
-    
-    # 首先清空梯度
-    optimizer.zero_grad()
-    
-    # 【优化】预计算所有样本的完整tokens
-    full_tokens_list = []
-    target_mask_list = []
-    for sample_tokens, _ in samples:
-        full_tokens = torch.cat([prompt, sample_tokens])
-        target_mask = torch.cat([
-            torch.zeros(len(prompt), dtype=torch.bool, device=device),
-            torch.ones(len(sample_tokens), dtype=torch.bool, device=device),
-        ])
-        full_tokens_list.append(full_tokens)
-        target_mask_list.append(target_mask)
-    
-    # 【优化】一次性计算所有样本的参考策略logits
-    with torch.no_grad():
-        ref_logits_list = []
-        for full_tokens in full_tokens_list:
-            ref_result = model(full_tokens, use_cache=False)
-            if isinstance(ref_result, tuple):
-                ref_logits = ref_result[0]
-            else:
-                ref_logits = ref_result
-            ref_logits_list.append(ref_logits)
-    
-    for idx, (sample_tokens, sample_text) in enumerate(samples):
-        advantage = advantages[idx]
-        
-        # 跳过优势为0的样本（组内表现平均）
-        if abs(advantage) < 1e-6:
-            continue
-        
-        # 获取预计算的完整tokens和目标掩码
-        full_tokens = full_tokens_list[idx]
-        target_mask = target_mask_list[idx]
-        ref_logits = ref_logits_list[idx]
-        
-        # 【修复】使用相同的训练步骤但不立即更新，而是累积梯度
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-            # 【修复1】对完整序列计算当前策略的logits
-            result = model(full_tokens, use_cache=False)
-            if isinstance(result, tuple):
-                logits = result[0]
-            else:
-                logits = result
-
-            # 应用目标掩码并进行 next-token prediction 对齐
-            if len(full_tokens) > 1:
-                # 正确的 next-token prediction 对齐
-                masked_logits = logits[:-1][target_mask[1:]]
-                masked_targets = full_tokens[1:][target_mask[1:]]
-                
-                if len(masked_logits) > 0 and len(masked_targets) > 0:
-                    # 【修复1】获取参考策略的logits（对应生成部分）
-                    ref_logits_for_gen = ref_logits[:-1][target_mask[1:]]
-                    
-                    # 计算当前策略和参考策略的log概率
-                    curr_log_probs = torch.log_softmax(masked_logits, dim=-1)
-                    ref_log_probs = torch.log_softmax(ref_logits_for_gen, dim=-1)
-                    
-                    # 计算策略比率
-                    curr_log_prob_selected = torch.gather(curr_log_probs, -1, masked_targets.unsqueeze(-1)).squeeze(-1)
-                    ref_log_prob_selected = torch.gather(ref_log_probs, -1, masked_targets.unsqueeze(-1)).squeeze(-1)
-                    
-                    # 计算策略比率
-                    ratio = torch.exp(curr_log_prob_selected - ref_log_prob_selected)
-                    
-                    # 【修复】GRPO标准损失计算：advantage * ratio * log_prob
-                    pg_loss = -advantage * ratio * curr_log_prob_selected
-                    
-                    # 【修复2】修正KL散度的分布顺序：应该是当前策略在前，参考策略在后
-                    kl_div = torch.distributions.kl_divergence(
-                        torch.distributions.Categorical(logits=masked_logits),
-                        torch.distributions.Categorical(logits=ref_logits_for_gen)
-                    ).mean()
-                    
-                    # 总损失 = 策略梯度损失 + KL散度惩罚
-                    sample_loss = pg_loss.mean() + GRPO_CONFIG["kl_coefficient"] * kl_div
-                    
-                    # 累积损失，按样本数平均以保持梯度尺度稳定
-                    total_loss += sample_loss / GRPO_CONFIG["num_samples"]
-                    valid_samples += 1
-                else:
-                    continue
-            else:
-                continue
-    
-    # 【GRPO】只有在有有效样本时才进行参数更新
-    if valid_samples > 0:
-        # 应用梯度缩放和更新
-        scaler.scale(total_loss).backward()
-        
-        # 【可选】添加梯度裁剪以提高稳定性
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        scaler.step(optimizer)
-        scaler.update()
-        
-        print(f"[GRPO] Trained on {valid_samples} samples with advantages: {[f'{a:.2f}' for a in advantages]}", flush=True)
-    else:
-        print("[GRPO] No valid samples for training, falling back to standard SFT if available", flush=True)
 
 
 def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
