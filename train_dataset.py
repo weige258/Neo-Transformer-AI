@@ -3,7 +3,7 @@ import torch
 import random
 import logging
 from typing import List, Tuple, Optional, Dict
-from main import train, generation, model, optimizer
+from main import train, model, optimizer
 from record import get_loss
 
 # Set up logging
@@ -151,7 +151,7 @@ def main() -> None:
 
     logging.info(f"Initialized streaming dataset with {dataset.total_entries} training samples.")
 
-    training_rounds = 0
+    local_training_rounds = 0
     save_interval = 500  # Save model every 500 rounds
     
     # 用于ReduceLROnPlateau的损失跟踪
@@ -181,7 +181,7 @@ def main() -> None:
                     history_context=history_context if history_context else None
                 )
                             
-                training_rounds += 1
+                local_training_rounds += 1
                 
                 # 获取当前学习率
                 current_lr = optimizer.param_groups[0]['lr']
@@ -197,10 +197,10 @@ def main() -> None:
                 print("*" * 100, flush=True)
 
                 # Save model periodically
-                if training_rounds % save_interval == 0:
+                if local_training_rounds % save_interval == 0:
                     torch.save(obj=model.state_dict(), f="model.pth")
                     avg_loss = sum(recent_losses) / len(recent_losses) if recent_losses else 0
-                    logging.info(f"Model saved, training rounds: {training_rounds}, current LR: {current_lr:.6f}, avg loss: {avg_loss:.6f}")
+                    logging.info(f"Model saved, training rounds: {local_training_rounds}, current LR: {current_lr:.6f}, avg loss: {avg_loss:.6f}")
 
             except Exception as e:
                 if "cannot convert float NaN to integer" in str(e):
@@ -216,7 +216,7 @@ def main() -> None:
         logging.info("Training interrupted by user.")
         # Save final model
         torch.save(obj=model.state_dict(), f="model.pth")
-        logging.info(f"Final model saved, training rounds: {training_rounds}")
+        logging.info(f"Final model saved, training rounds: {local_training_rounds}")
     except Exception as e:
         logging.error(f"Training loop error: {e}")
         # Save model before exiting

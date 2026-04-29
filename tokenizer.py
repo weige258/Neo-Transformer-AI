@@ -3,7 +3,7 @@ import math
 
 import torch
 
-from model import CONFIG
+from config import CONFIG
 
 
 class Tokenizer:

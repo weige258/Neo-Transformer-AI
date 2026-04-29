@@ -3,16 +3,9 @@ from typing import Dict
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
-
-CONFIG: Dict[str, int | float] = {
-    "dict_size": 60000,
-    "emb_size": 512,
-    "num_heads": 8,
-    "num_layers": 8,
-    "dropout": 0.1,
-    "temperature": 0.8,
-}
+from config import CONFIG
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 LinearKVCache = tuple[torch.Tensor, torch.Tensor, int]
@@ -198,15 +191,20 @@ class FlashAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        past_len = 0 if past_key_value is None else past_key_value[0].size(-2)
-        cos, sin = self.rope(seq_len=seq_len, device=x.device, start_pos=past_len)
-        q = (q * cos) + (rotate_half(q) * sin)
-        k = (k * cos) + (rotate_half(k) * sin)
-
+        past_len = 0
         if past_key_value is not None:
             past_k, past_v = past_key_value
+            past_len = past_k.size(-2)
             k = torch.cat([past_k, k], dim=-2)
             v = torch.cat([past_v, v], dim=-2)
+        
+        # 【修复】给q应用RoPE，使用正确的位置偏移
+        cos, sin = self.rope(seq_len=seq_len, device=x.device, start_pos=past_len)
+        q = (q * cos) + (rotate_half(q) * sin)
+        
+        # 【修复】给完整的k序列应用RoPE，而非仅当前序列
+        cos_k, sin_k = self.rope(seq_len=k.size(-2), device=x.device, start_pos=0)
+        k = (k * cos_k) + (rotate_half(k) * sin_k)
 
         output = F.scaled_dot_product_attention(
             q, k, v,
@@ -270,43 +268,27 @@ class VariableDimAdaptiveFFN(nn.Module):
         x_mean = x.mean(dim=1)  # [batch, emb_size]
         dim_ratio = self.dim_predictor(x_mean)  # [batch, 1] 范围[0, 1]，已经是Sigmoid输出
         
-        # 2. 应用SwiGLU激活（使用完整维度）
-        gate_full = torch.nn.functional.silu(self.gate_proj(x))  # [batch, seq_len, max_ffn_size]
-        up_full = self.up_proj(x)  # [batch, seq_len, max_ffn_size]
-        
-        # 3. 应用动态维度裁剪，只保留前actual_size个维度
-        # 根据维度比例计算实际使用的FFN大小
-        # 将比例映射到 [1-adaptive_range, 1+adaptive_range] 范围内
-        actual_ratio = 1.0 + (dim_ratio - 0.5) * 2 * self.adaptive_range  # [1-range, 1+range]
+        # 2. 计算实际使用的FFN维度
+        actual_ratio = 1.0 + (dim_ratio - 0.5) * 2 * self.adaptive_range
         actual_ratio = torch.clamp(actual_ratio, min=1-self.adaptive_range, max=1+self.adaptive_range)
         
         # 防止 NaN 导致 int() 崩溃
         if torch.isnan(actual_ratio).any():
             actual_ffn_size = self.base_ffn_size
         else:
-            actual_ffn_size = int(self.base_ffn_size * actual_ratio.mean().item())  # scalar
+            actual_ffn_size = int(self.base_ffn_size * actual_ratio.mean().item())
         
-        # 确保actual_ffn_size不为0
-        actual_ffn_size = max(1, actual_ffn_size)  # 确保至少为 1
+        actual_ffn_size = max(1, min(actual_ffn_size, self.max_ffn_size))
         
-        # 裁剪到实际大小
-        gate = gate_full[:, :, :actual_ffn_size]  # [batch, seq_len, actual_size]
-        up = up_full[:, :, :actual_ffn_size]      # [batch, seq_len, actual_size]
+        # 【核心修改】动态切片权重，只计算需要的维度，不分配全尺寸张量
+        gate = torch.nn.functional.silu(F.linear(x, self.gate_proj.weight[:actual_ffn_size, :]))
+        up = F.linear(x, self.up_proj.weight[:actual_ffn_size, :])
         
-        hidden = gate * up                        # [batch, seq_len, actual_size]
+        hidden = gate * up
+        hidden = self.hidden_norm(hidden)
         
-        # 4. 对裁剪后的hidden进行RMSNorm，而不是对零填充后的张量
-        # 这样可以避免零填充对均值计算的影响
-        hidden = self.hidden_norm(hidden)  # [batch, seq_len, actual_size]
-        
-        # 5. 将hidden扩展到max_ffn_size维度，以适配down_proj
-        # 使用零填充，但这次我们不会对零填充进行归一化
-        padded_hidden = torch.zeros(batch, seq_len, self.max_ffn_size, device=hidden.device, dtype=hidden.dtype)
-        padded_hidden[:, :, :actual_ffn_size] = hidden
-        
-        # 6. 输出投影 - 确保维度匹配
-        # down_proj期望输入是max_ffn_size维度，所以我们需要确保输入是正确维度
-        down = self.down_proj(padded_hidden)  # [batch, seq_len, emb_size]
+        # 输出投影只使用对应维度的权重
+        down = F.linear(hidden, self.down_proj.weight[:, :actual_ffn_size])
         
         return self.dropout(down)
 
@@ -359,7 +341,9 @@ class MainModel(nn.Module):
         dict_size = int(CONFIG["dict_size"])
         emb_size = int(CONFIG["emb_size"])
         num_heads = int(CONFIG["num_heads"])
-        num_layers = int(CONFIG.get("num_layers", 8))
+        num_linear_layers = int(CONFIG.get("num_linear_layers", 2))
+        num_flash_layers = int(CONFIG.get("num_flash_layers", 6))
+        num_layers = num_linear_layers + num_flash_layers
         dropout = float(CONFIG["dropout"])
 
         self.token_embedding = nn.Embedding(dict_size, emb_size)
@@ -368,7 +352,10 @@ class MainModel(nn.Module):
         self.transformers = nn.ModuleList()
         
         for i in range(num_layers):
-            attention_type = "flash" if i % 2 == 0 else "linear"
+            if i < num_linear_layers:
+                attention_type = "linear"
+            else:
+                attention_type = "flash"
             self.transformers.append(
                 AdaptiveAttentionTransformerBlock(
                     emb_size=emb_size,
@@ -390,6 +377,39 @@ class MainModel(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and module.weight is not self.output_linear.weight:
                 nn.init.xavier_uniform_(module.weight)
+
+    def compress_history_vectors(self, history_tokens: torch.Tensor, compress_ratio: float = None) -> torch.Tensor:
+        """无标记向量压缩：上下文token嵌入 → 聚类压缩 → 压缩向量
+        无人工标记，仅用注意力权重与语义聚类
+        """
+        if compress_ratio is None:
+            compress_ratio = float(CONFIG.get("compress_ratio", 0.3))
+        
+        with torch.no_grad():
+            hist_emb = self.token_embedding(history_tokens)
+            if hist_emb.dim() == 1:
+                hist_emb = hist_emb.unsqueeze(0)
+            seq_len, emb_size = hist_emb.shape
+            compress_num = max(16, int(seq_len * compress_ratio))
+            
+            from sklearn.cluster import KMeans
+            emb_np = hist_emb.cpu().numpy()
+            kmeans = KMeans(n_clusters=compress_num, random_state=42, n_init="auto")
+            cluster_labels = kmeans.fit_predict(emb_np)
+            
+            compress_vectors = []
+            for i in range(compress_num):
+                mask = (cluster_labels == i)
+                if not mask.any():
+                    continue
+                cluster_vec = hist_emb[mask]
+                attn_score = torch.norm(cluster_vec, dim=-1, keepdim=True)
+                attn_weight = torch.softmax(attn_score, dim=0)
+                weighted_vec = (cluster_vec * attn_weight).sum(dim=0)
+                compress_vectors.append(weighted_vec)
+            
+            compress_tensor = torch.stack(compress_vectors).to(hist_emb.device)
+            return self.final_norm(compress_tensor)
 
     def forward(
         self,
@@ -422,17 +442,40 @@ class MainModel(nn.Module):
         if past_key_values is None:
             past_key_values = [None] * len(self.transformers)
         
+        num_linear_layers = int(CONFIG.get("num_linear_layers", 2))
+        
         if use_cache:
-            for block, past_key_value in zip(self.transformers, past_key_values):
-                x, present_key_value = block(
-                    x,
-                    past_key_value=past_key_value,
-                    use_cache=True,
-                )
-                next_key_values.append(present_key_value)
+            for i, (block, past_key_value) in enumerate(zip(self.transformers, past_key_values)):
+                if i < num_linear_layers:
+                    x, present_key_value = block(
+                        x,
+                        past_key_value=past_key_value,
+                        use_cache=True,
+                    )
+                    next_key_values.append(present_key_value)
+                else:
+                    if past_len > 0:
+                        current_x = x[:, -1:, :]
+                        current_output = block(
+                            current_x,
+                            past_key_value=None,
+                            use_cache=False,
+                        )
+                        if isinstance(current_output, tuple):
+                            x[:, -1:, :] = current_output[0]
+                        else:
+                            x[:, -1:, :] = current_output
+                        next_key_values.append(None)
+                    else:
+                        x = block(
+                            x,
+                            past_key_value=None,
+                            use_cache=False,
+                        )
+                        next_key_values.append(None)
         else:
             for block in self.transformers:
-                x = block(x)
+                x = checkpoint(block, x, use_reentrant=False)
 
         x = self.final_norm(x)
         logits = self.output_linear(x)

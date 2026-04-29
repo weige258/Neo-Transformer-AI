@@ -8,6 +8,9 @@ total_loss = 0
 record_count = 0
 record_interval = 1000
 
+# 【修复】新增全局线程锁，防止数据竞争
+data_lock = threading.Lock()
+
 
 def hours_minutes_seconds_to_seconds(time_str: str) -> int:
     """Convert HH:MM:SS string to seconds"""
@@ -68,7 +71,8 @@ def time_thread():
     """Thread to track running time"""
     global running_time
     while True:
-        running_time += 1
+        with data_lock:
+            running_time += 1
         time.sleep(1)
 
 
@@ -81,22 +85,23 @@ def record_loss(loss: float):
     global running_time, total_loss, record_count
     
     try:
-        total_loss += loss
-        record_count += 1
-        
-        if record_count >= record_interval:
-            avg_loss = total_loss / record_count
-            record_file = "record.txt"
+        with data_lock:
+            total_loss += loss
+            record_count += 1
             
-            with open(record_file, "a", encoding="utf-8") as f:
-                time_str = seconds_to_hours_minutes_seconds(running_time)
-                system_time = get_system_time()
-                f.write(f"<system_time>{system_time}</system_time><time>{time_str}</time><avg_loss>{avg_loss:.6f}</avg_loss>\n")
-            
-            # Reset counters
-            total_loss = 0
-            record_count = 0
-            print(f"记录损失 - 系统时间: {system_time}, 运行时间: {time_str}, 平均损失: {avg_loss:.6f}", flush=True)
+            if record_count >= record_interval:
+                avg_loss = total_loss / record_count
+                record_file = "record.txt"
+                
+                with open(record_file, "a", encoding="utf-8") as f:
+                    time_str = seconds_to_hours_minutes_seconds(running_time)
+                    system_time = get_system_time()
+                    f.write(f"<system_time>{system_time}</system_time><time>{time_str}</time><avg_loss>{avg_loss:.6f}</avg_loss>\n")
+                
+                # Reset counters
+                total_loss = 0
+                record_count = 0
+                print(f"记录损失 - 系统时间: {system_time}, 运行时间: {time_str}, 平均损失: {avg_loss:.6f}", flush=True)
             
     except Exception as e:
         print(f"记录损失失败: {e}", flush=True)

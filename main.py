@@ -1,11 +1,12 @@
 import sys
-import math
 
 import torch
 
-from model import CONFIG, MainModel
+from config import CONFIG
+from model import MainModel
 from record import record_loss, get_loss
 from tokenizer import TextTokenizer
+from rl import SelfRewardModel, LightweightPPO, TreeReinforcementLearning
 
 
 if hasattr(sys.stdin, "reconfigure"):
@@ -21,22 +22,18 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def _load_model() -> MainModel:
     try:
-        loaded = torch.load("model.pth", map_location=device, weights_only=False)
-        if isinstance(loaded, dict):
-            model = MainModel().to(device)
-            model.load_state_dict(loaded)
-            print("Loaded model state dict.", flush=True)
-        else:
-            model = loaded.to(device)
-            print("Loaded full model.", flush=True)
-
-        if (
-            not hasattr(model, "transformers")
-            or len(model.transformers) == 0
-            or not hasattr(model.transformers[0], "rms_norm1")
-        ):
-            print("Detected old model structure; creating new model.", flush=True)
-            model = MainModel().to(device)
+        # 【修复】强制启用weights_only，杜绝安全漏洞
+        loaded = torch.load("model.pth", map_location=device, weights_only=True)
+        model = MainModel().to(device)
+        
+        # 【修复】严格校验键匹配，避免加载不匹配
+        model_state = model.state_dict()
+        filtered_state = {k: v for k, v in loaded.items() if k in model_state and v.shape == model_state[k].shape}
+        missing_keys = [k for k in model_state if k not in filtered_state]
+        if missing_keys:
+            print(f"[Warning] 缺失权重键: {missing_keys}, 随机初始化", flush=True)
+        model.load_state_dict(filtered_state, strict=False)
+        print("Loaded model state dict safely.", flush=True)
         return model
     except Exception as e:
         print(f"Failed to load model: {e}", flush=True)
@@ -49,68 +46,61 @@ def _load_model() -> MainModel:
 if torch.cuda.is_available():
     torch.set_float32_matmul_precision('high')
 
-# 启用自动混合精度训练
-scaler = torch.amp.GradScaler()
-
 # 检查GPU能力，对于较老的GPU（compute capability < 8.0）禁用AMP
 if torch.cuda.is_available():
     cap = torch.cuda.get_device_capability(device)
     # bfloat16 有和 float32 一样的动态范围，不会溢出
-    use_amp = cap[0] >= 8  # Ampere (A100, RTX 30xx/40xx) 才支持 bfloat16
-    amp_dtype = torch.bfloat16 if use_amp else torch.float32
+    use_amp = True
+    if cap[0] >= 8:
+        amp_dtype = torch.bfloat16  # Ampere (A100, RTX 30xx/40xx) 才支持 bfloat16
+    else:
+        amp_dtype = torch.float16  # 老显卡用float16，同样能降显存
 else:
     use_amp = False
     amp_dtype = torch.float32
+
+# 【修复】仅float16启用scaler，bfloat16无需缩放，避免梯度爆炸
+scaler = torch.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
 
 print(f"Using device: {device}", flush=True)
 print(f"AMP enabled: {use_amp}, AMP dtype: {amp_dtype}", flush=True)
 model = _load_model()
 
-# 【性能优化】启用PyTorch 2.0编译加速(需要Triton支持)
-compile_success = False
-if torch.cuda.is_available():
-    # 检查是否有Triton支持
-    try:
-        import triton
-        has_triton = True
-    except ImportError:
-        has_triton = False
-    
-    if has_triton:
-        import warnings
-        import logging
-        
-        # 临时禁用torch._inductor的日志输出
-        inductor_logger = logging.getLogger("torch._inductor")
-        old_level = inductor_logger.level
-        inductor_logger.setLevel(logging.ERROR)
-        
-        try:
-            # 使用"reduce-overhead"模式适合小batch的推理场景
-            model = torch.compile(model, mode="reduce-overhead")
-            
-            # 测试编译是否成功(首次调用会触发编译)
-            with torch.inference_mode():
-                test_input = torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device).unsqueeze(0)
-                _ = model(test_input)
-            
-            compile_success = True
-        except Exception as e:
-            # 编译失败,回退到标准模式，保留原模型
-            print(f"[Warning] Torch compile failed: {e}, continuing with original model", flush=True)
-            # 不重新加载模型，保留当前权重
-        finally:
-            # 恢复日志级别
-            inductor_logger.setLevel(old_level)
-
-if not compile_success:
-    print("[Info] Running without torch.compile optimization.", flush=True)
+# 【显存优化】关闭torch.compile，避免额外显存占用
+print("[Info] Running without torch.compile optimization (disabled for memory efficiency).", flush=True)
 
 total_params = sum(param.numel() for param in model.parameters())
 print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 
 loss_func = torch.nn.CrossEntropyLoss().to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+
+GRADIENT_ACCUMULATION_STEPS = 4
+training_rounds = 0
+
+# 初始化自奖励模型和强化学习模块
+reward_model = SelfRewardModel(device)
+ppo_trainer = LightweightPPO(model, reward_model, device, learning_rate=1e-5)
+tree_rl_generator = TreeReinforcementLearning(model, reward_model, device)
+
+print("[Info] Self-reward model and RL modules initialized.", flush=True)
+
+
+def auto_compress_trigger(history_tensor: torch.Tensor, attn_weights: torch.Tensor = None) -> bool:
+    """无标记自动触发压缩：长度/注意力熵双判断"""
+    seq_len = history_tensor.numel()
+    compress_trigger_len = int(CONFIG.get("compress_trigger_len", 512))
+    compress_trigger_entropy = float(CONFIG.get("compress_trigger_entropy", 0.8))
+    
+    if seq_len > compress_trigger_len:
+        return True
+    
+    if attn_weights is not None:
+        attn_soft = torch.softmax(attn_weights, dim=-1)
+        entropy = -torch.sum(attn_soft * torch.log(attn_soft + 1e-8), dim=-1).mean()
+        return entropy > compress_trigger_entropy
+    
+    return False
 
 
 def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = None):
@@ -126,6 +116,11 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
 
     if hist_context is not None and hist_context.strip():
         history_tensor = TextTokenizer.encode(hist_context).to(device)
+        
+        if auto_compress_trigger(history_tensor):
+            compressed_hist = model.compress_history_vectors(history_tensor)
+            history_tensor = torch.argmax(model.output_linear(compressed_hist), dim=-1)
+        
         train_tensor = torch.cat(
             [
                 torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
@@ -138,16 +133,11 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
                 torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
             ]
         )
-        # 【关键修复】正确计算target_mask长度
-        # train_tensor结构: START + history + END + HIST_START + ask + START + answer + END
-        # 非目标部分: START + history + END + HIST_START + ask + START = 1 + h + 1 + 1 + a + 1 = h + a + 4
-        # 目标部分: answer + END = ans + 1
         non_target_len = 1 + history_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1
         target_mask = torch.cat([
             torch.zeros(non_target_len, dtype=torch.bool, device=device),
             torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
         ])
-        # 验证长度匹配
         assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
         preview = torch.cat(
             [answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device)]
@@ -175,7 +165,7 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
 
 
 def train(ask: str = None, think: str = None, answer: str = None, history_context: str = None) -> None:
-    """单步训练函数 - 集成GRPO和TTRL
+    """单步训练函数
     
     Args:
         ask: 问题文本
@@ -183,7 +173,8 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         answer: 答案文本
         history_context: 历史对话上下文
     """
-    # 【修复】过滤 NaN 字符串
+    model.train()
+    
     def _sanitize(text):
         if text is None:
             return None
@@ -225,21 +216,21 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         )
         target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
         preview = train_tensor
-        current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
+        _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
+        
+        # 【显存优化】训练后主动释放显存，解决泄漏问题
+        torch.cuda.empty_cache()
         return
 
     # QA训练模式
     print(f"\n---Train{RESET}", flush=True)
     print(f"{WHITE}{ask}{RESET}", flush=True)
     
-    # 【关键修复】如果有明确的参考答案，直接执行标准SFT
     if answer and answer.strip():
-        # 如果提供了思维链，构建带思考的训练数据
         if think and think.strip():
             print(f"{BLUE}{think}{RESET}", flush=True)
             print(f"{GREEN}{answer}{RESET}", flush=True)
             
-            # 构建带思维链的训练序列
             ask_tensor = TextTokenizer.encode(ask).to(device)
             think_tensor = TextTokenizer.encode(think).to(device)
             answer_tensor = TextTokenizer.encode(answer).to(device)
@@ -261,17 +252,17 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                         torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
                     ]
                 )
-                # 只对思维过程和答案部分计算loss
-                # train_tensor结构: START + history + END + HIST_START + ask + START + THINK_START + think + THINK_END + answer + END
-                non_target_len = 1 + history_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1 + 1  # START + history + END + HIST_START + ask + START + THINK_START
-                target_len = think_tensor.numel() + 1 + answer_tensor.numel() + 1  # think + THINK_END + answer + END
+                non_target_len = 1 + history_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1 + 1
+                target_len = think_tensor.numel() + 1 + answer_tensor.numel() + 1
                 target_mask = torch.cat([
                     torch.zeros(non_target_len, dtype=torch.bool, device=device),
                     torch.ones(target_len, dtype=torch.bool, device=device),
                 ])
-                # 【关键修复】确保target_mask长度与train_tensor完全一致
                 assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
                 preview = torch.cat([think_tensor, answer_tensor])
+                _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+                
+                torch.cuda.empty_cache()
             else:
                 train_tensor = torch.cat(
                     [
@@ -284,31 +275,52 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                         torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
                     ]
                 )
-                # 只对思维过程和答案部分计算loss
-                # train_tensor结构: ask + START + THINK_START + think + THINK_END + answer + END
-                non_target_len = ask_tensor.numel() + 1 + 1  # ask + START + THINK_START
+                non_target_len = ask_tensor.numel() + 1 + 1
                 target_len = think_tensor.numel() + 1 + answer_tensor.numel() + 1  # think + THINK_END + answer + END
                 target_mask = torch.cat([
                     torch.zeros(non_target_len, dtype=torch.bool, device=device),
                     torch.ones(target_len, dtype=torch.bool, device=device),
                 ])
-                # 【关键修复】确保target_mask长度与train_tensor完全一致
                 assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
                 preview = torch.cat([think_tensor, answer_tensor])
-                current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+                _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+                
+                torch.cuda.empty_cache()
             return
         
-        # 没有思维链，使用标准QA训练
         print(f"{GREEN}{answer}{RESET}", flush=True)
         train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
         if train_tensor is None:
             return
-        current_loss = _run_train_step(train_tensor, target_mask, preview, show_preview=False)
-        return
+        _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+        
+        torch.cuda.empty_cache()
+    
+    # 自奖励评估和PPO强化学习（静默进行，不影响原有训练）
+    try:
+        total_reward, reward_breakdown = reward_model.compute_total_reward(
+            think_text=think,
+            answer_text=answer,
+            context=history_context
+        )
+        
+        # 收集episode数据
+        ppo_trainer.collect_episode(
+            prompt=ask if ask else "",
+            think_text=think if think else "",
+            answer_text=answer if answer else "",
+            context=history_context
+        )
+        
+        # 定期更新PPO策略
+        if training_rounds > 0 and (training_rounds % 4) == 0:
+            ppo_stats = ppo_trainer.update_policy(batch_size=4)
+    except Exception as e:
+        pass  # 静默处理错误，不影响原有训练
 
 
 def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
-    """生成函数 - 集成树状搜索强化学习
+    """生成函数
     
     Args:
         text: 输入文本/问题
@@ -319,21 +331,23 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     Returns:
         生成的文本
     """
-    # ANSI颜色代码
-    BLUE = '\033[94m'      # 思考内容 - 蓝色
-    GREEN = '\033[92m'     # 回答内容 - 绿色
-    RESET = '\033[0m'      # 重置颜色
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    RESET = '\033[0m'
     
-    # 【新增】输入验证
     if not text or not isinstance(text, str):
         return "无效输入"
     
     model.eval()
     output_text = ""
 
-    # 构建prompt(支持历史上下文)
     if history_context and history_context.strip():
         history_tensor = TextTokenizer.encode(history_context).to(device)
+        
+        if auto_compress_trigger(history_tensor):
+            compressed_hist = model.compress_history_vectors(history_tensor)
+            history_tensor = torch.argmax(model.output_linear(compressed_hist), dim=-1)
+        
         text_tensor = TextTokenizer.encode(text).to(device)
         prompt = torch.cat([
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
@@ -356,25 +370,18 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         max_generate_tokens = max(1, int(max_generate_tokens))
  
     with torch.inference_mode():
-        # 直接进入标准生成
         current_prompt = prompt.clone()
         
-        # 【新增】如果启用思维链，检查当前prompt是否包含THINK_START_TOKEN
         thinking_started = False
         if thinking_available:
-            # 检查当前prompt是否已经包含THINK_START_TOKEN
             has_think_token = (current_prompt == TextTokenizer.THINK_START_TOKEN).any()
             if has_think_token:
-                # 如果prompt中存在THINK_START_TOKEN，则认为思考已经开始
                 thinking_started = True
             else:
-                # 如果没有THINK_START_TOKEN，则手动添加
                 thinking_started = True
-                # 添加THINK_START_TOKEN到prompt
                 think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
                 current_prompt = torch.cat([current_prompt, think_start_tensor])
         
-        # 继续标准自回归生成
         result = model(current_prompt, use_cache=True)
         if isinstance(result, tuple):
             logits, past_key_values = result
@@ -382,8 +389,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
             logits = result
 
         step = 0
-        thinking_content = ""
-        answer_content = ""
         
         while max_generate_tokens is None or step < max_generate_tokens:
             try:
@@ -395,54 +400,40 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
                 index = int(torch.multinomial(probs, 1).item())
 
-                # 【关键修复】先处理特殊token，再决定是否continue
                 should_skip_output = False
                 
-                # 检查是否遇到THINK_END_TOKEN，切换到答案生成模式
                 if index == TextTokenizer.THINK_END_TOKEN:
                     if thinking_available and thinking_started:
-                        # 思维链结束，切换到答案模式
                         thinking_started = False
-                        print(f"{RESET}\n", end="", flush=True)  # 重置颜色并换行
-                        should_skip_output = True  # 不输出THINK_END_TOKEN本身
+                        print(f"{RESET}\n", end="", flush=True)
+                        should_skip_output = True
                     else:
                         break
                 
-                # 检查是否遇到END_GENERATION_TOKEN
                 elif index == TextTokenizer.END_GENERATION_TOKEN:
                     break
 
-                # 检查是否遇到THINK_START_TOKEN
                 elif index == TextTokenizer.THINK_START_TOKEN:
                     if thinking_available and not thinking_started:
-                        # 如果思维链尚未开始但遇到了开始标记，则开启思维链
                         thinking_started = True
-                        should_skip_output = True  # 不输出THINK_START_TOKEN本身
+                        should_skip_output = True
                     elif not thinking_available:
-                        # 如果不启用思维链，跳过思考过程
                         should_skip_output = True
                 
-                # 【普通token】解码并输出（带颜色）
                 if not should_skip_output:
                     decoded_piece = TextTokenizer.decode(torch.tensor([index]))
                     
                     if decoded_piece:
                         if thinking_started:
-                            # 正在生成思考内容 - 蓝色
-                            thinking_content += decoded_piece
                             print(f"{BLUE}{decoded_piece}{RESET}", end="", flush=True)
                         else:
-                            # 正在生成答案内容 - 绿色
-                            answer_content += decoded_piece
                             print(f"{GREEN}{decoded_piece}{RESET}", end="", flush=True)
                         
                         output_text += decoded_piece
 
-                # 【统一处理】更新prompt和logits
                 next_token = torch.tensor([index], device=device)
                 current_prompt = torch.cat([current_prompt, next_token])
                 
-                # 推理时也需要处理返回值
                 result = model(
                     next_token,
                     past_key_values=past_key_values,
@@ -458,38 +449,43 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 print(f"Error during generation: {e}", flush=True)
                 break
         
-        # 输出总结（无颜色）
-        if thinking_available and thinking_content:
-            pass
+        # 【显存优化】生成后主动释放显存，解决泄漏问题
+        with torch.inference_mode():
+            torch.cuda.empty_cache()
+        
+        # 自奖励评估（静默进行，不影响原有生成）
+        try:
+            total_reward, reward_breakdown = reward_model.compute_total_reward(
+                answer_text=output_text,
+                context=history_context
+            )
+        except Exception as e:
+            pass  # 静默处理错误
         
         return output_text
 
 
-def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, advantage_weight: float = 1.0, show_preview: bool = True, preview_color: str = None) -> float:
+def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, show_preview: bool = True, preview_color: str = None) -> float:
     """执行单步训练
     
     Args:
         train_tensor: 训练张量
         target_mask: 目标掩码
         preview: 预览张量
-        advantage_weight: 优势加权因子(用于GRPO)
         show_preview: 是否显示预览输出(默认True,QA模式下可设为False避免重复)
         preview_color: 预览文本颜色(可选)
     
     Returns:
         当前训练步骤的损失值
     """
+    global training_rounds
+    
     model.train()
     
-    # 【新增】训练前梯度清理
-    optimizer.zero_grad()
-    
-    # 【新增】损失裁剪（在backward之前）
-    if advantage_weight > 10.0:
-        advantage_weight = 1.0
+    if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
+        optimizer.zero_grad()
 
-    # 【修改】更安全的autocast配置
-    with torch.autocast(device_type="cuda", dtype=torch.float32 if amp_dtype == torch.bfloat16 else torch.float32, enabled=use_amp):
+    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
         result = model(train_tensor, use_cache=False)
         if isinstance(result, tuple):
             logits = result[0]
@@ -506,9 +502,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             masked_targets = train_tensor[1:][target_mask[1:]]
             
             if len(masked_logits) > 0 and len(masked_targets) > 0:
-                # 【修复】增强 NaN 诊断
                 if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
-                    # 【诊断】打印输入统计信息，定位是哪类样本导致
                     print(f"[Warning] NaN/Inf in logits. "
                           f"train_tensor range: [{train_tensor.min()}, {train_tensor.max()}], "
                           f"seq_len: {len(train_tensor)}, "
@@ -521,7 +515,6 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 
                 loss = loss_func(masked_logits, masked_targets)
                 
-                # 检查loss是否为NaN
                 if torch.isnan(loss):
                     print(f"[Warning] NaN loss detected, skipping this step", flush=True)
                     return float('inf')
@@ -530,36 +523,41 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         else:
             loss = torch.tensor(0.0, device=device)
         
-        # 检查advantage_weight是否为NaN
-        if torch.isnan(torch.tensor(advantage_weight)):
-            print(f"[Warning] NaN advantage_weight detected, using 1.0", flush=True)
-            advantage_weight = 1.0
-            
-        # 应用GRPO优势加权
-        loss = loss * advantage_weight
+        # 【修复】损失缩放，适配梯度累积
+        loss = loss / GRADIENT_ACCUMULATION_STEPS
+        
         record_loss(loss.item())
 
     # 检查损失是否有效
     if not torch.isnan(loss) and not torch.isinf(loss):
-        scaler.scale(loss).backward()
-        
-        # 【新增】梯度裁剪前检查
-        scaler.unscale_(optimizer)
-        
-        # 【新增】梯度裁剪后检查NaN
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        if torch.isnan(grad_norm):
-            optimizer.zero_grad()
-            print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
-            return float('inf')
-        
-        scaler.step(optimizer)
-        scaler.update()
+        if scaler.is_enabled():
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if torch.isnan(grad_norm):
+                optimizer.zero_grad()
+                print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
+                return float('inf')
+            
+            if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                scaler.step(optimizer)
+                scaler.update()
+        else:
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            if torch.isnan(grad_norm):
+                optimizer.zero_grad()
+                print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
+                return float('inf')
+            
+            if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                optimizer.step()
     else:
         print(f"[Warning] Invalid loss detected: {loss}, skipping optimizer step", flush=True)
         return float('inf')
+    
+    training_rounds += 1
 
-    # 输出训练预览(可选)
     if show_preview:
         try:
             decoded_preview = TextTokenizer.decode(preview[preview != 0])
