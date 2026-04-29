@@ -381,6 +381,7 @@ class MainModel(nn.Module):
     def compress_history_vectors(self, history_tokens: torch.Tensor, compress_ratio: float = None) -> torch.Tensor:
         """无标记向量压缩：上下文token嵌入 → 聚类压缩 → 压缩向量
         无人工标记，仅用注意力权重与语义聚类
+        使用纯PyTorch实现的KMeans聚类
         """
         if compress_ratio is None:
             compress_ratio = float(CONFIG.get("compress_ratio", 0.3))
@@ -392,10 +393,10 @@ class MainModel(nn.Module):
             seq_len, emb_size = hist_emb.shape
             compress_num = max(16, int(seq_len * compress_ratio))
             
-            from sklearn.cluster import KMeans
-            emb_np = hist_emb.cpu().numpy()
-            kmeans = KMeans(n_clusters=compress_num, random_state=42, n_init="auto")
-            cluster_labels = kmeans.fit_predict(emb_np)
+            if seq_len <= compress_num:
+                return self.final_norm(hist_emb)
+            
+            cluster_labels = self._pytorch_kmeans(hist_emb, compress_num)
             
             compress_vectors = []
             for i in range(compress_num):
@@ -410,6 +411,34 @@ class MainModel(nn.Module):
             
             compress_tensor = torch.stack(compress_vectors).to(hist_emb.device)
             return self.final_norm(compress_tensor)
+    
+    def _pytorch_kmeans(self, x: torch.Tensor, n_clusters: int, max_iter: int = 100, tol: float = 1e-4) -> torch.Tensor:
+        """纯PyTorch实现的KMeans聚类算法"""
+        n_samples = x.size(0)
+        device = x.device
+        
+        idx = torch.randperm(n_samples)[:n_clusters]
+        centers = x[idx].clone()
+        
+        for _ in range(max_iter):
+            distances = torch.cdist(x, centers, p=2)
+            labels = torch.argmin(distances, dim=1)
+            
+            new_centers = torch.zeros_like(centers)
+            for i in range(n_clusters):
+                mask = (labels == i)
+                if mask.any():
+                    new_centers[i] = x[mask].mean(dim=0)
+                else:
+                    new_centers[i] = x[torch.randint(n_samples, (1,))]
+            
+            center_shift = torch.norm(new_centers - centers, dim=1).sum()
+            centers = new_centers
+            
+            if center_shift < tol:
+                break
+        
+        return labels
 
     def forward(
         self,
