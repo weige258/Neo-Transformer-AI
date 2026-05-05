@@ -4,9 +4,9 @@ import torch
 
 from config import CONFIG
 from model import MainModel
-from record import record_loss, get_loss
+from record import record_loss
 from tokenizer import TextTokenizer
-from rl import SelfRewardModel, LightweightPPO, TreeReinforcementLearning
+from rl import SelfRewardModel, LightweightPPO
 
 
 if hasattr(sys.stdin, "reconfigure"):
@@ -81,7 +81,6 @@ training_rounds = 0
 # 初始化自奖励模型和强化学习模块
 reward_model = SelfRewardModel(device)
 ppo_trainer = LightweightPPO(model, reward_model, device, learning_rate=1e-5)
-tree_rl_generator = TreeReinforcementLearning(model, reward_model, device)
 
 print("[Info] Self-reward model and RL modules initialized.", flush=True)
 
@@ -298,7 +297,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
     
     # 自奖励评估和PPO强化学习（静默进行，不影响原有训练）
     try:
-        total_reward, reward_breakdown = reward_model.compute_total_reward(
+        reward_model.compute_total_reward(
             think_text=think,
             answer_text=answer,
             context=history_context
@@ -314,7 +313,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         
         # 定期更新PPO策略
         if training_rounds > 0 and (training_rounds % 4) == 0:
-            ppo_stats = ppo_trainer.update_policy(batch_size=4)
+            ppo_trainer.update_policy(batch_size=4)
     except Exception as e:
         pass  # 静默处理错误，不影响原有训练
 
@@ -370,19 +369,17 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         max_generate_tokens = max(1, int(max_generate_tokens))
  
     with torch.inference_mode():
-        current_prompt = prompt.clone()
-        
         thinking_started = False
         if thinking_available:
-            has_think_token = (current_prompt == TextTokenizer.THINK_START_TOKEN).any()
+            has_think_token = (prompt == TextTokenizer.THINK_START_TOKEN).any()
             if has_think_token:
                 thinking_started = True
             else:
                 thinking_started = True
                 think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
-                current_prompt = torch.cat([current_prompt, think_start_tensor])
+                prompt = torch.cat([prompt, think_start_tensor])
         
-        result = model(current_prompt, use_cache=True)
+        result = model(prompt, use_cache=True)
         if isinstance(result, tuple):
             logits, past_key_values = result
         else:
@@ -432,8 +429,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         output_text += decoded_piece
 
                 next_token = torch.tensor([index], device=device)
-                current_prompt = torch.cat([current_prompt, next_token])
-                
                 result = model(
                     next_token,
                     past_key_values=past_key_values,
@@ -455,7 +450,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         
         # 自奖励评估（静默进行，不影响原有生成）
         try:
-            total_reward, reward_breakdown = reward_model.compute_total_reward(
+            reward_model.compute_total_reward(
                 answer_text=output_text,
                 context=history_context
             )

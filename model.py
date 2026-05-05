@@ -1,4 +1,4 @@
-from typing import Dict
+from typing import Any
 
 import torch
 from torch import nn
@@ -9,6 +9,7 @@ from config import CONFIG
 
 KVCache = tuple[torch.Tensor, torch.Tensor]
 LinearKVCache = tuple[torch.Tensor, torch.Tensor, int]
+AttentionCache = KVCache | LinearKVCache
 
 
 class RMSNorm(nn.Module):
@@ -20,22 +21,14 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 检查最后一个维度是否与weight维度匹配
         if x.size(-1) != self.weight.size(0):
-            # 如果不匹配，则使用相应部分的weight
             weight = self.weight[:x.size(-1)]
         else:
             weight = self.weight
-        
-        # 【新增】输入前检查
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            x = torch.where(torch.isnan(x) | torch.isinf(x), torch.zeros_like(x), x)
-        
+
+        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
         rms = torch.sqrt(torch.mean(x.pow(2), dim=-1, keepdim=True) + self.eps)
-        
-        # 【修改】更安全的clamp
-        rms = torch.clamp(rms, min=1e-6, max=1e6)  # 防止过大或过小
-        
+        rms = torch.clamp(rms, min=1e-6, max=1e6)
         x = x / rms
         return x * weight
 
@@ -74,7 +67,35 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
 
 
-class LinearAttention(nn.Module):
+def _attention_schedule(config: dict[str, Any]) -> list[str]:
+    mix = config.get("attention_mix")
+    if isinstance(mix, dict) and mix:
+        base: list[str] = []
+        for name, count in mix.items():
+            base.extend([str(name)] * max(0, int(count)))
+    else:
+        base = (
+            ["lightning"] * int(config.get("num_linear_layers", 2))
+            + ["flash"] * int(config.get("num_flash_layers", 6))
+        )
+    if not base:
+        base = ["flash"]
+    return base * max(1, int(config.get("num_big_blocks", 1)))
+
+
+def _apply_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    rope: RotaryPositionEmbedding,
+    start_pos: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    cos, sin = rope(seq_len=q.size(-2), device=q.device, start_pos=start_pos)
+    q = (q * cos) + (rotate_half(q) * sin)
+    k = (k * cos) + (rotate_half(k) * sin)
+    return q, k
+
+
+class LightningAttention(nn.Module):
     def __init__(self, emb_size: int, num_heads: int, dropout: float):
         super().__init__()
         self.num_heads = num_heads
@@ -82,6 +103,7 @@ class LinearAttention(nn.Module):
         self.dropout = dropout
         
         self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
+        self.gate_proj = nn.Linear(emb_size, emb_size, bias=False)
         self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
         self.rope = RotaryPositionEmbedding(self.head_dim)
 
@@ -166,6 +188,7 @@ class LinearAttention(nn.Module):
 
         out = out.permute(0, 2, 1, 3).contiguous()
         out = out.view(batch, seq_len, self.num_heads * self.head_dim)
+        out = out * torch.sigmoid(self.gate_proj(x))
         out = self.out_proj(out)
 
         if use_cache:
@@ -189,27 +212,25 @@ class FlashAttention(nn.Module):
         qkv = self.qkv_proj(x)
         qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
+        q, k_new, v_new = qkv[0], qkv[1], qkv[2]
 
         past_len = 0
         if past_key_value is not None:
             past_k, past_v = past_key_value
             past_len = past_k.size(-2)
-            k = torch.cat([past_k, k], dim=-2)
-            v = torch.cat([past_v, v], dim=-2)
+            v = torch.cat([past_v, v_new], dim=-2)
+        else:
+            past_k = None
+            v = v_new
         
-        # 【修复】给q应用RoPE，使用正确的位置偏移
-        cos, sin = self.rope(seq_len=seq_len, device=x.device, start_pos=past_len)
-        q = (q * cos) + (rotate_half(q) * sin)
+        q, k_new = _apply_rope(q, k_new, self.rope, past_len)
         
-        # 【修复】给完整的k序列应用RoPE，而非仅当前序列
-        cos_k, sin_k = self.rope(seq_len=k.size(-2), device=x.device, start_pos=0)
-        k = (k * cos_k) + (rotate_half(k) * sin_k)
+        k = k_new if past_k is None else torch.cat([past_k, k_new], dim=-2)
 
         output = F.scaled_dot_product_attention(
             q, k, v,
             dropout_p=self.dropout if self.training else 0.0,
-            is_causal=True,
+            is_causal=past_key_value is None,
         )
 
         output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
@@ -220,76 +241,182 @@ class FlashAttention(nn.Module):
         return output
 
 
+class SlidingWindowAttention(FlashAttention):
+    def __init__(self, emb_size: int, num_heads: int, dropout: float, window_size: int):
+        super().__init__(emb_size, num_heads, dropout)
+        self.window_size = max(1, int(window_size))
+
+    def forward(self, x: torch.Tensor, past_key_value=None, use_cache: bool = False):
+        batch, seq_len, _ = x.shape
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k_new, v_new = qkv[0], qkv[1], qkv[2]
+
+        past_len = 0
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            past_len = past_k.size(-2)
+        else:
+            past_k = past_v = None
+
+        q, k_new = _apply_rope(q, k_new, self.rope, past_len)
+        k_all = k_new if past_k is None else torch.cat([past_k, k_new], dim=-2)
+        v_all = v_new if past_v is None else torch.cat([past_v, v_new], dim=-2)
+
+        if use_cache and seq_len == 1:
+            k_window = k_all[:, :, -self.window_size :, :]
+            v_window = v_all[:, :, -self.window_size :, :]
+            output = F.scaled_dot_product_attention(
+                q,
+                k_window,
+                v_window,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        else:
+            total_len = k_all.size(-2)
+            q_pos = torch.arange(past_len, past_len + seq_len, device=x.device)[:, None]
+            k_pos = torch.arange(total_len, device=x.device)[None, :]
+            blocked = (k_pos > q_pos) | (k_pos < (q_pos - self.window_size + 1))
+            attn_mask = torch.zeros(seq_len, total_len, device=x.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(blocked, float("-inf"))
+            output = F.scaled_dot_product_attention(
+                q,
+                k_all,
+                v_all,
+                attn_mask=attn_mask,
+                dropout_p=self.dropout if self.training else 0.0,
+                is_causal=False,
+            )
+
+        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        output = self.out_proj(output)
+
+        if use_cache:
+            return output, (k_all, v_all)
+        return output
+
+
+class LatentCompressedAttention(FlashAttention):
+    def __init__(self, emb_size: int, num_heads: int, dropout: float, stride: int):
+        super().__init__(emb_size, num_heads, dropout)
+        self.stride = max(1, int(stride))
+        self.mix_proj = nn.Linear(emb_size * 2, emb_size, bias=False)
+
+    def _compress(self, x: torch.Tensor) -> torch.Tensor:
+        batch, heads, seq_len, dim = x.shape
+        chunks = (seq_len + self.stride - 1) // self.stride
+        padded_len = chunks * self.stride
+        if padded_len != seq_len:
+            pad = x[:, :, -1:, :].expand(batch, heads, padded_len - seq_len, dim)
+            x = torch.cat([x, pad], dim=-2)
+        return x.view(batch, heads, chunks, self.stride, dim).mean(dim=-2)
+
+    def forward(self, x: torch.Tensor, past_key_value=None, use_cache: bool = False):
+        batch, seq_len, _ = x.shape
+        qkv = self.qkv_proj(x)
+        qkv = qkv.view(batch, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k_new, v_new = qkv[0], qkv[1], qkv[2]
+
+        past_len = 0
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            past_len = past_k.size(-2)
+        else:
+            past_k = past_v = None
+
+        q, k_new = _apply_rope(q, k_new, self.rope, past_len)
+        k_all = k_new if past_k is None else torch.cat([past_k, k_new], dim=-2)
+        v_all = v_new if past_v is None else torch.cat([past_v, v_new], dim=-2)
+        k_latent = self._compress(k_all)
+        v_latent = self._compress(v_all)
+
+        scores = torch.matmul(q, k_latent.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        if not (use_cache and seq_len == 1):
+            total_len = k_all.size(-2)
+            chunk_start = torch.arange(k_latent.size(-2), device=x.device) * self.stride
+            chunk_start = chunk_start.clamp(max=total_len - 1)[None, :]
+            q_pos = torch.arange(past_len, past_len + seq_len, device=x.device)[:, None]
+            scores = scores.masked_fill(chunk_start > q_pos, float("-inf"))
+
+        weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+        weights = torch.nan_to_num(weights, nan=0.0)
+        compressed = torch.matmul(weights, v_latent)
+
+        local_size = min(k_all.size(-2), self.stride)
+        if use_cache and seq_len == 1:
+            local = F.scaled_dot_product_attention(
+                q,
+                k_all[:, :, -local_size:, :],
+                v_all[:, :, -local_size:, :],
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        else:
+            total_len = k_all.size(-2)
+            q_pos = torch.arange(past_len, past_len + seq_len, device=x.device)[:, None]
+            k_pos = torch.arange(total_len, device=x.device)[None, :]
+            blocked = (k_pos > q_pos) | (k_pos < (q_pos - self.stride + 1))
+            attn_mask = torch.zeros(seq_len, total_len, device=x.device, dtype=q.dtype)
+            attn_mask = attn_mask.masked_fill(blocked, float("-inf"))
+            local = F.scaled_dot_product_attention(
+                q,
+                k_all,
+                v_all,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+
+        output = torch.cat([compressed, local], dim=-1)
+        output = output.transpose(1, 2).contiguous().view(batch, seq_len, -1)
+        output = self.mix_proj(output)
+
+        if use_cache:
+            return output, (k_all, v_all)
+        return output
+
+
 class VariableDimAdaptiveFFN(nn.Module):
-    """可变维度自适应前馈网络
-    
-    根据输入特征的统计特性动态调整隐藏层维度，提高模型的表达能力和效率。
-    核心思想：复杂输入使用更大维度，简单输入使用较小维度。
-    """
-    def __init__(self, emb_size: int, dropout: float, base_ffn_ratio: float = 3.0, adaptive_range: float = 0.5) -> None:
+    def __init__(
+        self,
+        emb_size: int,
+        dropout: float,
+        base_ffn_ratio: float = 3.0,
+        adaptive_range: float = 0.5,
+    ) -> None:
         super().__init__()
-        self.emb_size = emb_size
-        self.base_ffn_ratio = base_ffn_ratio
-        self.adaptive_range = adaptive_range
-        
-        # 基础FFN尺寸
         self.base_ffn_size = int(emb_size * base_ffn_ratio)
-        
-        # 维度预测器：根据输入特征预测合适的隐藏层维度比例
-        self.dim_predictor = nn.Sequential(
-            nn.Linear(emb_size, emb_size // 4, bias=False),
-            nn.SiLU(),
-            nn.Linear(emb_size // 4, 1, bias=False),
-            nn.Sigmoid()  # 输出[0, 1]范围的比例因子
-        )
-        
-        # 最大可能的FFN尺寸（用于预分配）
+        self.adaptive_range = adaptive_range
         self.max_ffn_size = int(self.base_ffn_size * (1 + adaptive_range))
-        
-        # 主FFN网络（使用最大尺寸以保证兼容性）
+        self.dim_predictor = nn.Sequential(
+            nn.Linear(emb_size, max(1, emb_size // 4), bias=False),
+            nn.SiLU(),
+            nn.Linear(max(1, emb_size // 4), 1, bias=False),
+            nn.Sigmoid(),
+        )
         self.gate_proj = nn.Linear(emb_size, self.max_ffn_size, bias=False)
         self.up_proj = nn.Linear(emb_size, self.max_ffn_size, bias=False)
         self.down_proj = nn.Linear(self.max_ffn_size, emb_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
-        
-        # 添加RMSNorm以提高数值稳定性
         self.hidden_norm = RMSNorm(self.max_ffn_size)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: [batch, seq_len, emb_size]
-        Returns:
-            output: [batch, seq_len, emb_size]
-        """
-        batch, seq_len, emb_size = x.shape
-        
-        # 1. 计算自适应维度比例（增加数值稳定性）
-        x_mean = x.mean(dim=1)  # [batch, emb_size]
-        dim_ratio = self.dim_predictor(x_mean)  # [batch, 1] 范围[0, 1]，已经是Sigmoid输出
-        
-        # 2. 计算实际使用的FFN维度
+        dim_ratio = self.dim_predictor(x.mean(dim=1))
         actual_ratio = 1.0 + (dim_ratio - 0.5) * 2 * self.adaptive_range
-        actual_ratio = torch.clamp(actual_ratio, min=1-self.adaptive_range, max=1+self.adaptive_range)
-        
-        # 防止 NaN 导致 int() 崩溃
-        if torch.isnan(actual_ratio).any():
-            actual_ffn_size = self.base_ffn_size
-        else:
-            actual_ffn_size = int(self.base_ffn_size * actual_ratio.mean().item())
-        
+        actual_ratio = torch.nan_to_num(actual_ratio, nan=1.0).clamp(
+            min=1 - self.adaptive_range,
+            max=1 + self.adaptive_range,
+        )
+        actual_ffn_size = int(self.base_ffn_size * actual_ratio.mean().item())
         actual_ffn_size = max(1, min(actual_ffn_size, self.max_ffn_size))
-        
-        # 【核心修改】动态切片权重，只计算需要的维度，不分配全尺寸张量
-        gate = torch.nn.functional.silu(F.linear(x, self.gate_proj.weight[:actual_ffn_size, :]))
+
+        gate = F.silu(F.linear(x, self.gate_proj.weight[:actual_ffn_size, :]))
         up = F.linear(x, self.up_proj.weight[:actual_ffn_size, :])
-        
-        hidden = gate * up
-        hidden = self.hidden_norm(hidden)
-        
-        # 输出投影只使用对应维度的权重
+        hidden = self.hidden_norm(gate * up)
         down = F.linear(hidden, self.down_proj.weight[:, :actual_ffn_size])
-        
         return self.dropout(down)
 
 
@@ -302,17 +429,31 @@ class AdaptiveAttentionTransformerBlock(nn.Module):
         
         if attention_type == "flash":
             self.attention = FlashAttention(emb_size, num_heads, dropout)
+        elif attention_type == "sliding":
+            self.attention = SlidingWindowAttention(
+                emb_size,
+                num_heads,
+                dropout,
+                int(CONFIG.get("sliding_window", 128)),
+            )
+        elif attention_type in {"latent", "latent_compress", "compressed"}:
+            self.attention = LatentCompressedAttention(
+                emb_size,
+                num_heads,
+                dropout,
+                int(CONFIG.get("latent_compress_stride", 8)),
+            )
         else:
-            self.attention = LinearAttention(emb_size, num_heads, dropout)
+            self.attention = LightningAttention(emb_size, num_heads, dropout)
         
         self.feed_forward = VariableDimAdaptiveFFN(emb_size, dropout)
     
     def forward(
         self,
         x: torch.Tensor,
-        past_key_value: KVCache | LinearKVCache | None = None,
+        past_key_value: AttentionCache | None = None,
         use_cache: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, KVCache | LinearKVCache]:
+    ) -> torch.Tensor | tuple[torch.Tensor, AttentionCache]:
         attn_output = self.attention(
             self.rms_norm1(x),
             past_key_value=past_key_value,
@@ -341,9 +482,10 @@ class MainModel(nn.Module):
         dict_size = int(CONFIG["dict_size"])
         emb_size = int(CONFIG["emb_size"])
         num_heads = int(CONFIG["num_heads"])
-        num_linear_layers = int(CONFIG.get("num_linear_layers", 2))
-        num_flash_layers = int(CONFIG.get("num_flash_layers", 6))
-        num_layers = num_linear_layers + num_flash_layers
+        if emb_size % num_heads != 0:
+            raise ValueError("emb_size must be divisible by num_heads.")
+
+        attention_types = _attention_schedule(CONFIG)
         dropout = float(CONFIG["dropout"])
 
         self.token_embedding = nn.Embedding(dict_size, emb_size)
@@ -351,11 +493,7 @@ class MainModel(nn.Module):
         
         self.transformers = nn.ModuleList()
         
-        for i in range(num_layers):
-            if i < num_linear_layers:
-                attention_type = "linear"
-            else:
-                attention_type = "flash"
+        for attention_type in attention_types:
             self.transformers.append(
                 AdaptiveAttentionTransformerBlock(
                     emb_size=emb_size,
@@ -379,10 +517,7 @@ class MainModel(nn.Module):
                 nn.init.xavier_uniform_(module.weight)
 
     def compress_history_vectors(self, history_tokens: torch.Tensor, compress_ratio: float = None) -> torch.Tensor:
-        """无标记向量压缩：上下文token嵌入 → 聚类压缩 → 压缩向量
-        无人工标记，仅用注意力权重与语义聚类
-        使用纯PyTorch实现的KMeans聚类
-        """
+        """Compress history embeddings with unlabeled score-weighted segments."""
         if compress_ratio is None:
             compress_ratio = float(CONFIG.get("compress_ratio", 0.3))
         
@@ -396,56 +531,26 @@ class MainModel(nn.Module):
             if seq_len <= compress_num:
                 return self.final_norm(hist_emb)
             
-            cluster_labels = self._pytorch_kmeans(hist_emb, compress_num)
-            
+            scores = torch.norm(hist_emb, dim=-1)
+            boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
             compress_vectors = []
             for i in range(compress_num):
-                mask = (cluster_labels == i)
-                if not mask.any():
-                    continue
-                cluster_vec = hist_emb[mask]
-                attn_score = torch.norm(cluster_vec, dim=-1, keepdim=True)
-                attn_weight = torch.softmax(attn_score, dim=0)
-                weighted_vec = (cluster_vec * attn_weight).sum(dim=0)
-                compress_vectors.append(weighted_vec)
-            
-            compress_tensor = torch.stack(compress_vectors).to(hist_emb.device)
+                start = int(boundaries[i].item())
+                end = max(start + 1, int(boundaries[i + 1].item()))
+                segment = hist_emb[start:end]
+                segment_scores = scores[start:end].unsqueeze(-1)
+                weights = torch.softmax(segment_scores.float(), dim=0).to(hist_emb.dtype)
+                compress_vectors.append((segment * weights).sum(dim=0))
+
+            compress_tensor = torch.stack(compress_vectors)
             return self.final_norm(compress_tensor)
-    
-    def _pytorch_kmeans(self, x: torch.Tensor, n_clusters: int, max_iter: int = 100, tol: float = 1e-4) -> torch.Tensor:
-        """纯PyTorch实现的KMeans聚类算法"""
-        n_samples = x.size(0)
-        device = x.device
-        
-        idx = torch.randperm(n_samples)[:n_clusters]
-        centers = x[idx].clone()
-        
-        for _ in range(max_iter):
-            distances = torch.cdist(x, centers, p=2)
-            labels = torch.argmin(distances, dim=1)
-            
-            new_centers = torch.zeros_like(centers)
-            for i in range(n_clusters):
-                mask = (labels == i)
-                if mask.any():
-                    new_centers[i] = x[mask].mean(dim=0)
-                else:
-                    new_centers[i] = x[torch.randint(n_samples, (1,))]
-            
-            center_shift = torch.norm(new_centers - centers, dim=1).sum()
-            centers = new_centers
-            
-            if center_shift < tol:
-                break
-        
-        return labels
 
     def forward(
         self,
         tokens: torch.Tensor,
-        past_key_values: list[KVCache | LinearKVCache | None] | None = None,
+        past_key_values: list[AttentionCache | None] | None = None,
         use_cache: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, list[KVCache | LinearKVCache]]:
+    ) -> torch.Tensor | tuple[torch.Tensor, list[AttentionCache]]:
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
             squeeze_batch = True
@@ -454,54 +559,23 @@ class MainModel(nn.Module):
         else:
             raise ValueError("tokens must have shape [seq_len] or [batch, seq_len].")
 
-        seq_len = tokens.size(1)
-        past_len = 0
-        if past_key_values:
-            first_cache = past_key_values[0]
-            if first_cache is not None:
-                if len(first_cache) == 3:
-                    past_len = first_cache[2]
-                else:
-                    past_len = first_cache[0].size(-2)
-
         x = self.token_embedding(tokens)
         x = self.embedding_dropout(x)
 
-        next_key_values: list[KVCache | LinearKVCache] = []
+        next_key_values: list[AttentionCache] = []
         if past_key_values is None:
             past_key_values = [None] * len(self.transformers)
-        
-        num_linear_layers = int(CONFIG.get("num_linear_layers", 2))
-        
+        elif len(past_key_values) != len(self.transformers):
+            raise ValueError("past_key_values length must match transformer layer count.")
+
         if use_cache:
-            for i, (block, past_key_value) in enumerate(zip(self.transformers, past_key_values)):
-                if i < num_linear_layers:
-                    x, present_key_value = block(
-                        x,
-                        past_key_value=past_key_value,
-                        use_cache=True,
-                    )
-                    next_key_values.append(present_key_value)
-                else:
-                    if past_len > 0:
-                        current_x = x[:, -1:, :]
-                        current_output = block(
-                            current_x,
-                            past_key_value=None,
-                            use_cache=False,
-                        )
-                        if isinstance(current_output, tuple):
-                            x[:, -1:, :] = current_output[0]
-                        else:
-                            x[:, -1:, :] = current_output
-                        next_key_values.append(None)
-                    else:
-                        x = block(
-                            x,
-                            past_key_value=None,
-                            use_cache=False,
-                        )
-                        next_key_values.append(None)
+            for block, past_key_value in zip(self.transformers, past_key_values):
+                x, present_key_value = block(
+                    x,
+                    past_key_value=past_key_value,
+                    use_cache=True,
+                )
+                next_key_values.append(present_key_value)
         else:
             for block in self.transformers:
                 x = checkpoint(block, x, use_reentrant=False)

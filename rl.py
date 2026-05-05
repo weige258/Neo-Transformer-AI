@@ -1,8 +1,7 @@
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 from dataclasses import dataclass
-from config import CONFIG
 from tokenizer import TextTokenizer
 
 

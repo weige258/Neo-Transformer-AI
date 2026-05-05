@@ -37,7 +37,6 @@ class TextTokenizer(Tokenizer):
 
     @staticmethod
     def encode(text: str) -> torch.Tensor:
-        # 【修复】确保输入是字符串类型
         if not isinstance(text, str):
             if isinstance(text, float) and (math.isnan(text) or math.isinf(text)):
                 text = ""
@@ -45,17 +44,15 @@ class TextTokenizer(Tokenizer):
                 text = str(text)
         
         tensor: list[int] = []
-        dict_size = int(CONFIG["dict_size"])  # 获取词表大小
+        dict_size = int(CONFIG["dict_size"])
         
         for letter in text:
             idx = ord(letter)
-            # 关键修复：任何超出词表大小或无效的字符都映射为UNKNOWN_TOKEN
             if TextTokenizer._is_valid_token(idx) and 0 <= idx < dict_size:
                 tensor.append(idx)
             else:
-                tensor.append(TextTokenizer.UNKNOWN_TOKEN)  # 映射为0
+                tensor.append(TextTokenizer.UNKNOWN_TOKEN)
         
-        # 防止空序列
         if len(tensor) == 0:
             tensor = [TextTokenizer.UNKNOWN_TOKEN]
         
@@ -66,7 +63,15 @@ class TextTokenizer(Tokenizer):
         text: list[str] = []
         for idx in tokens:
             idx_int = int(idx)
-            if idx_int in (TextTokenizer.UNKNOWN_TOKEN, TextTokenizer.START_GENERATION_TOKEN, TextTokenizer.END_GENERATION_TOKEN, TextTokenizer.HISTORY_CONTEXT_START_TOKEN, TextTokenizer.HISTORY_CONTEXT_END_TOKEN, TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN):
+            if idx_int in (
+                TextTokenizer.UNKNOWN_TOKEN,
+                TextTokenizer.START_GENERATION_TOKEN,
+                TextTokenizer.END_GENERATION_TOKEN,
+                TextTokenizer.HISTORY_CONTEXT_START_TOKEN,
+                TextTokenizer.HISTORY_CONTEXT_END_TOKEN,
+                TextTokenizer.THINK_START_TOKEN,
+                TextTokenizer.THINK_END_TOKEN,
+            ):
                 continue
             if not TextTokenizer._is_valid_token(idx_int):
                 continue

@@ -2,9 +2,8 @@ import json
 import torch
 import random
 import logging
-from typing import List, Tuple, Optional, Dict
+from typing import List, Optional, Dict
 from main import train, model, optimizer
-from record import get_loss
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
