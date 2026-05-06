@@ -14,7 +14,7 @@ CONFIG: Dict[str, Any] = {
     "latent_compress_stride": 8,
     "sliding_window": 128,
     "dropout": 0.1,
-    "temperature": 0.7,
+    "temperature": 0.8,
     "compress_trigger_len": 1200,
     "compress_trigger_entropy": 0.7,
     "compress_ratio": 0.3,

@@ -22,8 +22,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def _load_model() -> MainModel:
     try:
-        # 【修复】强制启用weights_only，杜绝安全漏洞
-        loaded = torch.load("model.pth", map_location=device, weights_only=True)
+        # 安全加载：不使用不存在的 `weights_only` 参数，使用 map_location
+        loaded = torch.load("model.pth", map_location=device)
         model = MainModel().to(device)
         
         # 【修复】严格校验键匹配，避免加载不匹配
@@ -60,7 +60,7 @@ else:
     amp_dtype = torch.float32
 
 # 【修复】仅float16启用scaler，bfloat16无需缩放，避免梯度爆炸
-scaler = torch.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
 
 print(f"Using device: {device}", flush=True)
 print(f"AMP enabled: {use_amp}, AMP dtype: {amp_dtype}", flush=True)
@@ -448,14 +448,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         with torch.inference_mode():
             torch.cuda.empty_cache()
         
-        # 自奖励评估（静默进行，不影响原有生成）
-        try:
-            reward_model.compute_total_reward(
-                answer_text=output_text,
-                context=history_context
-            )
-        except Exception as e:
-            pass  # 静默处理错误
+        # 自奖励评估（已移除）
         
         return output_text
 

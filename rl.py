@@ -210,7 +210,7 @@ class LightweightPPO:
         model,
         reward_model: SelfRewardModel,
         device: torch.device,
-        learning_rate: float = 1e-5,
+        learning_rate: float = 2e-4,
         clip_ratio: float = 0.2,
         entropy_coef: float = 0.01,
         gamma: float = 0.99
@@ -247,7 +247,17 @@ class LightweightPPO:
             context=context,
             reference_texts=reference_texts
         )
-        
+        # 存储到 episode buffer（使用占位 log_prob，为后续接入真实采样概率留空）
+        try:
+            # 记录标量奖励
+            self.episode_data['rewards'].append(float(total_reward))
+            # 占位 log_prob 张量（0.0），dtype 与设备匹配
+            self.episode_data['log_probs'].append(torch.tensor(0.0, device=self.device))
+        except Exception:
+            # 若出现设备/类型问题，回退为 Python 原生类型
+            self.episode_data['rewards'].append(float(total_reward))
+            self.episode_data['log_probs'].append(0.0)
+
         return total_reward, reward_breakdown
     
     def compute_advantages(self, rewards: List[float]) -> List[float]:
@@ -280,40 +290,48 @@ class LightweightPPO:
         if len(high_reward_indices) == 0:
             high_reward_indices = list(range(len(self.episode_data['rewards'])))
         
-        total_loss = 0.0
+        total_loss = None
         total_policy_loss = 0.0
         total_entropy_loss = 0.0
         update_count = 0
-        
+
         self.optimizer.zero_grad()
-        
+
         for idx in high_reward_indices:
             log_prob = self.episode_data['log_probs'][idx]
             advantage = advantages[idx]
-            
+
+            # Ensure tensors
+            if not isinstance(log_prob, torch.Tensor):
+                log_prob = torch.tensor(log_prob, device=self.device, dtype=torch.float32)
+            if not isinstance(advantage, torch.Tensor):
+                advantage = torch.tensor(advantage, device=self.device, dtype=torch.float32)
+
             ratio = torch.exp(log_prob)
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantage
-            
-            policy_loss = -torch.min(surr1, surr2)
-            
-            entropy = -log_prob
+
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            entropy = -log_prob.mean()
             entropy_loss = -self.entropy_coef * entropy
-            
+
             loss = policy_loss + entropy_loss
-            
-            total_loss += loss.item()
+
+            if total_loss is None:
+                total_loss = loss
+            else:
+                total_loss = total_loss + loss
+
             total_policy_loss += policy_loss.item()
             total_entropy_loss += entropy_loss.item()
             update_count += 1
-        
-        if update_count > 0:
-            avg_loss = total_loss / update_count
-            avg_loss_tensor = torch.tensor(avg_loss, device=self.device, requires_grad=True)
-            avg_loss_tensor.backward()
-            
+
+        if update_count > 0 and total_loss is not None:
+            total_loss.backward()
+
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
+
             self.optimizer.step()
         
         self.episode_data = {
