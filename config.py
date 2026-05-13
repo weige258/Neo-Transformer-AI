@@ -4,10 +4,10 @@ CONFIG: Dict[str, Any] = {
     "dict_size": 60000,
     "emb_size": 512,
     "num_heads": 8,
-    "num_big_blocks": 2,
+    "num_transformer_blocks": 8,
     "attention_mix": {
         "compressed": 2,
-        "sparse": 1,
+        "sparse": 1.3,
         "dynamic": 1,
     },
     "sliding_window": 96,

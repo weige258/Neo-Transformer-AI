@@ -349,7 +349,7 @@ class CompressedSparseDynamicAttention(nn.Module):
 class SwiGLUFFN(nn.Module):
     def __init__(self, emb_size: int, dropout: float) -> None:
         super().__init__()
-        hidden = int(emb_size * 8 / 3)
+        hidden = int(emb_size *  3)
         self.gate_proj = nn.Linear(emb_size, hidden, bias=False)
         self.up_proj = nn.Linear(emb_size, hidden, bias=False)
         self.down_proj = nn.Linear(hidden, emb_size, bias=False)
@@ -359,7 +359,7 @@ class SwiGLUFFN(nn.Module):
         return self.dropout(self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x)))
 
 
-class CompressedAttentionBigBlock(nn.Module):
+class CompressedAttentionBlock(nn.Module):
     def __init__(self, emb_size: int, num_heads: int, dropout: float) -> None:
         super().__init__()
         self.attn_norm = RMSNorm(emb_size)
@@ -402,15 +402,15 @@ class MainModel(nn.Module):
             raise ValueError("emb_size must be divisible by num_heads.")
 
         dropout = float(CONFIG.get("dropout", 0.05))
-        num_big_blocks = int(CONFIG.get("num_big_blocks", 2))
-        if num_big_blocks != 2:
-            raise ValueError("This architecture requires CONFIG['num_big_blocks'] == 2.")
+        num_transformer_blocks = int(CONFIG.get("num_transformer_blocks", 2))
+        if num_transformer_blocks < 1:
+            raise ValueError("CONFIG['num_transformer_blocks'] must be at least 1.")
 
         self.token_embedding = nn.Embedding(dict_size, emb_size)
         self.embedding_dropout = nn.Dropout(dropout)
         self.transformers = nn.ModuleList(
-            CompressedAttentionBigBlock(emb_size, num_heads, dropout)
-            for _ in range(num_big_blocks)
+            CompressedAttentionBlock(emb_size, num_heads, dropout)
+            for _ in range(num_transformer_blocks)
         )
         self.final_norm = RMSNorm(emb_size)
         self.output_linear = nn.Linear(emb_size, dict_size, bias=False)
