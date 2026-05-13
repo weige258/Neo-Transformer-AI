@@ -3,3 +3,4 @@ __pycache__/
 dataset/*
 !dataset/dataset_1.json
 ./record.txt
+record.txt
