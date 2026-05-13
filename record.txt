@@ -1,1 +1,4 @@
 <system_time>2026/05/05 19:38:42</system_time><time>00:00:00</time><avg_loss>0</avg_loss>
+<system_time>2026/05/06 17:06:32</system_time><time>00:35:40</time><avg_loss>1.110391</avg_loss>
+<system_time>2026/05/06 17:33:34</system_time><time>01:01:52</time><avg_loss>0.928939</avg_loss>
+<system_time>2026/05/06 18:05:02</system_time><time>01:32:26</time><avg_loss>0.794185</avg_loss>
