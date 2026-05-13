@@ -222,7 +222,11 @@ class LightweightPPO:
         self.entropy_coef = entropy_coef
         self.gamma = gamma
         
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            foreach=torch.cuda.is_available(),
+        )
         
         self.episode_data = {
             'log_probs': [],
@@ -295,7 +299,7 @@ class LightweightPPO:
         total_entropy_loss = 0.0
         update_count = 0
 
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
 
         for idx in high_reward_indices:
             log_prob = self.episode_data['log_probs'][idx]

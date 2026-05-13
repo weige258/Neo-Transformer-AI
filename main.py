@@ -73,7 +73,12 @@ total_params = sum(param.numel() for param in model.parameters())
 print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 
 loss_func = torch.nn.CrossEntropyLoss().to(device)
-optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+optimizer = torch.optim.AdamW(
+    model.parameters(),
+    lr=2e-4,
+    weight_decay=0.01,
+    foreach=torch.cuda.is_available(),
+)
 
 GRADIENT_ACCUMULATION_STEPS = 4
 training_rounds = 0
@@ -471,7 +476,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     model.train()
     
     if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
     with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
         result = model(train_tensor, use_cache=False)
@@ -523,7 +528,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if torch.isnan(grad_norm):
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
                 return float('inf')
             
@@ -534,7 +539,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             if torch.isnan(grad_norm):
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
                 return float('inf')
             

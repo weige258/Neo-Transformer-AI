@@ -205,7 +205,7 @@ def main() -> None:
                 if "cannot convert float NaN to integer" in str(e):
                     logging.error(f"NaN training error: {e}, skipping this sample")
                     # 尝试清理梯度
-                    optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
                     continue
                 else:
                     logging.error(f"Training error: {e}")
