@@ -409,35 +409,36 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
                 # 根据 token 切分思维链与回答并分别着色输出，默认不显示 RL 额外信息
                 try:
-                    # 合并 prompt 与生成 tokens 以便检测 THINK_START/THINK_END
-                    prompt_list = prompt.tolist() if hasattr(prompt, 'tolist') else list(prompt)
+                    # 逐 token 打印生成结果：遇到 THINK_START/THINK_END 切换颜色并处理换行
                     gen_list = list(generated_tokens)
-                    full_tokens = prompt_list + gen_list
-
                     THINK_S = TextTokenizer.THINK_START_TOKEN
                     THINK_E = TextTokenizer.THINK_END_TOKEN
 
-                    if THINK_S in full_tokens and THINK_E in full_tokens and full_tokens.index(THINK_S) < full_tokens.index(THINK_E):
-                        s = full_tokens.index(THINK_S)
-                        e = full_tokens.index(THINK_E)
+                    thinking = False
+                    # 仅遍历生成部分的 token，逐 token 解码并输出，模拟采样路径的行为
+                    for tok in gen_list:
+                        if tok == THINK_S:
+                            thinking = True
+                            continue
+                        if tok == THINK_E:
+                            # 结束思维链：换行并关闭思考标记
+                            thinking = False
+                            print(RESET)
+                            continue
 
-                        think_tokens = full_tokens[s+1:e]
-                        answer_tokens = full_tokens[e+1:]
+                        decoded_piece = TextTokenizer.decode(torch.tensor([tok], device=device))
+                        if not decoded_piece:
+                            continue
 
-                        think_text = TextTokenizer.decode(torch.tensor(think_tokens, device=device)) if len(think_tokens) > 0 else ""
-                        # 只解码 answer_tokens 中属于生成部分（去掉 prompt 前缀）
-                        answer_text = TextTokenizer.decode(torch.tensor(answer_tokens, device=device)) if len(answer_tokens) > 0 else ""
+                        if thinking:
+                            print(f"{BLUE}{decoded_piece}{RESET}", end="", flush=True)
+                        else:
+                            print(f"{GREEN}{decoded_piece}{RESET}", end="", flush=True)
 
-                        if think_text:
-                            # 打印思维链并换行（与采样路径一致）
-                            print(f"{BLUE}{think_text}{RESET}", flush=True)
-                        if answer_text:
-                            # 打印回答的开头（绿色），不强制换行以保持与后续 token 输出一致
-                            print(f"{GREEN}{answer_text}{RESET}", end="", flush=True)
-                    else:
-                        # 无明确思维链标记，整体作为回答输出
-                        if generated_text:
-                            print(f"{GREEN}{generated_text}{RESET}", end="", flush=True)
+                    # 最后保持光标在行末（与采样一致）
+                except Exception:
+                    if generated_text:
+                        print(f"{GREEN}{generated_text}{RESET}", end="", flush=True)
                 except Exception:
                     # 回退：直接打印解码后的文本
                     if generated_text:
