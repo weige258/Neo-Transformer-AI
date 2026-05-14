@@ -6,7 +6,7 @@ from config import CONFIG
 from model import MainModel
 from record import record_loss
 from tokenizer import TextTokenizer
-from rl import SelfRewardModel, LightweightPPO, TreeReinforcementLearning
+from rl import SelfRewardModel, LightweightPPO
 
 
 if hasattr(sys.stdin, "reconfigure"):
@@ -86,16 +86,8 @@ training_rounds = 0
 # 初始化自奖励模型和强化学习模块
 reward_model = SelfRewardModel(device)
 ppo_trainer = LightweightPPO(model, reward_model, device, learning_rate=1e-5)
-tree_rl_generator = TreeReinforcementLearning(
-    model,
-    reward_model,
-    device,
-    max_depth=int(CONFIG.get("tree_rl_max_generate_tokens", 100)),
-    beam_width=int(CONFIG.get("tree_rl_beam_width", 4)),
-    temperature=float(CONFIG.get("temperature", 0.8)),
-)
 
-print("[Info] Self-reward model, PPO, and tree RL generator initialized.", flush=True)
+print("[Info] Self-reward model and RL modules initialized.", flush=True)
 
 
 def auto_compress_trigger(history_tensor: torch.Tensor, attn_weights: torch.Tensor = None) -> bool:
@@ -391,63 +383,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 thinking_started = True
                 think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
                 prompt = torch.cat([prompt, think_start_tensor])
-
-        if CONFIG.get("use_tree_rl_generation", True):
-            try:
-                tree_max_tokens = max_generate_tokens
-                if tree_max_tokens is None:
-                    tree_max_tokens = int(CONFIG.get("tree_rl_max_generate_tokens", 100))
-
-                generated_tokens, generated_text, total_reward, reward_breakdown = tree_rl_generator.beam_search_with_reward(
-                    prompt,
-                    context=history_context,
-                    max_length=max(1, int(tree_max_tokens)),
-                    beam_width=max(1, int(CONFIG.get("tree_rl_beam_width", 4))),
-                    thinking_available=thinking_available,
-                    min_new_tokens=min_new_tokens,
-                )
-
-                # 根据 token 切分思维链与回答并分别着色输出，默认不显示 RL 额外信息
-                try:
-                    # 逐 token 打印生成结果：遇到 THINK_START/THINK_END 切换颜色并处理换行
-                    gen_list = list(generated_tokens)
-                    THINK_S = TextTokenizer.THINK_START_TOKEN
-                    THINK_E = TextTokenizer.THINK_END_TOKEN
-
-                    thinking = False
-                    # 仅遍历生成部分的 token，逐 token 解码并输出，模拟采样路径的行为
-                    for tok in gen_list:
-                        if tok == THINK_S:
-                            thinking = True
-                            continue
-                        if tok == THINK_E:
-                            # 结束思维链：换行并关闭思考标记
-                            thinking = False
-                            print(RESET)
-                            continue
-
-                        decoded_piece = TextTokenizer.decode(torch.tensor([tok], device=device))
-                        if not decoded_piece:
-                            continue
-
-                        if thinking:
-                            print(f"{BLUE}{decoded_piece}{RESET}", end="", flush=True)
-                        else:
-                            print(f"{GREEN}{decoded_piece}{RESET}", end="", flush=True)
-
-                    # 最后保持光标在行末（与采样一致）
-                except Exception:
-                    if generated_text:
-                        print(f"{GREEN}{generated_text}{RESET}", end="", flush=True)
-                except Exception:
-                    # 回退：直接打印解码后的文本
-                    if generated_text:
-                        print(f"{GREEN}{generated_text}{RESET}", end="", flush=True)
-
-                torch.cuda.empty_cache()
-                return generated_text
-            except Exception as e:
-                print(f"[Warning] Tree RL generation failed, fallback to sampling: {e}", flush=True)
         
         result = model(prompt, use_cache=True)
         if isinstance(result, tuple):
