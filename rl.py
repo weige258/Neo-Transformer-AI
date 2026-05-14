@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Union
 from dataclasses import dataclass
 from tokenizer import TextTokenizer
 
@@ -385,6 +385,11 @@ class TreeReinforcementLearning:
         self.temperature = temperature
         
         self.root = TreeNode(token_id=None, log_prob=0.0)
+
+    def _prompt_to_tokens(self, prompt: Union[str, torch.Tensor]) -> torch.Tensor:
+        if isinstance(prompt, torch.Tensor):
+            return prompt.to(self.device, dtype=torch.long)
+        return TextTokenizer.encode(prompt).to(self.device)
     
     def select_node(self, node: TreeNode) -> TreeNode:
         """使用UCB算法选择节点"""
@@ -431,8 +436,7 @@ class TreeReinforcementLearning:
         
         next_logits = logits[-1]
         next_probs = F.softmax(next_logits / self.temperature, dim=-1)
-        
-        top_k_probs, top_k_indices = torch.topk(next_logits, k=self.beam_width)
+        top_k_probs, top_k_indices = torch.topk(next_probs, k=self.beam_width)
         
         new_children = []
         for i in range(self.beam_width):
@@ -488,13 +492,14 @@ class TreeReinforcementLearning:
     
     def search(
         self,
-        prompt: str,
+        prompt: Union[str, torch.Tensor],
         context: str = None,
         max_iterations: int = 100,
-        thinking_available: bool = True
+        thinking_available: bool = True,
+        min_new_tokens: int = 1,
     ) -> Tuple[str, float, Dict[str, float]]:
         """执行树搜索"""
-        prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
+        prompt_tokens = self._prompt_to_tokens(prompt)
         
         self.root = TreeNode(token_id=None, log_prob=0.0)
         
@@ -532,13 +537,14 @@ class TreeReinforcementLearning:
         best_tokens = best_node.get_path()
         
         generated_text = TextTokenizer.decode(torch.tensor(best_tokens))
-        
+
         total_reward, reward_breakdown = self.reward_model.compute_total_reward(
             answer_text=generated_text,
             context=context
         )
-        
-        return generated_text, total_reward, reward_breakdown
+
+        # 返回额外的 token 列表以便调用方区分 THINK_START/THINK_END
+        return best_tokens, generated_text, total_reward, reward_breakdown
     
     def _select_best_node(self) -> TreeNode:
         """选择最佳节点"""
@@ -564,14 +570,15 @@ class TreeReinforcementLearning:
     
     def beam_search_with_reward(
         self,
-        prompt: str,
+        prompt: Union[str, torch.Tensor],
         context: str = None,
         max_length: int = 100,
         beam_width: int = 4,
-        thinking_available: bool = True
-    ) -> Tuple[str, float, Dict[str, float]]:
+        thinking_available: bool = True,
+        min_new_tokens: int = 1,
+    ) -> Tuple[List[int], str, float, Dict[str, float]]:
         """基于奖励的束搜索"""
-        prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
+        prompt_tokens = self._prompt_to_tokens(prompt)
         
         beams = [
             {
@@ -607,9 +614,12 @@ class TreeReinforcementLearning:
                         logits = result
                 
                 next_logits = logits[-1]
+                if step < min_new_tokens:
+                    next_logits = next_logits.clone()
+                    next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
+
                 next_probs = F.softmax(next_logits / self.temperature, dim=-1)
-                
-                top_k_probs, top_k_indices = torch.topk(next_logits, k=beam_width)
+                top_k_probs, top_k_indices = torch.topk(next_probs, k=beam_width)
                 
                 for i in range(beam_width):
                     token_id = top_k_indices[i].item()
@@ -627,28 +637,28 @@ class TreeReinforcementLearning:
                         'finished': finished
                     }
                     
-                    if finished or step == max_length - 1:
-                        full_tokens = prompt_tokens.tolist() + new_beam['tokens']
-                        generated_text = TextTokenizer.decode(torch.tensor(full_tokens))
-                        
-                        total_reward, _ = self.reward_model.compute_total_reward(
-                            answer_text=generated_text,
-                            context=context
-                        )
-                        new_beam['reward'] = total_reward
+                    generated_text = TextTokenizer.decode(torch.tensor(new_beam['tokens']))
+                    total_reward, _ = self.reward_model.compute_total_reward(
+                        answer_text=generated_text,
+                        context=context
+                    )
+                    new_beam['reward'] = total_reward
                     
                     new_beams.append(new_beam)
             
             beams = sorted(
                 new_beams,
-                key=lambda b: b['log_prob'] + b['reward'],
+                key=lambda b: (b['log_prob'] / max(len(b['tokens']), 1)) + b['reward'],
                 reverse=True
             )[:beam_width]
             
             if all(beam['finished'] for beam in beams):
                 break
         
-        best_beam = max(beams, key=lambda b: b['log_prob'] + b['reward'])
+        best_beam = max(
+            beams,
+            key=lambda b: (b['log_prob'] / max(len(b['tokens']), 1)) + b['reward']
+        )
         best_tokens = best_beam['tokens']
         
         generated_text = TextTokenizer.decode(torch.tensor(best_tokens))
@@ -658,4 +668,5 @@ class TreeReinforcementLearning:
             context=context
         )
         
-        return generated_text, total_reward, reward_breakdown
+        # 返回 tokens 列表、解码文本、总奖励与奖励细分
+        return best_tokens, generated_text, total_reward, reward_breakdown

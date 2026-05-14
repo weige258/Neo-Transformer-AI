@@ -6,7 +6,7 @@ from config import CONFIG
 from model import MainModel
 from record import record_loss
 from tokenizer import TextTokenizer
-from rl import SelfRewardModel, LightweightPPO
+from rl import SelfRewardModel, LightweightPPO, TreeReinforcementLearning
 
 
 if hasattr(sys.stdin, "reconfigure"):
@@ -86,8 +86,16 @@ training_rounds = 0
 # 初始化自奖励模型和强化学习模块
 reward_model = SelfRewardModel(device)
 ppo_trainer = LightweightPPO(model, reward_model, device, learning_rate=1e-5)
+tree_rl_generator = TreeReinforcementLearning(
+    model,
+    reward_model,
+    device,
+    max_depth=int(CONFIG.get("tree_rl_max_generate_tokens", 100)),
+    beam_width=int(CONFIG.get("tree_rl_beam_width", 4)),
+    temperature=float(CONFIG.get("temperature", 0.8)),
+)
 
-print("[Info] Self-reward model and RL modules initialized.", flush=True)
+print("[Info] Self-reward model, PPO, and tree RL generator initialized.", flush=True)
 
 
 def auto_compress_trigger(history_tensor: torch.Tensor, attn_weights: torch.Tensor = None) -> bool:
@@ -383,6 +391,62 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 thinking_started = True
                 think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
                 prompt = torch.cat([prompt, think_start_tensor])
+
+        if CONFIG.get("use_tree_rl_generation", True):
+            try:
+                tree_max_tokens = max_generate_tokens
+                if tree_max_tokens is None:
+                    tree_max_tokens = int(CONFIG.get("tree_rl_max_generate_tokens", 100))
+
+                generated_tokens, generated_text, total_reward, reward_breakdown = tree_rl_generator.beam_search_with_reward(
+                    prompt,
+                    context=history_context,
+                    max_length=max(1, int(tree_max_tokens)),
+                    beam_width=max(1, int(CONFIG.get("tree_rl_beam_width", 4))),
+                    thinking_available=thinking_available,
+                    min_new_tokens=min_new_tokens,
+                )
+
+                # 根据 token 切分思维链与回答并分别着色输出，默认不显示 RL 额外信息
+                try:
+                    # 合并 prompt 与生成 tokens 以便检测 THINK_START/THINK_END
+                    prompt_list = prompt.tolist() if hasattr(prompt, 'tolist') else list(prompt)
+                    gen_list = list(generated_tokens)
+                    full_tokens = prompt_list + gen_list
+
+                    THINK_S = TextTokenizer.THINK_START_TOKEN
+                    THINK_E = TextTokenizer.THINK_END_TOKEN
+
+                    if THINK_S in full_tokens and THINK_E in full_tokens and full_tokens.index(THINK_S) < full_tokens.index(THINK_E):
+                        s = full_tokens.index(THINK_S)
+                        e = full_tokens.index(THINK_E)
+
+                        think_tokens = full_tokens[s+1:e]
+                        answer_tokens = full_tokens[e+1:]
+
+                        think_text = TextTokenizer.decode(torch.tensor(think_tokens, device=device)) if len(think_tokens) > 0 else ""
+                        # 只解码 answer_tokens 中属于生成部分（去掉 prompt 前缀）
+                        answer_text = TextTokenizer.decode(torch.tensor(answer_tokens, device=device)) if len(answer_tokens) > 0 else ""
+
+                        if think_text:
+                            # 打印思维链并换行（与采样路径一致）
+                            print(f"{BLUE}{think_text}{RESET}", flush=True)
+                        if answer_text:
+                            # 打印回答的开头（绿色），不强制换行以保持与后续 token 输出一致
+                            print(f"{GREEN}{answer_text}{RESET}", end="", flush=True)
+                    else:
+                        # 无明确思维链标记，整体作为回答输出
+                        if generated_text:
+                            print(f"{GREEN}{generated_text}{RESET}", end="", flush=True)
+                except Exception:
+                    # 回退：直接打印解码后的文本
+                    if generated_text:
+                        print(f"{GREEN}{generated_text}{RESET}", end="", flush=True)
+
+                torch.cuda.empty_cache()
+                return generated_text
+            except Exception as e:
+                print(f"[Warning] Tree RL generation failed, fallback to sampling: {e}", flush=True)
         
         result = model(prompt, use_cache=True)
         if isinstance(result, tuple):
