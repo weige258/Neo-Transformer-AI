@@ -75,12 +75,12 @@ print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 loss_func = torch.nn.CrossEntropyLoss().to(device)
 optimizer = torch.optim.AdamW(
     model.parameters(),
-    lr=2e-4,
+    lr=3e-4,
     weight_decay=0.01,
     foreach=torch.cuda.is_available(),
 )
 
-GRADIENT_ACCUMULATION_STEPS = 4
+GRADIENT_ACCUMULATION_STEPS = 1
 training_rounds = 0
 
 # 初始化自奖励模型和强化学习模块
