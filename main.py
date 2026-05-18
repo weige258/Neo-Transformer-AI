@@ -76,7 +76,7 @@ print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 loss_func = torch.nn.CrossEntropyLoss().to(device)
 optimizer = torch.optim.AdamW(
     model.parameters(),
-    lr=3e-4,
+    lr=2e-4,
     weight_decay=0.01,
     foreach=torch.cuda.is_available(),
 )
