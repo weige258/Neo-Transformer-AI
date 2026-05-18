@@ -61,7 +61,7 @@ else:
     amp_dtype = torch.float32
 
 # 【修复】仅float16启用scaler，bfloat16无需缩放，避免梯度爆炸
-scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
 
 print(f"Using device: {device}", flush=True)
 print(f"AMP enabled: {use_amp}, AMP dtype: {amp_dtype}", flush=True)
@@ -377,9 +377,16 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
     # 状态机：跟踪当前行动状态
     prev_action = ACTION_THINKING  # 初始状态假设为思考
-    thinking_steps = 0             # 当前思考块已累积的步数（防止空块）
+    thinking_steps = 0             # 当前思考块已累积的步数（防止空块+死锁）
+    max_thinking_steps = int(CONFIG.get("max_thinking_steps", 200))
     action_temperature = float(CONFIG.get("action_temperature", 0.5))
     _TAG_CHARS = frozenset({'<', '>', '/', '《', '》'})
+    # 解码参数（反退化生成）
+    llm_temperature = float(CONFIG.get("temperature", 0.7))
+    rep_penalty = float(CONFIG.get("repetition_penalty", 1.15))
+    top_k = int(CONFIG.get("top_k", 50))
+    top_p = float(CONFIG.get("top_p", 0.9))
+    generated_ids: list[int] = []  # 历史 token 用于重复惩罚
     # 转移掩码（log 域，0=禁止 → -inf）
     _trans_mask = torch.tensor(TRANSITION_MASK, device=device, dtype=torch.float32)
     _trans_mask = torch.where(_trans_mask > 0.5, torch.tensor(0.0, device=device),
@@ -439,9 +446,15 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         force_token = TextTokenizer.THINK_START_TOKEN
                         thinking_steps = 0  # 重置思考步数计数
                     elif sampled_action == ACTION_ANSWER and prev_action == ACTION_THINKING:
-                        # 空块防护：最少思考 3 步才允许切出
+                        # 空块防护：最少思考 3 步
+                        # 死锁防护：超过 max_thinking_steps 强制切出
                         if thinking_steps < 3:
-                            sampled_action = ACTION_THINKING  # 强制继续思考
+                            sampled_action = ACTION_THINKING
+                        elif thinking_steps >= max_thinking_steps:
+                            # 思考块已达上限，强制切出防止死循环
+                            do_think_jump = True
+                            force_token = TextTokenizer.THINK_END_TOKEN
+                            sampled_action = ACTION_ANSWER
                         else:
                             # 从思考→回答：注入 THINK_END
                             do_think_jump = True
@@ -474,14 +487,49 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     # 注入不消耗 step，继续下一步循环
                     continue
 
-                # 正常采样下一个 token
-                next_logits = logits[-1]
+                # 正常采样下一个 token（含重复惩罚 + Top-K + Top-P）
+                next_logits = logits[-1].clone()
                 if step < min_new_tokens:
-                    next_logits = next_logits.clone()
                     next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
 
-                probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
+                # 1) 重复惩罚：已生成过的 token 降低概率
+                if rep_penalty != 1.0 and generated_ids:
+                    for past_id in set(generated_ids):
+                        score = next_logits[past_id].item()
+                        if score > 0:
+                            next_logits[past_id] = score / rep_penalty
+                        else:
+                            next_logits[past_id] = score * rep_penalty
+
+                # 2) Top-K 过滤
+                if top_k > 0 and top_k < next_logits.size(-1):
+                    kth = torch.topk(next_logits, top_k)[0][-1]
+                    next_logits[next_logits < kth] = float('-inf')
+
+                # 3) 温度缩放 + softmax
+                probs = torch.softmax(next_logits / llm_temperature, dim=-1)
+                probs = torch.nan_to_num(probs, nan=0.0)
+
+                # 4) Top-P (Nucleus) 过滤
+                if top_p < 1.0:
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                    cumsum = torch.cumsum(sorted_probs, dim=-1)
+                    mask = cumsum > top_p
+                    mask[1:] = mask[:-1].clone()  # 至少保留一个
+                    mask[0] = False
+                    to_remove = torch.zeros_like(probs, dtype=torch.bool)
+                    to_remove.scatter_(dim=-1, index=sorted_indices[mask], src=torch.ones_like(sorted_indices[mask], dtype=torch.bool))
+                    probs[to_remove] = 0.0
+                    probs = probs / (probs.sum(dim=-1, keepdim=True).clamp(min=1e-8))
+
                 index = int(torch.multinomial(probs, 1).item())
+                generated_ids.append(index)
+
+                # 累积思考步数（在特殊 token 跳过之前更新）
+                if prev_action == ACTION_THINKING:
+                    thinking_steps += 1
+                else:
+                    thinking_steps = 0
 
                 # 特殊 token 静默跳过 —— 同步 prev_action
                 if index in (TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN,
@@ -509,11 +557,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
                 # 颜色：直接使用当前行动状态
                 current_color = BLUE if prev_action == ACTION_THINKING else GREEN
-                # 累积思考步数（用于空块防护）
-                if prev_action == ACTION_THINKING:
-                    thinking_steps += 1
-                else:
-                    thinking_steps = 0
 
                 decoded_piece = TextTokenizer.decode(torch.tensor([index]))
                 if decoded_piece and decoded_piece in _TAG_CHARS:
