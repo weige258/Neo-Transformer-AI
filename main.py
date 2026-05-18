@@ -1,9 +1,10 @@
 import sys
 
 import torch
+import torch.nn.functional as F
 
 from config import CONFIG
-from model import MainModel
+from model import MainModel, compute_action_labels, ACTION_THINKING, ACTION_ANSWER, ACTION_END, TRANSITION_MASK
 from record import record_loss
 from tokenizer import TextTokenizer
 from rl import SelfRewardModel, LightweightPPO
@@ -369,31 +370,111 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
     print("\n---Generated reply:", flush=True)
 
-    min_new_tokens = 1
+    # 最小生成 tokens
+    min_new_tokens = max(4, int(CONFIG.get("min_generate_tokens", 4)))
     if max_generate_tokens is not None:
-        max_generate_tokens = max(1, int(max_generate_tokens))
- 
+        max_generate_tokens = max(min_new_tokens + 1, int(max_generate_tokens))
+
+    # 状态机：跟踪当前行动状态
+    prev_action = ACTION_THINKING  # 初始状态假设为思考
+    thinking_steps = 0             # 当前思考块已累积的步数（防止空块）
+    action_temperature = float(CONFIG.get("action_temperature", 0.5))
+    _TAG_CHARS = frozenset({'<', '>', '/', '《', '》'})
+    # 转移掩码（log 域，0=禁止 → -inf）
+    _trans_mask = torch.tensor(TRANSITION_MASK, device=device, dtype=torch.float32)
+    _trans_mask = torch.where(_trans_mask > 0.5, torch.tensor(0.0, device=device),
+                              torch.tensor(float('-inf'), device=device))
+    
     with torch.inference_mode():
-        thinking_started = False
         if thinking_available:
             has_think_token = (prompt == TextTokenizer.THINK_START_TOKEN).any()
-            if has_think_token:
-                thinking_started = True
-            else:
-                thinking_started = True
+            if not has_think_token:
                 think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
                 prompt = torch.cat([prompt, think_start_tensor])
         
         result = model(prompt, use_cache=True)
-        if isinstance(result, tuple):
+        if isinstance(result, tuple) and len(result) == 3:
+            logits, action_logits, past_key_values = result
+        elif isinstance(result, tuple) and len(result) == 2:
             logits, past_key_values = result
+            action_logits = None
         else:
             logits = result
+            action_logits = None
 
         step = 0
         
         while max_generate_tokens is None or step < max_generate_tokens:
             try:
+                # ====================================================
+                # 阶段1: Action Head 采样决策（主动控制）
+                # ====================================================
+                do_think_jump = False      # 是否强制跳转思考/回答
+                force_token = None          # 强制注入的 token
+                force_token_reason = ""     # 调试用
+
+                if action_logits is not None:
+                    act_logit = action_logits[-1].float()  # [3]
+                    # 应用状态转移掩码：禁止非法转移
+                    act_logit = act_logit + _trans_mask[prev_action]
+                    # 采样行动
+                    act_probs = torch.softmax(act_logit / action_temperature, dim=-1)
+                    
+                    # min_new_tokens 内仅禁止 END，保留思考/回答自由度
+                    if step < min_new_tokens:
+                        act_probs_l = act_probs.clone()
+                        act_probs_l[ACTION_END] = 0.0
+                        if act_probs_l.sum() > 0:
+                            act_probs_l = act_probs_l / act_probs_l.sum()
+                            sampled_action = int(torch.multinomial(act_probs_l, 1).item())
+                        else:
+                            sampled_action = ACTION_ANSWER
+                    else:
+                        sampled_action = int(torch.multinomial(act_probs, 1).item())
+
+                    # === 行动决策 ===
+                    if sampled_action == ACTION_THINKING and prev_action != ACTION_THINKING:
+                        # 从回答→思考：注入 THINK_START
+                        do_think_jump = True
+                        force_token = TextTokenizer.THINK_START_TOKEN
+                        thinking_steps = 0  # 重置思考步数计数
+                    elif sampled_action == ACTION_ANSWER and prev_action == ACTION_THINKING:
+                        # 空块防护：最少思考 3 步才允许切出
+                        if thinking_steps < 3:
+                            sampled_action = ACTION_THINKING  # 强制继续思考
+                        else:
+                            # 从思考→回答：注入 THINK_END
+                            do_think_jump = True
+                            force_token = TextTokenizer.THINK_END_TOKEN
+                    elif sampled_action == ACTION_END and step >= min_new_tokens:
+                        # 结束
+                        force_token = TextTokenizer.END_GENERATION_TOKEN
+                        force_token_reason = "→END"
+                    
+                    # 更新状态
+                    if sampled_action != ACTION_END:
+                        prev_action = sampled_action
+
+                # ====================================================
+                # 阶段2: 执行生成（主语言模型）
+                # ====================================================
+                if force_token == TextTokenizer.END_GENERATION_TOKEN:
+                    break
+
+                if do_think_jump and force_token is not None:
+                    # 主动注入特殊 token（THINK_START / THINK_END）
+                    # 这些不输出到屏幕，不消耗 step，只更新 KV cache
+                    inject_token = torch.tensor([force_token], device=device)
+                    result = model(inject_token, past_key_values=past_key_values, use_cache=True)
+                    if isinstance(result, tuple) and len(result) == 3:
+                        logits, action_logits, past_key_values = result
+                    elif isinstance(result, tuple) and len(result) == 2:
+                        logits, past_key_values = result
+                        action_logits = None
+                    # 注入不消耗 step，继续下一步循环
+                    continue
+
+                # 正常采样下一个 token
                 next_logits = logits[-1]
                 if step < min_new_tokens:
                     next_logits = next_logits.clone()
@@ -402,60 +483,147 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
                 index = int(torch.multinomial(probs, 1).item())
 
-                should_skip_output = False
-                
-                if index == TextTokenizer.THINK_END_TOKEN:
-                    if thinking_available and thinking_started:
-                        thinking_started = False
-                        print(f"{RESET}\n", end="", flush=True)
-                        should_skip_output = True
+                # 特殊 token 静默跳过 —— 同步 prev_action
+                if index in (TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN,
+                             TextTokenizer.HISTORY_CONTEXT_START_TOKEN, TextTokenizer.HISTORY_CONTEXT_END_TOKEN,
+                             TextTokenizer.START_GENERATION_TOKEN):
+                    if index == TextTokenizer.THINK_START_TOKEN:
+                        prev_action = ACTION_THINKING  # LM 自己生成 THINK_START → 同步
+                    elif index == TextTokenizer.THINK_END_TOKEN:
+                        prev_action = ACTION_ANSWER     # LM 自己生成 THINK_END → 同步
+                    next_token = torch.tensor([index], device=device)
+                    result = model(next_token, past_key_values=past_key_values, use_cache=True)
+                    if isinstance(result, tuple) and len(result) == 3:
+                        logits, action_logits, past_key_values = result
+                    elif isinstance(result, tuple) and len(result) == 2:
+                        logits, past_key_values = result
+                        action_logits = None
                     else:
-                        break
-                
-                elif index == TextTokenizer.END_GENERATION_TOKEN:
+                        logits = result
+                        action_logits = None
+                    step += 1
+                    continue
+
+                if index == TextTokenizer.END_GENERATION_TOKEN:
                     break
 
-                elif index == TextTokenizer.THINK_START_TOKEN:
-                    if thinking_available and not thinking_started:
-                        thinking_started = True
-                        should_skip_output = True
-                    elif not thinking_available:
-                        should_skip_output = True
-                
-                if not should_skip_output:
-                    decoded_piece = TextTokenizer.decode(torch.tensor([index]))
-                    
-                    if decoded_piece:
-                        if thinking_started:
-                            print(f"{BLUE}{decoded_piece}{RESET}", end="", flush=True)
-                        else:
-                            print(f"{GREEN}{decoded_piece}{RESET}", end="", flush=True)
-                        
-                        output_text += decoded_piece
+                # 颜色：直接使用当前行动状态
+                current_color = BLUE if prev_action == ACTION_THINKING else GREEN
+                # 累积思考步数（用于空块防护）
+                if prev_action == ACTION_THINKING:
+                    thinking_steps += 1
+                else:
+                    thinking_steps = 0
+
+                decoded_piece = TextTokenizer.decode(torch.tensor([index]))
+                if decoded_piece and decoded_piece in _TAG_CHARS:
+                    decoded_piece = ""
+                if decoded_piece:
+                    print(f"{current_color}{decoded_piece}{RESET}", end="", flush=True)
+                    output_text += decoded_piece
 
                 next_token = torch.tensor([index], device=device)
-                result = model(
-                    next_token,
-                    past_key_values=past_key_values,
-                    use_cache=True,
-                )
-                if isinstance(result, tuple):
+                result = model(next_token, past_key_values=past_key_values, use_cache=True)
+                if isinstance(result, tuple) and len(result) == 3:
+                    logits, action_logits, past_key_values = result
+                elif isinstance(result, tuple) and len(result) == 2:
                     logits, past_key_values = result
+                    action_logits = None
                 else:
                     logits = result
+                    action_logits = None
                 
                 step += 1
             except Exception as e:
                 print(f"Error during generation: {e}", flush=True)
                 break
         
-        # 【显存优化】生成后主动释放显存，解决泄漏问题
         with torch.inference_mode():
             torch.cuda.empty_cache()
         
-        # 自奖励评估（已移除）
-        
         return output_text
+
+
+def train_dynamic(ask: str, response: str, history_context: str = None) -> float:
+    """动态格式训练：response 可包含多段 <think>...内容...</think>交替。
+    
+    自动将文本中的 <think> 和 </think> 替换为特殊 token ID (5=THINK_START, 6=THINK_END)。
+    例如 response = "<think>先算12*15</think>12*15=180.<think>再算一半</think>90."
+    """
+    ask = str(ask).strip() if ask else ""
+    response = str(response).strip() if response else ""
+    if not ask or not response:
+        return float('inf')
+
+    model.train()
+
+    ask_tensor = TextTokenizer.encode(ask).to(device)
+
+    # 手动解析 <think> 和 </think> 标签 → 替换为特殊 token ID
+    resp_list = []
+    i = 0
+    n = len(response)
+    TAG_THINK = '<think>'
+    TAG_THINK_END = '</think>'
+    while i < n:
+        if response[i:].startswith(TAG_THINK):
+            resp_list.append(TextTokenizer.THINK_START_TOKEN)
+            i += len(TAG_THINK)
+        elif response[i:].startswith(TAG_THINK_END):
+            resp_list.append(TextTokenizer.THINK_END_TOKEN)
+            i += len(TAG_THINK_END)
+        else:
+            ch = response[i]
+            idx = ord(ch)
+            if TextTokenizer._is_valid_token(idx) and 0 <= idx < int(CONFIG["dict_size"]):
+                resp_list.append(idx)
+            else:
+                resp_list.append(TextTokenizer.UNKNOWN_TOKEN)
+            i += 1
+
+    if not resp_list:
+        return float('inf')
+    resp_tensor = torch.tensor(resp_list, dtype=torch.long, device=device)
+
+    if ask_tensor.numel() == 0 or resp_tensor.numel() == 0:
+        return float('inf')
+
+    if history_context and history_context.strip():
+        hist_tensor = TextTokenizer.encode(history_context).to(device)
+        if auto_compress_trigger(hist_tensor):
+            compressed_hist = model.compress_history_vectors(hist_tensor)
+            hist_tensor = torch.argmax(model.output_linear(compressed_hist), dim=-1)
+        train_tensor = torch.cat([
+            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            hist_tensor,
+            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+            torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
+            ask_tensor,
+            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            resp_tensor,
+            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+        ])
+        non_target_len = 1 + hist_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1
+    else:
+        train_tensor = torch.cat([
+            ask_tensor,
+            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            resp_tensor,
+            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+        ])
+        non_target_len = ask_tensor.numel() + 1
+
+    target_len = resp_tensor.numel() + 1
+    target_mask = torch.cat([
+        torch.zeros(non_target_len, dtype=torch.bool, device=device),
+        torch.ones(target_len, dtype=torch.bool, device=device),
+    ])
+    assert target_mask.numel() == train_tensor.numel(), \
+        f"mask len {target_mask.numel()} != train len {train_tensor.numel()}"
+
+    loss_val = _run_train_step(train_tensor, target_mask, resp_tensor, show_preview=False)
+    torch.cuda.empty_cache()
+    return loss_val
 
 
 def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, show_preview: bool = True, preview_color: str = None) -> float:
@@ -482,15 +650,13 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         result = model(train_tensor, use_cache=False)
         if isinstance(result, tuple):
             logits = result[0]
+            action_logits = result[1]
         else:
             logits = result
+            action_logits = None
 
-        # 应用目标掩码并进行 next-token prediction 对齐
-        # 对于 next-token prediction，targets 应该是 train_tensor 右移一位
-        # 确保 logits 和 targets 长度相同
+        # === 语言模型损失 (next-token prediction) ===
         if len(train_tensor) > 1:
-            # 正确的 next-token prediction 对齐
-            # logits 对应位置 i，targets 对应位置 i+1
             masked_logits = logits[:-1][target_mask[1:]]
             masked_targets = train_tensor[1:][target_mask[1:]]
             
@@ -506,20 +672,47 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                     print(f"[Warning] NaN or Inf detected in targets, skipping this step", flush=True)
                     return float('inf')
                 
-                loss = loss_func(masked_logits, masked_targets)
+                lm_loss = loss_func(masked_logits, masked_targets)
                 
-                if torch.isnan(loss):
+                if torch.isnan(lm_loss):
                     print(f"[Warning] NaN loss detected, skipping this step", flush=True)
                     return float('inf')
             else:
-                loss = torch.tensor(0.0, device=device)
+                lm_loss = torch.tensor(0.0, device=device)
         else:
-            loss = torch.tensor(0.0, device=device)
+            lm_loss = torch.tensor(0.0, device=device)
+        
+        loss = lm_loss
+
+        # === 行动头损失 (hard label cross-entropy) ===
+        if action_logits is not None:
+            # 生成硬标签：compute_action_labels 返回 [seq_len, 3] 软标签
+            # 取 argmax 转为硬标签 [seq_len]
+            action_labels_soft = compute_action_labels(
+                train_tensor,
+                think_start_id=TextTokenizer.THINK_START_TOKEN,
+                think_end_id=TextTokenizer.THINK_END_TOKEN,
+                end_id=TextTokenizer.END_GENERATION_TOKEN,
+                temperature=float(CONFIG.get("action_label_temperature", 0.5)),
+            )
+            # 对齐: action_logits[:-1] 对应 action_labels[1:] (next-token prediction)
+            act_logits_aligned = action_logits[:-1]  # [seq_len-1, 3]
+            act_hard_labels = action_labels_soft[1:].argmax(dim=-1)  # [seq_len-1]
+            # 只对 target_mask 选中的位置计算行动损失
+            if target_mask[1:].any():
+                act_logits_masked = act_logits_aligned[target_mask[1:]]
+                act_labels_masked = act_hard_labels[target_mask[1:]]
+                action_ce_loss = F.cross_entropy(
+                    act_logits_masked.float(), act_labels_masked,
+                )
+                action_coef = float(CONFIG.get("action_loss_coef", 0.3))
+                action_loss = action_coef * action_ce_loss
+                loss = loss + action_loss
+                if not torch.isnan(action_ce_loss) and not torch.isinf(action_ce_loss):
+                    record_loss(action_ce_loss.item())
         
         # 【修复】损失缩放，适配梯度累积
         loss = loss / GRADIENT_ACCUMULATION_STEPS
-        
-        record_loss(loss.item())
 
     # 检查损失是否有效
     if not torch.isnan(loss) and not torch.isinf(loss):

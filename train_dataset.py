@@ -3,7 +3,7 @@ import torch
 import random
 import logging
 from typing import List, Optional, Dict
-from main import train, model, optimizer
+from main import train, train_dynamic, model, optimizer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -50,8 +50,12 @@ class StreamingDataset:
             
             count = 0
             for item in data:
-                # 新格式：检查 ask 和 answer 字段
-                if "ask" in item and "answer" in item:
+                # 多段交替格式：ask + response
+                if "ask" in item and "response" in item:
+                    if str(item.get("ask", "")).strip() and str(item.get("response", "")).strip():
+                        count += 1
+                # 旧格式：ask + answer
+                elif "ask" in item and "answer" in item:
                     ask_raw = item.get("ask")
                     answer_raw = item.get("answer")
                     if ask_raw is not None and answer_raw is not None:
@@ -88,8 +92,38 @@ class StreamingDataset:
             
             current_idx = 0
             for item in data:
-                # 新格式：检查 ask 和 answer 字段
-                if "ask" in item and "answer" in item:
+                # 多段交替格式：ask + response
+                if "ask" in item and "response" in item:
+                    ask_raw = item.get("ask")
+                    resp_raw = item.get("response")
+                    if ask_raw is not None and resp_raw is not None:
+                        ask = str(ask_raw).strip()
+                        resp = str(resp_raw).strip()
+                        if ask and resp:
+                            if current_idx == target_local_idx:
+                                history_raw = item.get("history", [])
+                                if isinstance(history_raw, list) and len(history_raw) > 0:
+                                    history_parts = []
+                                    for msg in history_raw:
+                                        if isinstance(msg, dict):
+                                            role = msg.get("role", "unknown")
+                                            content = msg.get("content", "")
+                                            history_parts.append(f"{role}: {content}" if role != "unknown" else content)
+                                        elif isinstance(msg, str):
+                                            history_parts.append(str(msg))
+                                    history_context = "\n".join(history_parts)
+                                else:
+                                    history_context = ""
+                                return {
+                                    "ask": ask,
+                                    "response": resp,
+                                    "think": "",
+                                    "answer": "",
+                                    "history_context": history_context
+                                }
+                            current_idx += 1
+                # 旧格式：ask + answer
+                elif "ask" in item and "answer" in item:
                     ask_raw = item.get("ask")
                     answer_raw = item.get("answer")
                     
@@ -166,19 +200,29 @@ def main() -> None:
             think = sample.get("think", "")
             answer = sample.get("answer", "")
             history_context = sample.get("history_context", "")
+            response = sample.get("response", "")  # 多段交替格式
             
             # Skip empty asks or answers
-            if not ask or not answer:
+            if not ask:
                 continue
 
-            # Train on this sample (支持问-思考-答-历史上下文格式)
             try:
-                train(
-                    ask=ask,
-                    think=think if think else None,
-                    answer=answer,
-                    history_context=history_context if history_context else None
-                )
+                # 优先使用多段交替格式（response字段）
+                if response and response.strip():
+                    train_dynamic(
+                        ask=ask,
+                        response=response,
+                        history_context=history_context if history_context else None
+                    )
+                elif answer and answer.strip():
+                    train(
+                        ask=ask,
+                        think=think if think and think.strip() else None,
+                        answer=answer,
+                        history_context=history_context if history_context else None
+                    )
+                else:
+                    continue
                             
                 local_training_rounds += 1
                 

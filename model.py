@@ -9,6 +9,20 @@ from torch.utils.checkpoint import checkpoint
 
 from config import CONFIG
 
+# === 行动智能头常量 ===
+ACTION_THINKING = 0  # 思考中
+ACTION_ANSWER = 1    # 回答中
+ACTION_END = 2       # 结束
+
+# 状态转移掩码矩阵：1=允许，0=禁止
+# 行=当前状态，列=下一状态
+#        T   A   E
+TRANSITION_MASK = [
+    [1.0, 1.0, 0.1],  # THINKING → (T, A, E)  降低直接END权重
+    [1.0, 1.0, 1.0 ],  # ANSWER   → (T, A, E)
+    [0.0, 0.0, 1.0 ],  # END      → (T, A, E)
+]
+
 
 CompressedKVCache = tuple[
     torch.Tensor,
@@ -392,6 +406,112 @@ class CompressedAttentionBlock(nn.Module):
         return x
 
 
+class ActionHead(nn.Module):
+    """行动智能头：从最终隐层状态预测 [思考, 回答, 结束] 行动。"""
+    def __init__(self, emb_size: int, hidden_dim: int = 128) -> None:
+        super().__init__()
+        self.fc1 = nn.Linear(emb_size, hidden_dim, bias=False)
+        self.fc2 = nn.Linear(hidden_dim, 3, bias=True)  # 3 actions: THINKING, ANSWER, END
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [batch, seq_len, emb_size] or [seq_len, emb_size]
+        h = F.silu(self.fc1(x))
+        return self.fc2(h)  # [batch, seq_len, 3] or [seq_len, 3]
+
+
+def compute_action_labels(
+    tokens: torch.Tensor,
+    think_start_id: int = 5,
+    think_end_id: int = 6,
+    end_id: int = 2,
+    temperature: float = 0.5,
+) -> torch.Tensor:
+    """计算每个时间步的硬行动标签 [THINKING, ANSWER, END]。
+    
+    基于 token 序列中特殊标记位置生成硬标签（非软标签，避免模糊）：
+    - THINK_START ~ THINK_END 之间 → THINKING=1
+    - 连续思考区域之间的"中转间隙"（TE→TS 无需回答）→ THINKING=1
+    - 思考区域外（非中转）→ ANSWER=1
+    - 每个 END_GENERATION 位置 → END=1
+    """
+    seq_len = tokens.size(-1) if tokens.dim() > 1 else tokens.size(0)
+    device = tokens.device
+
+    labels = torch.zeros(seq_len, 3, device=device, dtype=torch.float32)
+
+    think_start_positions = (tokens == think_start_id).nonzero(as_tuple=True)[-1]
+    think_end_positions = (tokens == think_end_id).nonzero(as_tuple=True)[-1]
+    end_positions = (tokens == end_id).nonzero(as_tuple=True)[-1]
+
+    # --- 1) 构建思考区域列表（成对匹配，支持嵌套退化为平铺）---
+    # 简单栈匹配：每个 THINK_START 找其后的 THINK_END
+    think_regions = []  # [(start, end), ...]
+    te_idx = 0
+    for ts in think_start_positions:
+        # 找最近的未匹配 THINK_END
+        while te_idx < len(think_end_positions) and think_end_positions[te_idx] < ts:
+            te_idx += 1
+        if te_idx < len(think_end_positions):
+            te = think_end_positions[te_idx]
+            te_idx += 1
+            think_regions.append((ts.item(), te.item()))
+        else:
+            # 没有配对的 END，标记到序列末尾
+            think_regions.append((ts.item(), seq_len - 1))
+
+    # --- 3) 建立位置→区域映射 ---
+    # 先确定每个位置是否在某个思考区域内
+    in_think = torch.zeros(seq_len, device=device, dtype=torch.bool)
+    for s, e in think_regions:
+        in_think[s:e+1] = True
+
+    # --- 4) 检测"思考中转间隙" ---
+    # 仅标记极短间隙（≤2 token）为中转；长间隙是真实的 ANSWER 区域
+    is_transition_gap = torch.zeros(seq_len, device=device, dtype=torch.bool)
+    for i in range(len(think_regions) - 1):
+        gap_start = think_regions[i][1] + 1  # 前一个区域的 TE + 1
+        gap_end = think_regions[i + 1][0]     # 后一个区域的 TS
+        gap_len = gap_end - gap_start
+        if 0 < gap_len <= 2:
+            is_transition_gap[gap_start:gap_end] = True
+
+    # --- 5) 标记 ANSWER 区域 ---
+    # 不在思考区域内且不是中转间隙 → ANSWER
+    is_answer = (~in_think) & (~is_transition_gap)
+
+    # --- 6) 计算各维标签 ---
+    # THINKING: 在思考区域内 + 中转间隙
+    think_weight = torch.zeros(seq_len, device=device)
+    think_weight[in_think] = 1.0
+    think_weight[is_transition_gap] = 0.9  # 中转间隙给高 thinking 权重
+
+    # ANSWER: 不在思考区域、不是中转间隙、不是 END
+    answer_weight = is_answer.float()
+
+    # END: 每个 END_GENERATION_TOKEN 位置
+    end_weight = torch.zeros(seq_len, device=device)
+    for ep in end_positions:
+        ep_idx = ep.item()
+        end_weight[ep_idx] = 1.0
+        # END 前 3 个位置开始渐入
+        fade_start = max(0, ep_idx - 3)
+        for fi in range(fade_start, ep_idx):
+            dist = (fi - fade_start) / max(ep_idx - fade_start, 1)
+            end_weight[fi] = max(end_weight[fi].item(), float(dist * dist))
+
+    # 确保每个位置标签和为 1
+    # 优先级: END > THINKING > ANSWER
+    labels[:, ACTION_END] = end_weight.clamp(0.0, 1.0)
+    remaining = 1.0 - end_weight
+    labels[:, ACTION_THINKING] = think_weight * remaining
+    labels[:, ACTION_ANSWER] = answer_weight * remaining
+
+    row_sum = labels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+    labels = labels / row_sum
+
+    return labels  # [seq_len, 3]
+
+
 class MainModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -417,6 +537,10 @@ class MainModel(nn.Module):
         if bool(CONFIG.get("tie_token_embeddings", True)):
             self.output_linear.weight = self.token_embedding.weight
 
+        # === 行动智能头 ===
+        action_hidden = int(CONFIG.get("action_hidden_dim", 128))
+        self.action_head = ActionHead(emb_size, hidden_dim=action_hidden)
+
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -426,6 +550,12 @@ class MainModel(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and module.weight is not self.output_linear.weight:
                 nn.init.xavier_uniform_(module.weight)
+        # 初始化行动头
+        for name, param in self.action_head.named_parameters():
+            if 'weight' in name:
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
 
     def compress_history_vectors(
         self,
@@ -488,9 +618,12 @@ class MainModel(nn.Module):
                 else:
                     x = block(x)
 
-        logits = self.output_linear(self.final_norm(x))
+        hidden = self.final_norm(x)
+        logits = self.output_linear(hidden)
+        action_logits = self.action_head(hidden)
         logits = logits.squeeze(0) if squeeze_batch else logits
+        action_logits = action_logits.squeeze(0) if squeeze_batch else action_logits
 
         if use_cache:
-            return logits, next_key_values
-        return logits
+            return logits, action_logits, next_key_values
+        return logits, action_logits
