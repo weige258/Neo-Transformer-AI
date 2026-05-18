@@ -15,7 +15,7 @@ CONFIG: Dict[str, Any] = {
     "dynamic_attention_topk": 16,
     "attention_chunk_size": 64,
     "tie_token_embeddings": True,
-    "dropout": 0.05,
+    "dropout": 0.1,
     "temperature": 0.6,
     "compress_trigger_len": 1200,
     "compress_trigger_entropy": 0.7,
