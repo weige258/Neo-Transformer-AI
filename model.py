@@ -17,10 +17,11 @@ ACTION_END = 2       # 结束
 # 状态转移掩码矩阵：1=允许，0=禁止
 # 行=当前状态，列=下一状态
 #        T   A   E
+# 允许更灵活的多段思考/回答序列（例如：T→T→A→T→A→A→E）
 TRANSITION_MASK = [
-    [1.0, 1.0, 0.1],  # THINKING → (T, A, E)  降低直接END权重
-    [1.0, 1.0, 1.0 ],  # ANSWER   → (T, A, E)
-    [0.0, 0.0, 1.0 ],  # END      → (T, A, E)
+    [1.0, 1.0, 1.0],  # THINKING → (T, A, E)
+    [1.0, 1.0, 1.0],  # ANSWER   → (T, A, E)
+    [0.0, 0.0, 1.0],  # END      → (T, A, E)
 ]
 
 
@@ -412,11 +413,16 @@ class ActionHead(nn.Module):
         super().__init__()
         self.fc1 = nn.Linear(emb_size, hidden_dim, bias=False)
         self.fc2 = nn.Linear(hidden_dim, 3, bias=True)  # 3 actions: THINKING, ANSWER, END
+        # 置信/终止分支：输出单个标量，表示当前 token 的终止/置信度（可用于策略或 RL）
+        self.fc3 = nn.Linear(hidden_dim, 1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, seq_len, emb_size] or [seq_len, emb_size]
         h = F.silu(self.fc1(x))
-        return self.fc2(h)  # [batch, seq_len, 3] or [seq_len, 3]
+        a_logits = self.fc2(h)
+        t_logit = self.fc3(h)
+        # Concatenate: last dim -> [THINK, ANSWER, END, TERM]
+        return torch.cat([a_logits, t_logit], dim=-1)  # [batch, seq_len, 4] or [seq_len, 4]
 
 
 def compute_action_labels(
@@ -466,13 +472,13 @@ def compute_action_labels(
         in_think[s:e+1] = True
 
     # --- 4) 检测"思考中转间隙" ---
-    # 仅标记极短间隙（≤2 token）为中转；长间隙是真实的 ANSWER 区域
+    # 标记短间隙（≤3 token）为中转：这允许模型在多个思考段之间存在短过渡
     is_transition_gap = torch.zeros(seq_len, device=device, dtype=torch.bool)
     for i in range(len(think_regions) - 1):
         gap_start = think_regions[i][1] + 1  # 前一个区域的 TE + 1
         gap_end = think_regions[i + 1][0]     # 后一个区域的 TS
         gap_len = gap_end - gap_start
-        if 0 < gap_len <= 2:
+        if 0 < gap_len <= 3:
             is_transition_gap[gap_start:gap_end] = True
 
     # --- 5) 标记 ANSWER 区域 ---
@@ -483,7 +489,8 @@ def compute_action_labels(
     # THINKING: 在思考区域内 + 中转间隙
     think_weight = torch.zeros(seq_len, device=device)
     think_weight[in_think] = 1.0
-    think_weight[is_transition_gap] = 0.9  # 中转间隙给高 thinking 权重
+    # 对中转间隙赋予较高的 thinking 倾向，以鼓励短暂的连续思考序列
+    think_weight[is_transition_gap] = 0.8
 
     # ANSWER: 不在思考区域、不是中转间隙、不是 END
     answer_weight = is_answer.float()
@@ -508,6 +515,12 @@ def compute_action_labels(
 
     row_sum = labels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     labels = labels / row_sum
+
+    # 应用温度参数对标签做平滑处理，输出为软标签分布
+    temp = max(1e-6, float(temperature))
+    labels = torch.clamp(labels, min=1e-12)
+    # 通过 log + softmax 实现温度缩放，避免数值不稳定
+    labels = torch.softmax(torch.log(labels) / temp, dim=-1)
 
     return labels  # [seq_len, 3]
 
@@ -540,6 +553,8 @@ class MainModel(nn.Module):
         # === 行动智能头 ===
         action_hidden = int(CONFIG.get("action_hidden_dim", 128))
         self.action_head = ActionHead(emb_size, hidden_dim=action_hidden)
+        # === 价值头 (value head) 用于 PPO 的 value 预测 ===
+        self.value_head = nn.Linear(emb_size, 1, bias=True)
 
         self._reset_parameters()
 
@@ -556,6 +571,11 @@ class MainModel(nn.Module):
                 nn.init.xavier_uniform_(param)
             elif 'bias' in name:
                 nn.init.zeros_(param)
+        # 初始化 value head
+        if hasattr(self, 'value_head'):
+            nn.init.xavier_uniform_(self.value_head.weight)
+            if self.value_head.bias is not None:
+                nn.init.zeros_(self.value_head.bias)
 
     def compress_history_vectors(
         self,
@@ -621,9 +641,12 @@ class MainModel(nn.Module):
         hidden = self.final_norm(x)
         logits = self.output_linear(hidden)
         action_logits = self.action_head(hidden)
+        value_preds = self.value_head(hidden)
+        # squeeze batch dimension if input was 1D
         logits = logits.squeeze(0) if squeeze_batch else logits
         action_logits = action_logits.squeeze(0) if squeeze_batch else action_logits
+        value_preds = value_preds.squeeze(0) if squeeze_batch else value_preds
 
         if use_cache:
-            return logits, action_logits, next_key_values
-        return logits, action_logits
+            return logits, action_logits, value_preds, next_key_values
+        return logits, action_logits, value_preds

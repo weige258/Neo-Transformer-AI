@@ -1,34 +1,11 @@
 import torch
 import torch.nn.functional as F
+import numpy as np
 from typing import List, Tuple, Dict
-from dataclasses import dataclass
 from tokenizer import TextTokenizer
 
 
-@dataclass
-class TreeNode:
-    """树节点"""
-    token_id: int
-    log_prob: float
-    reward: float = 0.0
-    cumulative_reward: float = 0.0
-    children: List['TreeNode'] = None
-    parent: 'TreeNode' = None
-    visit_count: int = 0
-    depth: int = 0
-    
-    def __post_init__(self):
-        if self.children is None:
-            self.children = []
-    
-    def get_path(self) -> List[int]:
-        """获取从根节点到当前节点的路径"""
-        path = []
-        node = self
-        while node is not None:
-            path.append(node.token_id)
-            node = node.parent
-        return path[::-1][1:]
+# Tree-of-Thoughts / TreeNode removed: generation-stage tree search disabled
 
 
 class SelfRewardModel:
@@ -183,6 +160,7 @@ class SelfRewardModel:
         """计算总奖励"""
         rewards = {}
         
+    
         if think_text:
             rewards['cot_completeness'] = self.compute_cot_completeness(think_text, answer_text)
         else:
@@ -263,81 +241,109 @@ class LightweightPPO:
             self.episode_data['log_probs'].append(0.0)
 
         return total_reward, reward_breakdown
+
+    def compute_gae(self, rewards: List[float], values: List[float], lam: float = 0.95):
+        """Compute GAE advantages and returns. Returns (advantages_tensor, returns_tensor)."""
+        device = self.device
+        N = len(rewards)
+        adv = torch.zeros(N, dtype=torch.float32, device=device)
+        last_gae = 0.0
+        for t in reversed(range(N)):
+            next_value = values[t + 1] if (t + 1) < N else 0.0
+            delta = rewards[t] + self.gamma * next_value - values[t]
+            last_gae = delta + self.gamma * lam * last_gae
+            adv[t] = last_gae
+
+        returns = adv + torch.tensor(values, dtype=torch.float32, device=device)
+        # normalize advantages
+        if adv.numel() > 1:
+            adv_mean = adv.mean()
+            adv_std = adv.std(unbiased=False) + 1e-8
+            adv = (adv - adv_mean) / adv_std
+
+        return adv, returns
     
-    def compute_advantages(self, rewards: List[float]) -> List[float]:
-        """计算优势函数"""
-        advantages = []
-        returns = 0
-        
-        for reward in reversed(rewards):
-            returns = reward + self.gamma * returns
-            advantages.insert(0, returns)
-        
-        advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
-        return advantages.tolist()
-    
-    def update_policy(self, batch_size: int = 4) -> Dict[str, float]:
-        """更新策略网络"""
-        if len(self.episode_data['rewards']) < batch_size:
-            return {'loss': 0.0, 'policy_loss': 0.0, 'entropy_loss': 0.0}
-        
-        advantages = self.compute_advantages(self.episode_data['rewards'])
-        
-        reward_threshold = sorted(self.episode_data['rewards'])[len(self.episode_data['rewards']) // 2]
-        high_reward_indices = [
-            i for i, r in enumerate(self.episode_data['rewards'])
-            if r >= reward_threshold
-        ]
-        
-        if len(high_reward_indices) == 0:
-            high_reward_indices = list(range(len(self.episode_data['rewards'])))
-        
-        total_loss = None
-        total_policy_loss = 0.0
-        total_entropy_loss = 0.0
-        update_count = 0
+    def update_policy(self, batch_size: int = 4, ppo_epochs: int = 4, minibatch_size: int = 4, lam: float = 0.95, value_coef: float = 0.5) -> Dict[str, float]:
+        """使用 GAE + 多轮 minibatch PPO 更新策略和价值网络。
 
-        self.optimizer.zero_grad(set_to_none=True)
+        - 使用模型的 `value_preds`（原始标度）作为 value 估计。
+        - 若 raw_states 可用，会在 update 时重算 action_logits/value_preds 以保证梯度能回传。
+        """
+        N = len(self.episode_data['rewards'])
+        if N < batch_size:
+            return {'loss': 0.0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy_loss': 0.0}
 
-        for idx in high_reward_indices:
-            log_prob = self.episode_data['log_probs'][idx]
-            advantage = advantages[idx]
+        # --- 收集 tensors ---
+        rewards = [float(r) for r in self.episode_data['rewards']]
+        old_log_probs = []
+        actions = []
+        stored_values = self.episode_data.get('values', [])
 
-            # Ensure tensors
-            if not isinstance(log_prob, torch.Tensor):
-                log_prob = torch.tensor(log_prob, device=self.device, dtype=torch.float32)
-            if not isinstance(advantage, torch.Tensor):
-                advantage = torch.tensor(advantage, device=self.device, dtype=torch.float32)
-
-            ratio = torch.exp(log_prob)
-            surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantage
-
-            policy_loss = -torch.min(surr1, surr2).mean()
-
-            entropy = -log_prob.mean()
-            entropy_loss = -self.entropy_coef * entropy
-
-            loss = policy_loss + entropy_loss
-
-            if total_loss is None:
-                total_loss = loss
+        for i in range(N):
+            lp = self.episode_data['log_probs'][i]
+            if isinstance(lp, torch.Tensor):
+                old_log_probs.append(float(lp.detach()))
             else:
-                total_loss = total_loss + loss
+                old_log_probs.append(float(lp))
+            actions.append(int(self.episode_data['actions'][i]))
 
-            total_policy_loss += policy_loss.item()
-            total_entropy_loss += entropy_loss.item()
-            update_count += 1
+        # 使用存储的 values，缺失处用0.0回退
+        values = [float(stored_values[i]) if i < len(stored_values) else 0.0 for i in range(N)]
 
-        if update_count > 0 and total_loss is not None:
-            total_loss.backward()
+        # --- GAE to compute advantages and returns ---
+        advantages, returns = self.compute_gae(rewards, values, lam=lam)
 
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        # convert old_log_probs/actions to tensors
+        old_log_probs = torch.tensor(old_log_probs, dtype=torch.float32, device=self.device)
+        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
 
-            self.optimizer.step()
-        
+        # PPO epochs with minibatches
+        indices = np.arange(N)
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy_loss = 0.0
+        total_updates = 0
+
+        for epoch in range(ppo_epochs):
+            np.random.shuffle(indices)
+            for start in range(0, N, minibatch_size):
+                mb_idx = indices[start:start + minibatch_size]
+                mb_idx_t = torch.tensor(mb_idx, dtype=torch.long, device=self.device)
+
+                # build minibatch inputs
+                mb_old_logp = old_log_probs[mb_idx_t]
+                mb_actions = actions[mb_idx_t]
+                mb_adv = advantages[mb_idx_t]
+                mb_ret = returns[mb_idx_t]
+
+                # Use stored old log probs as current proxy (no recomputation of raw states)
+                cur_logps = mb_old_logp
+                # Use stored values where available
+                cur_values = torch.tensor([values[ii] for ii in mb_idx], device=self.device, dtype=torch.float32)
+                entropies = torch.zeros(len(mb_idx), device=self.device)
+
+                ratios = torch.exp(cur_logps - mb_old_logp)
+                surr1 = ratios * mb_adv
+                surr2 = torch.clamp(ratios, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * mb_adv
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                value_loss = F.mse_loss(cur_values, mb_ret)
+
+                entropy_loss = - self.entropy_coef * entropies.mean()
+
+                loss = policy_loss + value_coef * value_loss + entropy_loss
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                self.optimizer.step()
+
+                total_policy_loss += float(policy_loss.item())
+                total_value_loss += float(value_loss.item())
+                total_entropy_loss += float(entropy_loss.item())
+                total_updates += 1
+
+        # reset episode buffer
         self.episode_data = {
             'log_probs': [],
             'rewards': [],
@@ -345,11 +351,15 @@ class LightweightPPO:
             'actions': [],
             'states': []
         }
-        
+
+        if total_updates == 0:
+            return {'loss': 0.0, 'policy_loss': 0.0, 'value_loss': 0.0, 'entropy_loss': 0.0}
+
         return {
-            'loss': total_loss / max(update_count, 1),
-            'policy_loss': total_policy_loss / max(update_count, 1),
-            'entropy_loss': total_entropy_loss / max(update_count, 1)
+            'loss': (total_policy_loss + value_coef * total_value_loss + total_entropy_loss) / total_updates,
+            'policy_loss': total_policy_loss / total_updates,
+            'value_loss': total_value_loss / total_updates,
+            'entropy_loss': total_entropy_loss / total_updates
         }
     
     def clear_data(self):
@@ -362,300 +372,3 @@ class LightweightPPO:
             'states': []
         }
 
-
-class TreeReinforcementLearning:
-    """树强化学习生成器"""
-    
-    def __init__(
-        self,
-        model,
-        reward_model: SelfRewardModel,
-        device: torch.device,
-        max_depth: int = 100,
-        beam_width: int = 4,
-        exploration_coef: float = 1.0,
-        temperature: float = 0.7
-    ):
-        self.model = model
-        self.reward_model = reward_model
-        self.device = device
-        self.max_depth = max_depth
-        self.beam_width = beam_width
-        self.exploration_coef = exploration_coef
-        self.temperature = temperature
-        
-        self.root = TreeNode(token_id=None, log_prob=0.0)
-    
-    def select_node(self, node: TreeNode) -> TreeNode:
-        """使用UCB算法选择节点"""
-        if not node.children:
-            return node
-        
-        def ucb_score(child: TreeNode) -> float:
-            if child.visit_count == 0:
-                return float('inf')
-            
-            exploitation = child.cumulative_reward / child.visit_count
-            exploration = self.exploration_coef * torch.sqrt(
-                torch.log(torch.tensor(node.visit_count + 1)) / child.visit_count
-            ).item()
-            
-            return exploitation + exploration
-        
-        selected = max(node.children, key=ucb_score)
-        return self.select_node(selected)
-    
-    def expand_node(
-        self,
-        node: TreeNode,
-        prompt_tokens: torch.Tensor,
-        current_tokens: List[int],
-        context: str = None
-    ) -> List[TreeNode]:
-        """扩展节点，生成候选子节点"""
-        if node.depth >= self.max_depth:
-            return []
-        
-        if current_tokens:
-            current_tokens_tensor = torch.tensor(current_tokens, device=self.device, dtype=torch.long)
-        else:
-            current_tokens_tensor = torch.tensor([], device=self.device, dtype=torch.long)
-        input_tokens = torch.cat([prompt_tokens, current_tokens_tensor])
-        
-        with torch.inference_mode():
-            result = self.model(input_tokens, use_cache=True)
-            if isinstance(result, tuple):
-                logits, _ = result
-            else:
-                logits = result
-        
-        next_logits = logits[-1]
-        next_probs = F.softmax(next_logits / self.temperature, dim=-1)
-        
-        top_k_probs, top_k_indices = torch.topk(next_logits, k=self.beam_width)
-        
-        new_children = []
-        for i in range(self.beam_width):
-            token_id = top_k_indices[i].item()
-            log_prob = torch.log(top_k_probs[i] + 1e-10).item()
-            
-            child = TreeNode(
-                token_id=token_id,
-                log_prob=log_prob,
-                parent=node,
-                depth=node.depth + 1
-            )
-            new_children.append(child)
-        
-        node.children = new_children
-        return new_children
-    
-    def evaluate_node(
-        self,
-        node: TreeNode,
-        prompt_tokens: torch.Tensor,
-        current_tokens: List[int],
-        think_tokens: List[int] = None,
-        context: str = None
-    ) -> float:
-        """评估节点的奖励值"""
-        full_tokens = prompt_tokens.tolist() + current_tokens
-        
-        generated_text = TextTokenizer.decode(torch.tensor(full_tokens))
-        
-        think_text = None
-        answer_text = generated_text
-        
-        if think_tokens is not None:
-            think_text = TextTokenizer.decode(torch.tensor(think_tokens))
-            answer_text = generated_text[len(think_text):]
-        
-        total_reward, _ = self.reward_model.compute_total_reward(
-            think_text=think_text,
-            answer_text=answer_text,
-            context=context
-        )
-        
-        return total_reward
-    
-    def backpropagate(self, node: TreeNode, reward: float):
-        """反向传播奖励值"""
-        current = node
-        while current is not None:
-            current.visit_count += 1
-            current.cumulative_reward += reward
-            current = current.parent
-    
-    def search(
-        self,
-        prompt: str,
-        context: str = None,
-        max_iterations: int = 100,
-        thinking_available: bool = True
-    ) -> Tuple[str, float, Dict[str, float]]:
-        """执行树搜索"""
-        prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
-        
-        self.root = TreeNode(token_id=None, log_prob=0.0)
-        
-        initial_children = self.expand_node(
-            self.root,
-            prompt_tokens,
-            [],
-            context
-        )
-        
-        for iteration in range(max_iterations):
-            selected_node = self.select_node(self.root)
-            
-            current_tokens = selected_node.get_path()
-            new_children = self.expand_node(
-                selected_node,
-                prompt_tokens,
-                current_tokens,
-                context
-            )
-            
-            for child in new_children:
-                child_tokens = child.get_path()
-                reward = self.evaluate_node(
-                    child,
-                    prompt_tokens,
-                    child_tokens,
-                    context=context
-                )
-                child.reward = reward
-                
-                self.backpropagate(child, reward)
-        
-        best_node = self._select_best_node()
-        best_tokens = best_node.get_path()
-        
-        generated_text = TextTokenizer.decode(torch.tensor(best_tokens))
-        
-        total_reward, reward_breakdown = self.reward_model.compute_total_reward(
-            answer_text=generated_text,
-            context=context
-        )
-        
-        return generated_text, total_reward, reward_breakdown
-    
-    def _select_best_node(self) -> TreeNode:
-        """选择最佳节点"""
-        def collect_leaves(node: TreeNode, leaves: List[TreeNode]):
-            if not node.children:
-                leaves.append(node)
-            else:
-                for child in node.children:
-                    collect_leaves(child, leaves)
-        
-        leaves = []
-        collect_leaves(self.root, leaves)
-        
-        if not leaves:
-            return self.root
-        
-        best_leaf = max(
-            leaves,
-            key=lambda n: n.cumulative_reward / max(n.visit_count, 1)
-        )
-        
-        return best_leaf
-    
-    def beam_search_with_reward(
-        self,
-        prompt: str,
-        context: str = None,
-        max_length: int = 100,
-        beam_width: int = 4,
-        thinking_available: bool = True
-    ) -> Tuple[str, float, Dict[str, float]]:
-        """基于奖励的束搜索"""
-        prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
-        
-        beams = [
-            {
-                'tokens': [],
-                'log_prob': 0.0,
-                'reward': 0.0,
-                'finished': False
-            }
-        ]
-        
-        for step in range(max_length):
-            new_beams = []
-            
-            for beam in beams:
-                if beam['finished']:
-                    new_beams.append(beam)
-                    continue
-                
-                if beam['tokens']:
-                    beam_tokens = torch.tensor(beam['tokens'], device=self.device, dtype=torch.long)
-                else:
-                    beam_tokens = torch.tensor([], device=self.device, dtype=torch.long)
-                current_tokens = torch.cat([
-                    prompt_tokens,
-                    beam_tokens
-                ])
-                
-                with torch.inference_mode():
-                    result = self.model(current_tokens, use_cache=True)
-                    if isinstance(result, tuple):
-                        logits, _ = result
-                    else:
-                        logits = result
-                
-                next_logits = logits[-1]
-                next_probs = F.softmax(next_logits / self.temperature, dim=-1)
-                
-                top_k_probs, top_k_indices = torch.topk(next_logits, k=beam_width)
-                
-                for i in range(beam_width):
-                    token_id = top_k_indices[i].item()
-                    log_prob = torch.log(top_k_probs[i] + 1e-10).item()
-                    
-                    if token_id == TextTokenizer.END_GENERATION_TOKEN:
-                        finished = True
-                    else:
-                        finished = False
-                    
-                    new_beam = {
-                        'tokens': beam['tokens'] + [token_id],
-                        'log_prob': beam['log_prob'] + log_prob,
-                        'reward': 0.0,
-                        'finished': finished
-                    }
-                    
-                    if finished or step == max_length - 1:
-                        full_tokens = prompt_tokens.tolist() + new_beam['tokens']
-                        generated_text = TextTokenizer.decode(torch.tensor(full_tokens))
-                        
-                        total_reward, _ = self.reward_model.compute_total_reward(
-                            answer_text=generated_text,
-                            context=context
-                        )
-                        new_beam['reward'] = total_reward
-                    
-                    new_beams.append(new_beam)
-            
-            beams = sorted(
-                new_beams,
-                key=lambda b: b['log_prob'] + b['reward'],
-                reverse=True
-            )[:beam_width]
-            
-            if all(beam['finished'] for beam in beams):
-                break
-        
-        best_beam = max(beams, key=lambda b: b['log_prob'] + b['reward'])
-        best_tokens = best_beam['tokens']
-        
-        generated_text = TextTokenizer.decode(torch.tensor(best_tokens))
-        
-        total_reward, reward_breakdown = self.reward_model.compute_total_reward(
-            answer_text=generated_text,
-            context=context
-        )
-        
-        return generated_text, total_reward, reward_breakdown

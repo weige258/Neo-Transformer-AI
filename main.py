@@ -9,7 +9,6 @@ from record import record_loss
 from tokenizer import TextTokenizer
 from rl import SelfRewardModel, LightweightPPO
 
-
 if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8")
 if hasattr(sys.stdout, "reconfigure"):
@@ -87,6 +86,8 @@ training_rounds = 0
 # 初始化自奖励模型和强化学习模块
 reward_model = SelfRewardModel(device)
 ppo_trainer = LightweightPPO(model, reward_model, device, learning_rate=1e-5)
+ 
+ 
 
 print("[Info] Self-reward model and RL modules initialized.", flush=True)
 
@@ -210,22 +211,18 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
 
         text_tensor = TextTokenizer.encode(answer).to(device)
         if text_tensor.numel() < 2:
-            return
-
-        train_tensor = torch.cat(
-            [
+            train_tensor = torch.cat([
                 torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
                 text_tensor,
                 torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-            ]
-        )
-        target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
-        preview = train_tensor
-        _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
-        
-        # 【显存优化】训练后主动释放显存，解决泄漏问题
-        torch.cuda.empty_cache()
-        return
+            ])
+            target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
+            preview = text_tensor
+            _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
+
+            # 【显存优化】训练后主动释放显存，解决泄漏问题
+            torch.cuda.empty_cache()
+            return
 
     # QA训练模式
     print(f"\n---Train{RESET}", flush=True)
@@ -400,14 +397,22 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 prompt = torch.cat([prompt, think_start_tensor])
         
         result = model(prompt, use_cache=True)
-        if isinstance(result, tuple) and len(result) == 3:
-            logits, action_logits, past_key_values = result
-        elif isinstance(result, tuple) and len(result) == 2:
-            logits, past_key_values = result
-            action_logits = None
+        if isinstance(result, tuple):
+            if len(result) == 4:
+                logits, action_logits, value_preds, past_key_values = result
+            elif len(result) == 3:
+                logits, action_logits, value_preds = result
+                past_key_values = None
+            else:
+                logits = result[0]
+                action_logits = result[1] if len(result) > 1 else None
+                value_preds = result[2] if len(result) > 2 else None
+                past_key_values = None
         else:
             logits = result
             action_logits = None
+            value_preds = None
+            past_key_values = None
 
         step = 0
         
@@ -421,50 +426,63 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 force_token_reason = ""     # 调试用
 
                 if action_logits is not None:
-                    act_logit = action_logits[-1].float()  # [3]
-                    # 应用状态转移掩码：禁止非法转移
+                    act_all = action_logits[-1].float()  # [4] -> [THINK, ANSWER, END, TERM]
+                    act_logit = act_all[:3]
+                    term_logit = act_all[3]
+                    # 应用状态转移掩码：禁止非法转移（仅作用于前三个 action logits）
                     act_logit = act_logit + _trans_mask[prev_action]
-                    # 采样行动
+                    # 采样行动概率
                     act_probs = torch.softmax(act_logit / action_temperature, dim=-1)
-                    
-                    # min_new_tokens 内仅禁止 END，保留思考/回答自由度
-                    if step < min_new_tokens:
-                        act_probs_l = act_probs.clone()
-                        act_probs_l[ACTION_END] = 0.0
-                        if act_probs_l.sum() > 0:
-                            act_probs_l = act_probs_l / act_probs_l.sum()
-                            sampled_action = int(torch.multinomial(act_probs_l, 1).item())
-                        else:
-                            sampled_action = ACTION_ANSWER
-                    else:
-                        sampled_action = int(torch.multinomial(act_probs, 1).item())
 
-                    # === 行动决策 ===
-                    if sampled_action == ACTION_THINKING and prev_action != ACTION_THINKING:
-                        # 从回答→思考：注入 THINK_START
-                        do_think_jump = True
-                        force_token = TextTokenizer.THINK_START_TOKEN
-                        thinking_steps = 0  # 重置思考步数计数
-                    elif sampled_action == ACTION_ANSWER and prev_action == ACTION_THINKING:
-                        # 空块防护：最少思考 3 步
-                        # 死锁防护：超过 max_thinking_steps 强制切出
-                        if thinking_steps < 3:
-                            sampled_action = ACTION_THINKING
-                        elif thinking_steps >= max_thinking_steps:
-                            # 思考块已达上限，强制切出防止死循环
-                            do_think_jump = True
-                            force_token = TextTokenizer.THINK_END_TOKEN
-                            sampled_action = ACTION_ANSWER
+                    # 在最小生成步数内禁止 END
+                    if step < min_new_tokens:
+                        act_probs = act_probs.clone()
+                        act_probs[ACTION_END] = 0.0
+                        if act_probs.sum() > 0:
+                            act_probs = act_probs / act_probs.sum()
                         else:
-                            # 从思考→回答：注入 THINK_END
+                            act_probs = torch.tensor([0.5, 0.5, 0.0], device=act_probs.device)
+
+                    sampled_action = int(torch.multinomial(act_probs, 1).item())
+                    # 记录 action 采样对数概率与动作，用于 PPO 后续更新
+                    try:
+                        logp = torch.log(act_probs[sampled_action].clamp_min(1e-12))
+                        if 'ppo_trainer' in globals():
+                            try:
+                                ppo_trainer.episode_data['log_probs'].append(logp)
+                                ppo_trainer.episode_data['actions'].append(sampled_action)
+                                # 记录简要状态（可选）：使用提示末尾的若干 token id
+                                try:
+                                    if 'prompt' in locals():
+                                        ppo_trainer.episode_data['states'].append(prompt[-16:].cpu().tolist() if isinstance(prompt, torch.Tensor) else str(prompt)[-64:])
+                                except Exception:
+                                    try:
+                                        ppo_trainer.episode_data['states'].append(str(prompt)[-64:])
+                                    except Exception:
+                                        ppo_trainer.episode_data['states'].append([])
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    # === 行动注入逻辑（支持多段 THINK/ANSWER） ===
+                    if sampled_action == ACTION_THINKING:
+                        if prev_action != ACTION_THINKING:
+                            # 从回答/初始 -> 思考：注入 THINK_START
+                            do_think_jump = True
+                            force_token = TextTokenizer.THINK_START_TOKEN
+                            thinking_steps = 0
+                    elif sampled_action == ACTION_ANSWER:
+                        if prev_action == ACTION_THINKING:
+                            # 从思考 -> 回答：注入 THINK_END
                             do_think_jump = True
                             force_token = TextTokenizer.THINK_END_TOKEN
+                        # 如果已经在 ANSWER 状态，则继续输出回答，不注入特殊 token
                     elif sampled_action == ACTION_END and step >= min_new_tokens:
-                        # 结束
                         force_token = TextTokenizer.END_GENERATION_TOKEN
                         force_token_reason = "→END"
-                    
-                    # 更新状态
+
+                    # 更新状态（END 不改变 prev_action，END 会直接结束）
                     if sampled_action != ACTION_END:
                         prev_action = sampled_action
 
@@ -476,16 +494,59 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
                 if do_think_jump and force_token is not None:
                     # 主动注入特殊 token（THINK_START / THINK_END）
-                    # 这些不输出到屏幕，不消耗 step，只更新 KV cache
-                    inject_token = torch.tensor([force_token], device=device)
-                    result = model(inject_token, past_key_values=past_key_values, use_cache=True)
-                    if isinstance(result, tuple) and len(result) == 3:
-                        logits, action_logits, past_key_values = result
-                    elif isinstance(result, tuple) and len(result) == 2:
-                        logits, past_key_values = result
-                        action_logits = None
-                    # 注入不消耗 step，继续下一步循环
-                    continue
+                    # 对于 THINK_START: 先进行短时规划（多候选采样 + reward 打分），选择最佳思路并一次性注入
+                    if force_token == TextTokenizer.THINK_START_TOKEN:
+                        # 使用 Tree-of-Thoughts 搜索替代短时规划器
+                        try:
+                            prompt_str = (history_context + "\n" + text) if history_context else text
+                            tot_iters = int(CONFIG.get('tot_iterations', 20))
+                            best_text, best_reward, breakdown = tree_search.search(prompt=prompt_str, context=history_context, max_iterations=tot_iters, thinking_available=thinking_available)
+                            if best_text and len(best_text) > 0:
+                                candidate_ids = TextTokenizer.encode(best_text).to(device)
+                                inject_seq = [force_token] + candidate_ids.tolist() + [TextTokenizer.THINK_END_TOKEN]
+                            else:
+                                inject_seq = [force_token]
+                        except Exception:
+                            inject_seq = [force_token]
+
+                        inject_tensor = torch.tensor(inject_seq, device=device)
+                        result = model(inject_tensor, past_key_values=past_key_values, use_cache=True)
+                        if isinstance(result, tuple):
+                            if len(result) == 4:
+                                logits, action_logits, value_preds, past_key_values = result
+                            elif len(result) == 3:
+                                logits, action_logits, value_preds = result
+                                past_key_values = None
+                            else:
+                                logits = result[0]
+                                action_logits = result[1] if len(result) > 1 else None
+                                value_preds = result[2] if len(result) > 2 else None
+                                past_key_values = None
+                        else:
+                            logits = result
+                            action_logits = None
+                        # 注入不消耗 step，继续下一步循环
+                        continue
+
+                    else:
+                        # THINK_END 或其他 token 简单注入
+                        inject_token = torch.tensor([force_token], device=device)
+                        result = model(inject_token, past_key_values=past_key_values, use_cache=True)
+                        if isinstance(result, tuple):
+                            if len(result) == 4:
+                                logits, action_logits, value_preds, past_key_values = result
+                            elif len(result) == 3:
+                                logits, action_logits, value_preds = result
+                                past_key_values = None
+                            else:
+                                logits = result[0]
+                                action_logits = result[1] if len(result) > 1 else None
+                                value_preds = result[2] if len(result) > 2 else None
+                                past_key_values = None
+                        else:
+                            logits = result
+                            action_logits = None
+                        continue
 
                 # 正常采样下一个 token（含重复惩罚 + Top-K + Top-P）
                 next_logits = logits[-1].clone()
@@ -541,11 +602,17 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         prev_action = ACTION_ANSWER     # LM 自己生成 THINK_END → 同步
                     next_token = torch.tensor([index], device=device)
                     result = model(next_token, past_key_values=past_key_values, use_cache=True)
-                    if isinstance(result, tuple) and len(result) == 3:
-                        logits, action_logits, past_key_values = result
-                    elif isinstance(result, tuple) and len(result) == 2:
-                        logits, past_key_values = result
-                        action_logits = None
+                    if isinstance(result, tuple):
+                        if len(result) == 4:
+                            logits, action_logits, value_preds, past_key_values = result
+                        elif len(result) == 3:
+                            logits, action_logits, value_preds = result
+                            past_key_values = None
+                        else:
+                            logits = result[0]
+                            action_logits = result[1] if len(result) > 1 else None
+                            value_preds = result[2] if len(result) > 2 else None
+                            past_key_values = None
                     else:
                         logits = result
                         action_logits = None
@@ -567,14 +634,21 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
                 next_token = torch.tensor([index], device=device)
                 result = model(next_token, past_key_values=past_key_values, use_cache=True)
-                if isinstance(result, tuple) and len(result) == 3:
-                    logits, action_logits, past_key_values = result
-                elif isinstance(result, tuple) and len(result) == 2:
-                    logits, past_key_values = result
-                    action_logits = None
+                if isinstance(result, tuple):
+                    if len(result) == 4:
+                        logits, action_logits, value_preds, past_key_values = result
+                    elif len(result) == 3:
+                        logits, action_logits, value_preds = result
+                        past_key_values = None
+                    else:
+                        logits = result[0]
+                        action_logits = result[1] if len(result) > 1 else None
+                        value_preds = result[2] if len(result) > 2 else None
+                        past_key_values = None
                 else:
                     logits = result
                     action_logits = None
+                    value_preds = None
                 
                 step += 1
             except Exception as e:
@@ -739,15 +813,14 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 temperature=float(CONFIG.get("action_label_temperature", 0.5)),
             )
             # 对齐: action_logits[:-1] 对应 action_labels[1:] (next-token prediction)
-            act_logits_aligned = action_logits[:-1]  # [seq_len-1, 3]
-            act_hard_labels = action_labels_soft[1:].argmax(dim=-1)  # [seq_len-1]
-            # 只对 target_mask 选中的位置计算行动损失
-            if target_mask[1:].any():
-                act_logits_masked = act_logits_aligned[target_mask[1:]]
-                act_labels_masked = act_hard_labels[target_mask[1:]]
-                action_ce_loss = F.cross_entropy(
-                    act_logits_masked.float(), act_labels_masked,
-                )
+            act_logits_aligned = action_logits[:-1, :3]  # [seq_len-1, 3]
+            mask = target_mask[1:]
+            # 使用软标签的 KL 散度作为行动损失（对模型输出的 log_probs 与目标分布匹配）
+            if mask.any():
+                act_logits_masked = act_logits_aligned[mask]  # [N, 3]
+                act_target_dist = action_labels_soft[1:][mask].float()  # [N, 3]
+                logp = F.log_softmax(act_logits_masked.float(), dim=-1)
+                action_ce_loss = F.kl_div(logp, act_target_dist, reduction='batchmean')
                 action_coef = float(CONFIG.get("action_loss_coef", 0.3))
                 action_loss = action_coef * action_ce_loss
                 loss = loss + action_loss
