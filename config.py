@@ -20,8 +20,8 @@ CONFIG: Dict[str, Any] = {
     "compress_trigger_entropy": 0.7,
     "compress_ratio": 0.3,
     # === 解码策略（防止退化生成） ===
-    "temperature": 0.7,               # 温度：越高越随机（0.6→0.7）
-    "repetition_penalty": 1.15,        # 重复惩罚：>1 惩罚已生成 token
+    "temperature": 0.6,               # 温度：越高越随机（0.6→0.7）
+    "repetition_penalty": 1.2,        # 重复惩罚：>1 惩罚已生成 token
     "top_k": 50,                       # Top-K 采样
     "top_p": 0.9,                      # Top-P (Nucleus) 采样
     "max_thinking_steps": 200,         # 思考块最大步数（防止死锁）
