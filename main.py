@@ -384,28 +384,49 @@ def _apply_top_k_top_p(logits: torch.Tensor, top_k: int, top_p: float) -> torch.
     return logits
 
 
-def _check_perplexity_early_stop(logits: torch.Tensor, selected_token: int, threshold: float) -> tuple[bool, float]:
-    """精简版困惑度监控：计算当前步困惑度，超过阈值则建议停止
+def _check_repetition_stop(generated_tokens: list, threshold: int = 5) -> tuple[bool, str]:
+    """重复循环检测停止（业界标准方案）
     
-    原理: perplexity = exp(-log(prob))，反映模型对当前选择的"确定程度"
-    - 困惑度低: 模型很确定，生成质量高
-    - 困惑度高: 模型不确定，可能开始胡言乱语
+    检测生成中的重复模式，防止模型陷入无限循环或"复读机"状态。
+    这是比困惑度早停更有效、更稳定的质量控制策略。
+    
+    Args:
+        generated_tokens: 已生成的token列表
+        threshold: 连续相同token的阈值
     
     Returns:
-        (should_stop: bool, perplexity: float)
+        (should_stop: bool, detected_pattern: str)
     """
-    probs = torch.softmax(logits, dim=-1)
-    token_prob = probs[selected_token]
-    # 计算困惑度: PPL = exp(-log(P(token)))
-    perplexity = torch.exp(-torch.log(token_prob + 1e-10)).item()
+    if len(generated_tokens) < threshold:
+        return False, ""
     
-    # 超过阈值则建议停止
-    should_stop = perplexity > threshold
-    return should_stop, perplexity
+    # 策略1: 检测连续相同token
+    recent_tokens = generated_tokens[-threshold:]
+    if all(t == recent_tokens[0] for t in recent_tokens):
+        return True, f"连续{threshold}个相同token"
+    
+    # 策略2: 检测重复的n-gram序列（2-gram, 3-gram）
+    for n in [2, 3]:
+        if len(generated_tokens) < n * 3:
+            continue
+        
+        # 取最后3个n-gram
+        ngrams = []
+        for i in range(len(generated_tokens) - n + 1):
+            ngram = tuple(generated_tokens[i:i+n])
+            ngrams.append(ngram)
+        
+        # 检查最后3个n-gram是否重复
+        if len(ngrams) >= 3:
+            last_ngrams = ngrams[-3:]
+            if len(set(last_ngrams)) == 1:
+                return True, f"重复{n}-gram模式"
+    
+    return False, ""
 
 
 def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
-    """生成函数 (精简增强版: Top-K + Top-P + 困惑度早停)
+    """生成函数 (增强版: Top-K + Top-P + 重复惩罚 + 重复检测停止)
     
     Args:
         text: 输入文本/问题
@@ -457,8 +478,8 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     # 读取采样参数
     top_k = int(CONFIG.get("top_k", 0))
     top_p = float(CONFIG.get("top_p", 1.0))
-    perplexity_threshold = float(CONFIG.get("perplexity_threshold", 999.0))  # 默认不启用
-    repetition_penalty = float(CONFIG.get("repetition_penalty", 1.0))  # 【修复】读取重复惩罚参数
+    repetition_penalty = float(CONFIG.get("repetition_penalty", 1.0))
+    repetition_stop_threshold = int(CONFIG.get("repetition_stop_threshold", 5))
 
     with torch.inference_mode():
         thinking_started = False
@@ -537,13 +558,19 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     elif not thinking_available:
                         should_skip_output = True
 
-                # 2️⃣ 困惑度监控 (生成至少5个token后启用)
-                if step >= 5 and perplexity_threshold < 100.0:
-                    should_stop, ppl = _check_perplexity_early_stop(next_logits, index, perplexity_threshold)
-                    if should_stop:
-                        print(f"\n[Stop] 困惑度过高(PPL={ppl:.1f}>{perplexity_threshold:.1f})，提前结束", flush=True)
-                        break
-                
+                # 2️⃣ 重复检测停止（业界标准方案）
+                if index not in (
+                    TextTokenizer.THINK_START_TOKEN,
+                    TextTokenizer.THINK_END_TOKEN,
+                    TextTokenizer.START_GENERATION_TOKEN,
+                    TextTokenizer.END_GENERATION_TOKEN,
+                ):
+                    if step >= 5:  # 至少生成5个token后启用检测
+                        should_stop, pattern = _check_repetition_stop(list(generated_tokens) + [index], repetition_stop_threshold)
+                        if should_stop:
+                            print(f"\n[Stop] 检测到重复模式({pattern})，提前结束", flush=True)
+                            break
+
                 if not should_skip_output:
                     decoded_piece = TextTokenizer.decode(torch.tensor([index]))
                     
