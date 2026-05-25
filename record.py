@@ -1,15 +1,54 @@
+import os
 import threading
 import time
-import os
+import queue
+from datetime import datetime
+from config import CONFIG
 
-# Global variables
+# 全局变量
 running_time = 0
-total_loss = 0
+total_loss = 0.0
 record_count = 0
-record_interval = 1000
-
-# 【修复】新增全局线程锁，防止数据竞争
+record_interval = int(CONFIG.get("record_interval", 1000))  # 从配置读取，默认1000
 data_lock = threading.Lock()
+
+# 【修复】异步写入队列和后台线程
+write_queue = queue.Queue(maxsize=100)  # 限制队列大小防止内存溢出
+
+
+def _write_worker():
+    """后台写入线程，将记录异步写入文件，不阻塞训练主线程"""
+    while True:
+        try:
+            # 从队列中获取待写入的记录（阻塞等待）
+            record_data = write_queue.get(timeout=60)  # 60秒超时
+            if record_data is None:  # 退出信号
+                break
+            
+            # 执行文件IO（不在锁内执行）
+            record_file = "record.txt"
+            with open(record_file, "a", encoding="utf-8") as f:
+                f.write(
+                    f"<system_time>{record_data['system_time']}</system_time>"
+                    f"<time>{record_data['time_str']}</time>"
+                    f"<avg_loss>{record_data['avg_loss']:.6f}</avg_loss>\n"
+                )
+            
+            print(
+                f"记录损失 - 系统时间: {record_data['system_time']}, "
+                f"运行时间: {record_data['time_str']}, "
+                f"平均损失: {record_data['avg_loss']:.6f}",
+                flush=True
+            )
+            write_queue.task_done()
+        except queue.Empty:
+            continue
+        except Exception as e:
+            print(f"后台写入线程异常: {e}", flush=True)
+
+
+# 启动后台写入线程
+threading.Thread(target=_write_worker, daemon=True, name="record_write_worker").start()
 
 
 def hours_minutes_seconds_to_seconds(time_str: str) -> int:
@@ -81,7 +120,11 @@ threading.Thread(target=time_thread, daemon=True).start()
 
 
 def record_loss(loss: float):
-    """Record training loss"""
+    """Record training loss
+    
+    修复：将文件IO操作移出锁外，改为异步写入队列
+    训练线程只负责将数据放入队列，不阻塞等待文件写入
+    """
     global running_time, total_loss, record_count
     
     try:
@@ -91,17 +134,32 @@ def record_loss(loss: float):
             
             if record_count >= record_interval:
                 avg_loss = total_loss / record_count
-                record_file = "record.txt"
+                time_str = seconds_to_hours_minutes_seconds(running_time)
+                system_time = get_system_time()
                 
-                with open(record_file, "a", encoding="utf-8") as f:
-                    time_str = seconds_to_hours_minutes_seconds(running_time)
-                    system_time = get_system_time()
-                    f.write(f"<system_time>{system_time}</system_time><time>{time_str}</time><avg_loss>{avg_loss:.6f}</avg_loss>\n")
+                # 【修复】将记录放入异步写入队列，而不是直接写文件
+                try:
+                    write_queue.put_nowait({
+                        'time_str': time_str,
+                        'system_time': system_time,
+                        'avg_loss': avg_loss
+                    })
+                except queue.Full:
+                    # 队列满了，丢弃最旧的记录并警告
+                    print(f"[Warning] 记录队列已满，丢弃一条记录", flush=True)
+                    try:
+                        write_queue.get_nowait()  # 移除最旧的
+                        write_queue.put_nowait({
+                            'time_str': time_str,
+                            'system_time': system_time,
+                            'avg_loss': avg_loss
+                        })
+                    except:
+                        pass
                 
                 # Reset counters
                 total_loss = 0
                 record_count = 0
-                print(f"记录损失 - 系统时间: {system_time}, 运行时间: {time_str}, 平均损失: {avg_loss:.6f}", flush=True)
             
     except Exception as e:
         print(f"记录损失失败: {e}", flush=True)

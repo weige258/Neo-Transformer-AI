@@ -27,7 +27,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+        # 修复：移除nan_to_num，让数值异常暴露以便调试
+        # 根据PyTorch最佳实践，NaN/Inf应该被检测而非掩盖
+        # 如果上游产生NaN/Inf，应该立即报错中断训练
         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
 
 

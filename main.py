@@ -67,16 +67,6 @@ def _build_train_sequence(
     )
     return train_tensor, target_mask
 
-if hasattr(sys.stdin, "reconfigure"):
-    sys.stdin.reconfigure(encoding="utf-8")
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8")
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 def _load_model() -> MainModel:
     try:
@@ -84,15 +74,46 @@ def _load_model() -> MainModel:
         loaded = torch.load("model.pth", map_location=device)
         model = MainModel().to(device)
         
-        # 【修复】严格校验键匹配，避免加载不匹配
+        # 【修复】严格校验键匹配，避免加载不匹配的权重导致静默随机初始化
+        # 根据PyTorch最佳实践，应该使用strict=True或在不匹配时抛出异常
         model_state = model.state_dict()
-        filtered_state = {k: v for k, v in loaded.items() if k in model_state and v.shape == model_state[k].shape}
-        missing_keys = [k for k in model_state if k not in filtered_state]
-        if missing_keys:
-            print(f"[Warning] 缺失权重键: {missing_keys}, 随机初始化", flush=True)
-        model.load_state_dict(filtered_state, strict=False)
-        print("Loaded model state dict safely.", flush=True)
+        
+        # 检查是否有shape不匹配的键
+        shape_mismatched = []
+        for k, v in loaded.items():
+            if k in model_state:
+                if v.shape != model_state[k].shape:
+                    shape_mismatched.append(f"{k}: expected {model_state[k].shape}, got {v.shape}")
+            else:
+                shape_mismatched.append(f"{k}: 模型中不存在此键")
+        
+        if shape_mismatched:
+            error_msg = "\n".join(shape_mismatched)
+            raise ValueError(
+                f"权重文件与模型结构不匹配，加载中止！\n"
+                f"不匹配的键：\n{error_msg}\n\n"
+                f"请检查：\n"
+                f"1. dict_size、emb_size、层数等配置是否与保存权重时的配置一致\n"
+                f"2. 是否使用了错误的model.pth文件"
+            )
+        
+        # 严格加载
+        model.load_state_dict(loaded, strict=True)
+        print("Loaded model state dict with strict validation.", flush=True)
         return model
+    except FileNotFoundError:
+        print("model.pth not found. Creating new model.", flush=True)
+        model = MainModel().to(device)
+        print("Created new model.", flush=True)
+        return model
+    except ValueError as e:
+        # 捕获形状不匹配的异常并终止程序
+        print(f"\n{'='*60}", flush=True)
+        print(f"[ERROR] {e}", flush=True)
+        print(f"{'='*60}\n", flush=True)
+        print("程序已终止。请修正配置或权重文件后重新运行。", flush=True)
+        import sys
+        sys.exit(1)
     except Exception as e:
         print(f"Failed to load model: {e}", flush=True)
         model = MainModel().to(device)
@@ -474,14 +495,17 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     top_k = int(CONFIG.get("top_k", 0))
     top_p = float(CONFIG.get("top_p", 1.0))
     perplexity_threshold = float(CONFIG.get("perplexity_threshold", 999.0))  # 默认不启用
- 
+    repetition_penalty = float(CONFIG.get("repetition_penalty", 1.0))  # 【修复】读取重复惩罚参数
+
     with torch.inference_mode():
         thinking_started = False
         if thinking_available:
             has_think_token = (prompt == TextTokenizer.THINK_START_TOKEN).any()
             if has_think_token:
+                # 已包含THINK_START_TOKEN，直接标记为已开始，不再追加
                 thinking_started = True
             else:
+                # 未包含，追加THINK_START_TOKEN并标记为已开始
                 thinking_started = True
                 think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
                 prompt = torch.cat([prompt, think_start_tensor])
@@ -494,12 +518,25 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
         step = 0
         
+        # 【修复】用于repetition_penalty的已生成token跟踪
+        generated_tokens = set()
+        
         while max_generate_tokens is None or step < max_generate_tokens:
             try:
                 next_logits = logits[-1]
                 if step < min_new_tokens:
                     next_logits = next_logits.clone()
                     next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
+
+                # 【修复】应用 repetition_penalty
+                if repetition_penalty > 1.0 and len(generated_tokens) > 0:
+                    # 将已生成的token的logits除以repetition_penalty（降低其概率）
+                    for token_id in generated_tokens:
+                        if token_id < next_logits.size(0):  # 确保token_id在有效范围内
+                            if next_logits[token_id] > 0:
+                                next_logits[token_id] /= repetition_penalty
+                            else:
+                                next_logits[token_id] *= repetition_penalty
 
                 # 1️⃣ 应用 Top-K + Top-P 组合采样
                 if top_k > 0 or top_p < 1.0:
@@ -545,6 +582,15 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                             print(f"{GREEN}{decoded_piece}{RESET}", end="", flush=True)
                         
                         output_text += decoded_piece
+
+                # 【修复】将生成的token添加到集合中用于repetition_penalty
+                if index not in (
+                    TextTokenizer.THINK_START_TOKEN,
+                    TextTokenizer.THINK_END_TOKEN,
+                    TextTokenizer.START_GENERATION_TOKEN,
+                    TextTokenizer.END_GENERATION_TOKEN,
+                ):
+                    generated_tokens.add(index)
 
                 next_token = torch.tensor([index], device=device)
                 result = model(

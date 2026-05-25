@@ -276,18 +276,27 @@ class WebCrawler:
             return False
     
     def _queue_manager(self):
-        """队列管理线程"""
+        """队列管理线程
+        
+        修复：移除随机URL生成功能（存在安全与法律风险）
+        改为基于种子URL的队列监控，当队列低于阈值时发出警告
+        """
+        warning_count = 0
         while self.is_running and not self.stop_event.is_set():
             try:
                 # 检查队列大小
                 current_size = self.url_queue.qsize()
                 
                 if current_size < self.queue_threshold:
-                    # 生成新的随机URL
-                    new_urls = self._generate_random_urls(self.queue_threshold - current_size)
-                    for url in new_urls:
-                        if url not in self.visited_urls and url not in self.failed_urls:
-                            self.url_queue.put(url)
+                    # 【安全修复】不再随机生成URL，改为等待用户添加种子URL
+                    warning_count += 1
+                    if warning_count % 10 == 0:  # 每20秒输出一次警告
+                        logger.warning(
+                            f"URL队列过低({current_size} < {self.queue_threshold})，"
+                            f"请通过 add_seed_url() 或 add_seed_urls() 添加种子URL。"
+                            f"已访问: {len(self.visited_urls)}, 已失败: {len(self.failed_urls)}"
+                        )
+                    warning_count = warning_count % 10
                 
                 # 定期检查（每2秒）
                 time.sleep(2)

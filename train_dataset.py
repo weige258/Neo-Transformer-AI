@@ -1,4 +1,5 @@
 import json
+import os
 import torch
 import random
 import logging
@@ -11,7 +12,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 def load_dataset_files(dataset_dir: str = "dataset") -> List[str]:
     """Load all dataset JSON files from the specified directory"""
-    import os
     
     dataset_files = []
     for file_name in os.listdir(dataset_dir):
@@ -81,10 +81,28 @@ class StreamingDataset:
         raise IndexError("Failed to locate entry")
     
     def _load_entry_from_file(self, file_path: str, target_local_idx: int) -> Dict[str, Optional[str]]:
-        """从文件中加载指定索引的条目"""
+        """从文件中加载指定索引的条目
+        
+        修复：添加文件大小限制和安全校验，防止恶意JSON导致内存耗尽
+        """
         try:
+            # 【安全修复】检查文件大小，限制为100MB
+            max_file_size = 100 * 1024 * 1024  # 100MB
+            file_size = os.path.getsize(file_path)
+            if file_size > max_file_size:
+                raise ValueError(
+                    f"文件 {file_path} 过大 ({file_size / 1024 / 1024:.2f}MB > {max_file_size / 1024 / 1024:.2f}MB)，"
+                    f"可能存在安全风险或格式错误"
+                )
+            
             with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                # 【安全修复】添加JSON加载的异常处理
+                try:
+                    data = json.load(f)
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"JSON解析失败 {file_path}: {e}") from e
+                except MemoryError:
+                    raise MemoryError(f"JSON文件 {file_path} 加载时内存不足，文件可能过大或格式异常")
             
             current_idx = 0
             for item in data:
@@ -140,7 +158,11 @@ class StreamingDataset:
 
 
 def main() -> None:
-    """Main training loop"""
+    """Main training loop
+    
+    修复：精细化异常处理，区分可恢复错误和不可恢复错误
+    添加最大连续错误计数，防止在损坏状态下无限循环
+    """
     # 使用流式数据集，不再一次性加载所有数据到内存
     dataset = StreamingDataset("dataset")
 
@@ -156,6 +178,10 @@ def main() -> None:
     # 用于ReduceLROnPlateau的损失跟踪
     recent_losses = []
     loss_window_size = 100  # 计算平均loss的窗口大小
+    
+    # 【修复】添加连续错误计数器，防止无限循环
+    consecutive_errors = 0
+    max_consecutive_errors = 50  # 最大连续错误次数
 
     try:
         while True:
@@ -179,6 +205,9 @@ def main() -> None:
                     answer=answer,
                     history_context=history_context if history_context else None
                 )
+                
+                # 【修复】训练成功后重置错误计数器
+                consecutive_errors = 0
                             
                 local_training_rounds += 1
                 
@@ -201,15 +230,58 @@ def main() -> None:
                     avg_loss = sum(recent_losses) / len(recent_losses) if recent_losses else 0
                     logging.info(f"Model saved, training rounds: {local_training_rounds}, current LR: {current_lr:.6f}, avg loss: {avg_loss:.6f}")
 
-            except Exception as e:
-                if "cannot convert float NaN to integer" in str(e):
-                    logging.error(f"NaN training error: {e}, skipping this sample")
-                    # 尝试清理梯度
+            except RuntimeError as e:
+                # 【修复】区分可恢复和不可恢复的RuntimeError
+                if "NaN" in str(e) or "nan" in str(e).lower():
+                    consecutive_errors += 1
+                    logging.error(
+                        f"NaN training error (连续错误 {consecutive_errors}/{max_consecutive_errors}): {e}, "
+                        f"skipping this sample"
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        logging.critical(
+                            f"连续{max_consecutive_errors}次NaN错误，训练可能已损坏，中止训练并保存模型"
+                        )
+                        torch.save(obj=model.state_dict(), f="model.pth")
+                        raise RuntimeError("训练因连续NaN错误而中止") from e
+                    
+                    continue
+                elif "out of memory" in str(e).lower():
+                    # CUDA OOM是不可恢复的，需要立即中止
+                    logging.critical(f"CUDA Out of Memory: {e}")
+                    torch.save(obj=model.state_dict(), f="model.pth")
+                    raise RuntimeError("训练因显存不足而中止") from e
+                else:
+                    # 其他RuntimeError也可能是严重的
+                    consecutive_errors += 1
+                    logging.error(
+                        f"RuntimeError (连续错误 {consecutive_errors}/{max_consecutive_errors}): {e}"
+                    )
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        logging.critical(f"连续{max_consecutive_errors}次RuntimeError，中止训练")
+                        torch.save(obj=model.state_dict(), f="model.pth")
+                        raise RuntimeError("训练因连续RuntimeError而中止") from e
+                    
                     optimizer.zero_grad(set_to_none=True)
                     continue
-                else:
-                    logging.error(f"Training error: {e}")
-                    continue
+                    
+            except Exception as e:
+                # 【修复】其他异常也要计数，并有最大限制
+                consecutive_errors += 1
+                logging.error(
+                    f"Training error (连续错误 {consecutive_errors}/{max_consecutive_errors}): {e}"
+                )
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logging.critical(f"连续{max_consecutive_errors}次错误，中止训练并保存模型")
+                    torch.save(obj=model.state_dict(), f="model.pth")
+                    raise RuntimeError("训练因连续错误而中止") from e
+                
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
     except KeyboardInterrupt:
         logging.info("Training interrupted by user.")

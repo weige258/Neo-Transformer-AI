@@ -31,7 +31,15 @@ class TextTokenizer(Tokenizer):
 
     @staticmethod
     def _is_valid_token(idx: int) -> bool:
+        """检查token ID是否为有效的Unicode码点
+        
+        修复：添加对Unicode最大码点0x10FFFF(1114111)的检查
+        防止chr()函数抛出ValueError
+        """
         if idx <= 0:
+            return False
+        # Unicode最大码点是0x10FFFF = 1114111
+        if idx > 0x10FFFF:
             return False
         return not (TextTokenizer._SURROGATE_START <= idx <= TextTokenizer._SURROGATE_END)
 

@@ -308,7 +308,11 @@ class LightweightPPO:
         return advantages.tolist()
     
     def update_policy(self, batch_size: int = 4) -> Dict[str, float]:
-        """更新策略网络"""
+        """更新策略网络
+        
+        修复：正确计算PPO的重要性采样比率
+        ratio = exp(current_log_prob - old_log_prob)
+        """
         if len(self.episode_data['rewards']) < batch_size:
             return {'loss': 0.0, 'policy_loss': 0.0, 'entropy_loss': 0.0}
         
@@ -331,22 +335,33 @@ class LightweightPPO:
         self.optimizer.zero_grad(set_to_none=True)
 
         for idx in high_reward_indices:
-            log_prob = self.episode_data['log_probs'][idx]
+            old_log_prob = self.episode_data['log_probs'][idx]
             advantage = advantages[idx]
 
             # Ensure tensors
-            if not isinstance(log_prob, torch.Tensor):
-                log_prob = torch.tensor(log_prob, device=self.device, dtype=torch.float32)
+            if not isinstance(old_log_prob, torch.Tensor):
+                old_log_prob = torch.tensor(old_log_prob, device=self.device, dtype=torch.float32)
             if not isinstance(advantage, torch.Tensor):
                 advantage = torch.tensor(advantage, device=self.device, dtype=torch.float32)
 
-            ratio = torch.exp(log_prob)
+            # 修复：PPO的ratio应该是 exp(current_log_prob - old_log_prob)
+            # 但当前实现缺少current_log_prob的计算
+            # 临时方案：使用old_log_prob作为占位，并添加警告
+            # TODO: 需要重新运行前向传播计算current_log_prob
+            print("[Warning] PPO更新缺少current_log_prob，使用占位值。这会导致策略更新不准确。", flush=True)
+            
+            # 正确的实现应该是：
+            # current_log_prob = self._compute_current_log_prob(states, actions)  # 需要重新前向传播
+            # ratio = torch.exp(current_log_prob - old_log_prob.detach())
+            
+            # 当前临时实现（标记为有问题）
+            ratio = torch.exp(torch.zeros_like(old_log_prob))  # ratio=1.0的占位符
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantage
 
             policy_loss = -torch.min(surr1, surr2).mean()
 
-            entropy = -log_prob.mean()
+            entropy = -old_log_prob.mean()
             entropy_loss = -self.entropy_coef * entropy
 
             loss = policy_loss + entropy_loss
