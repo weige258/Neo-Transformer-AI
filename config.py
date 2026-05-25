@@ -9,7 +9,7 @@ CONFIG: Dict[str, Any] = {
     "num_heads": 8,                  # 注意力头数
     "num_transformer_blocks": 8,     # Transformer层数
     "tie_token_embeddings": True,    # 绑定输入输出嵌入权重
-    "dropout": 0.05,                 # Dropout比率
+    "dropout": 0.2,                 # Dropout比率
     
     # ═══════════════════════════════════════════════════════
     # 2️⃣ 注意力机制配置
