@@ -179,10 +179,6 @@ def main() -> None:
     recent_losses = []
     loss_window_size = 100  # 计算平均loss的窗口大小
     
-    # 【修复】添加连续错误计数器，防止无限循环
-    consecutive_errors = 0
-    max_consecutive_errors = 50  # 最大连续错误次数
-
     try:
         while True:
             # 流式获取随机训练样本
@@ -206,9 +202,6 @@ def main() -> None:
                     history_context=history_context if history_context else None
                 )
                 
-                # 【修复】训练成功后重置错误计数器
-                consecutive_errors = 0
-                            
                 local_training_rounds += 1
                 
                 # 获取当前学习率
@@ -231,55 +224,40 @@ def main() -> None:
                     logging.info(f"Model saved, training rounds: {local_training_rounds}, current LR: {current_lr:.6f}, avg loss: {avg_loss:.6f}")
 
             except RuntimeError as e:
-                # 【修复】区分可恢复和不可恢复的RuntimeError
+                # 【修复】区分可恢复和不可恢复的RuntimeError，但都不中止训练
                 if "NaN" in str(e) or "nan" in str(e).lower():
-                    consecutive_errors += 1
-                    logging.error(
-                        f"NaN training error (连续错误 {consecutive_errors}/{max_consecutive_errors}): {e}, "
-                        f"skipping this sample"
-                    )
+                    logging.error(f"NaN training error: {e}, skipping this sample")
                     optimizer.zero_grad(set_to_none=True)
-                    
-                    if consecutive_errors >= max_consecutive_errors:
-                        logging.critical(
-                            f"连续{max_consecutive_errors}次NaN错误，训练可能已损坏，中止训练并保存模型"
-                        )
-                        torch.save(obj=model.state_dict(), f="model.pth")
-                        raise RuntimeError("训练因连续NaN错误而中止") from e
-                    
                     continue
                 elif "out of memory" in str(e).lower():
-                    # CUDA OOM是不可恢复的，需要立即中止
-                    logging.critical(f"CUDA Out of Memory: {e}")
-                    torch.save(obj=model.state_dict(), f="model.pth")
-                    raise RuntimeError("训练因显存不足而中止") from e
+                    # 【用户要求】OOM不中止训练，跳过当前样本继续
+                    logging.warning(f"CUDA Out of Memory: {e}, skipping this sample")
+                    # 清理显存碎片
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    optimizer.zero_grad(set_to_none=True)
+                    continue
                 else:
-                    # 其他RuntimeError也可能是严重的
-                    consecutive_errors += 1
-                    logging.error(
-                        f"RuntimeError (连续错误 {consecutive_errors}/{max_consecutive_errors}): {e}"
-                    )
-                    
-                    if consecutive_errors >= max_consecutive_errors:
-                        logging.critical(f"连续{max_consecutive_errors}次RuntimeError，中止训练")
-                        torch.save(obj=model.state_dict(), f="model.pth")
-                        raise RuntimeError("训练因连续RuntimeError而中止") from e
-                    
+                    # 其他RuntimeError也跳过，不中止训练
+                    logging.error(f"RuntimeError: {e}, skipping this sample")
                     optimizer.zero_grad(set_to_none=True)
                     continue
                     
             except Exception as e:
-                # 【修复】其他异常也要计数，并有最大限制
-                consecutive_errors += 1
-                logging.error(
-                    f"Training error (连续错误 {consecutive_errors}/{max_consecutive_errors}): {e}"
-                )
+                error_msg = str(e)
                 
-                if consecutive_errors >= max_consecutive_errors:
-                    logging.critical(f"连续{max_consecutive_errors}次错误，中止训练并保存模型")
-                    torch.save(obj=model.state_dict(), f="model.pth")
-                    raise RuntimeError("训练因连续错误而中止") from e
+                # 分类记录错误，但都不中止训练，全部跳过继续
+                if "cannot convert float NaN to integer" in error_msg or "nan" in error_msg.lower():
+                    logging.error(f"NaN training error: {e}, skipping this sample")
+                elif "out of memory" in error_msg.lower():
+                    logging.warning(f"CUDA Out of Memory: {e}, skipping this sample")
+                    # 清理显存碎片
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                else:
+                    logging.error(f"Training error: {e}, skipping this sample")
                 
+                # 清理梯度，继续下一个样本
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
