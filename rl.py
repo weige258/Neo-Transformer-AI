@@ -37,17 +37,14 @@ class TreeNode:
 class SelfRewardModel:
     """自奖励模型：基于手工规则的多维度奖励评估。
 
-    ⚠️ 注意：此模块使用手工编写的启发式规则（如统计连接词数量、
-    检查 token 重叠度等），而非学习得到的奖励模型。
-    在模型 SFT 阶段生成通顺句子之前，这些规则的 RL 信号不可靠。
-    建议仅在 SFT 收敛后启用 RL（设置 config.rl_enabled = True）。
-
     评估维度：
     1. 思维链完整性 (CoT Completeness)
     2. 输出一致性 (Output Consistency)
     3. 长度合规性 (Length Compliance)
     4. 无UNK (No Unknown Tokens)
     5. 语义新颖性 (Semantic Novelty)
+    
+    此模块始终启用，在每次训练步骤中自动计算奖励并更新策略。
     """
     
     def __init__(self, device: torch.device):

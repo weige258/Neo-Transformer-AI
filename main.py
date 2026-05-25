@@ -168,42 +168,6 @@ ppo_trainer = LightweightPPO(model, reward_model, device, learning_rate=1e-5)
 
 print("[Info] Self-reward model and RL modules initialized.", flush=True)
 
-# ── 强化学习自动就绪评估 ──
-# 系统根据训练损失的收敛状态自动判断是否启用 PPO，
-# 不再需要手动设置 rl_enabled 开关。
-rl_ready = False
-rl_ready_reason = ""
-rl_last_check_round = 0
-rl_check_interval = int(CONFIG.get("rl_check_interval", 200))
-
-
-def _update_rl_readiness(force: bool = False) -> bool:
-    """定期（或在强制时）重新评估 RL 就绪状态。"""
-    global rl_ready, rl_ready_reason, rl_last_check_round, training_rounds
-    if not force and (training_rounds - rl_last_check_round) < rl_check_interval:
-        return rl_ready
-
-    rl_last_check_round = training_rounds
-    new_ready, reason = evaluate_rl_readiness(
-        loss_threshold=float(CONFIG.get("rl_loss_threshold", 1.2)),
-        stability_window=int(CONFIG.get("rl_loss_stability_window", 5)),
-        stability_std_threshold=float(CONFIG.get("rl_loss_stability_std_threshold", 0.15)),
-        min_training_rounds=int(CONFIG.get("rl_min_training_rounds", 3000)),
-    )
-
-    if new_ready != rl_ready:
-        rl_ready = new_ready
-        rl_ready_reason = reason
-        if rl_ready:
-            print(f"[RL] {reason}", flush=True)
-        else:
-            print(f"[RL] 尚未就绪 — {reason}", flush=True)
-
-    return rl_ready
-
-
-# 启动时评估一次
-_update_rl_readiness(force=True)
 
 
 def auto_compress_trigger(history_tensor: torch.Tensor, attn_weights: torch.Tensor = None) -> bool:
@@ -373,24 +337,23 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             return
         _run_train_step(train_tensor, target_mask, preview, show_preview=False)
     
-    # 自奖励评估 —— 根据训练收敛状态自动启用
-    if _update_rl_readiness():
-        try:
-            reward_model.compute_total_reward(
-                think_text=think,
-                answer_text=answer,
-                context=history_context
-            )
-            ppo_trainer.collect_episode(
-                prompt=ask if ask else "",
-                think_text=think if think else "",
-                answer_text=answer if answer else "",
-                context=history_context
-            )
-            if training_rounds > 0 and (training_rounds % 4) == 0:
-                ppo_trainer.update_policy(batch_size=4)
-        except Exception as e:
-            print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
+    # 自奖励评估 —— RL 始终启用
+    try:
+        reward_model.compute_total_reward(
+            think_text=think,
+            answer_text=answer,
+            context=history_context
+        )
+        ppo_trainer.collect_episode(
+            prompt=ask if ask else "",
+            think_text=think if think else "",
+            answer_text=answer if answer else "",
+            context=history_context
+        )
+        if training_rounds > 0 and (training_rounds % 4) == 0:
+            ppo_trainer.update_policy(batch_size=4)
+    except Exception as e:
+        print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
 
 
 def _apply_top_k_top_p(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
@@ -556,7 +519,16 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         break
                 
                 elif index == TextTokenizer.END_GENERATION_TOKEN:
-                    break
+                    # 【修复】如果思维阶段直接触发结束token，强制切换到回答阶段
+                    if thinking_available and thinking_started:
+                        print(f"{RESET}\n[强制切换] 思维阶段触发结束，强制开始回答生成", flush=True)
+                        thinking_started = False
+                        should_skip_output = True
+                        # 不break，继续生成循环，下一轮会正常生成回答内容
+                        # 将END_GENERATION_TOKEN替换为START_GENERATION_TOKEN以强制进入回答阶段
+                        index = TextTokenizer.START_GENERATION_TOKEN
+                    else:
+                        break
 
                 elif index == TextTokenizer.THINK_START_TOKEN:
                     if thinking_available and not thinking_started:
@@ -564,7 +536,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         should_skip_output = True
                     elif not thinking_available:
                         should_skip_output = True
-                
+
                 # 2️⃣ 困惑度监控 (生成至少5个token后启用)
                 if step >= 5 and perplexity_threshold < 100.0:
                     should_stop, ppl = _check_perplexity_early_stop(next_logits, index, perplexity_threshold)
