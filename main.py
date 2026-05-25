@@ -1,13 +1,71 @@
+from typing import List, Tuple, Optional
+
 import sys
 
 import torch
-import torch.nn.functional as F
 
 from config import CONFIG
-from model import MainModel, compute_action_labels, ACTION_THINKING, ACTION_ANSWER, ACTION_END, TRANSITION_MASK
-from record import record_loss
+from model import MainModel
+from record import record_loss, evaluate_rl_readiness
 from tokenizer import TextTokenizer
 from rl import SelfRewardModel, LightweightPPO
+
+
+if hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8")
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ──────────────────────────────────────────────────────────
+# 安全的训练序列构建工具
+# ──────────────────────────────────────────────────────────
+
+def _build_train_sequence(
+    segments: List[Tuple[torch.Tensor | int, bool]],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """根据 (token/常量, is_target) 段列表构建 train_tensor 和 target_mask。
+
+    每个段为 (data, is_target)：
+      - data: 可以是 torch.Tensor（token 序列）或 int（单个特殊 token）
+      - is_target: True = 该段参与 loss 计算，False = 仅作为上下文
+
+    返回 (train_tensor, target_mask)，两者长度严格相等。
+    """
+    tensors: List[torch.Tensor] = []
+    masks: List[torch.Tensor] = []
+
+    for data, is_target in segments:
+        if isinstance(data, int):
+            t = torch.tensor([data], device=device, dtype=torch.long)
+        elif isinstance(data, torch.Tensor):
+            t = data.to(device=device, dtype=torch.long)
+        else:
+            raise TypeError(f"_build_train_sequence: unexpected segment type {type(data)}")
+
+        if t.numel() == 0:
+            continue
+
+        tensors.append(t)
+        masks.append(torch.full((t.numel(),), is_target, device=device, dtype=torch.bool))
+
+    if not tensors:
+        # 返回一个最小的哑元序列
+        dummy = torch.tensor([TextTokenizer.UNKNOWN_TOKEN], device=device, dtype=torch.long)
+        return dummy, torch.tensor([False], device=device, dtype=torch.bool)
+
+    train_tensor = torch.cat(tensors, dim=0)
+    target_mask = torch.cat(masks, dim=0)
+
+    assert target_mask.numel() == train_tensor.numel(), (
+        f"_build_train_sequence: mask len {target_mask.numel()} != train len {train_tensor.numel()}"
+    )
+    return train_tensor, target_mask
 
 if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8")
@@ -60,7 +118,7 @@ else:
     amp_dtype = torch.float32
 
 # 【修复】仅float16启用scaler，bfloat16无需缩放，避免梯度爆炸
-scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
+scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
 
 print(f"Using device: {device}", flush=True)
 print(f"AMP enabled: {use_amp}, AMP dtype: {amp_dtype}", flush=True)
@@ -80,16 +138,51 @@ optimizer = torch.optim.AdamW(
     foreach=torch.cuda.is_available(),
 )
 
-GRADIENT_ACCUMULATION_STEPS = 1
+GRADIENT_ACCUMULATION_STEPS = 4
 training_rounds = 0
 
 # 初始化自奖励模型和强化学习模块
 reward_model = SelfRewardModel(device)
 ppo_trainer = LightweightPPO(model, reward_model, device, learning_rate=1e-5)
- 
- 
 
 print("[Info] Self-reward model and RL modules initialized.", flush=True)
+
+# ── 强化学习自动就绪评估 ──
+# 系统根据训练损失的收敛状态自动判断是否启用 PPO，
+# 不再需要手动设置 rl_enabled 开关。
+rl_ready = False
+rl_ready_reason = ""
+rl_last_check_round = 0
+rl_check_interval = int(CONFIG.get("rl_check_interval", 200))
+
+
+def _update_rl_readiness(force: bool = False) -> bool:
+    """定期（或在强制时）重新评估 RL 就绪状态。"""
+    global rl_ready, rl_ready_reason, rl_last_check_round, training_rounds
+    if not force and (training_rounds - rl_last_check_round) < rl_check_interval:
+        return rl_ready
+
+    rl_last_check_round = training_rounds
+    new_ready, reason = evaluate_rl_readiness(
+        loss_threshold=float(CONFIG.get("rl_loss_threshold", 1.2)),
+        stability_window=int(CONFIG.get("rl_loss_stability_window", 5)),
+        stability_std_threshold=float(CONFIG.get("rl_loss_stability_std_threshold", 0.15)),
+        min_training_rounds=int(CONFIG.get("rl_min_training_rounds", 3000)),
+    )
+
+    if new_ready != rl_ready:
+        rl_ready = new_ready
+        rl_ready_reason = reason
+        if rl_ready:
+            print(f"[RL] {reason}", flush=True)
+        else:
+            print(f"[RL] 尚未就绪 — {reason}", flush=True)
+
+    return rl_ready
+
+
+# 启动时评估一次
+_update_rl_readiness(force=True)
 
 
 def auto_compress_trigger(history_tensor: torch.Tensor, attn_weights: torch.Tensor = None) -> bool:
@@ -110,63 +203,50 @@ def auto_compress_trigger(history_tensor: torch.Tensor, attn_weights: torch.Tens
 
 
 def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = None):
-    """准备单个样本的训练数据"""
+    """准备单个样本的训练数据（使用安全的段构建方式）"""
     if ask_text is None or answer_text is None:
         return None, None, None
-    
+
     ask_tensor = TextTokenizer.encode(ask_text).to(device)
     answer_tensor = TextTokenizer.encode(answer_text).to(device)
-    
+
     if answer_tensor.numel() == 0:
         return None, None, None
 
+    segments: list = []
+
     if hist_context is not None and hist_context.strip():
         history_tensor = TextTokenizer.encode(hist_context).to(device)
-        
+
         if auto_compress_trigger(history_tensor):
             compressed_hist = model.compress_history_vectors(history_tensor)
             history_tensor = torch.argmax(model.output_linear(compressed_hist), dim=-1)
-        
-        train_tensor = torch.cat(
-            [
-                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                history_tensor,
-                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-                torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
-                ask_tensor,
-                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                answer_tensor,
-                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-            ]
-        )
-        non_target_len = 1 + history_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1
-        target_mask = torch.cat([
-            torch.zeros(non_target_len, dtype=torch.bool, device=device),
-            torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
-        ])
-        assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
+
+        segments = [
+            (TextTokenizer.START_GENERATION_TOKEN, False),
+            (history_tensor, False),
+            (TextTokenizer.END_GENERATION_TOKEN, False),
+            (TextTokenizer.HISTORY_CONTEXT_START_TOKEN, False),
+            (ask_tensor, False),
+            (TextTokenizer.START_GENERATION_TOKEN, False),
+            (answer_tensor, True),
+            (TextTokenizer.END_GENERATION_TOKEN, True),
+        ]
         preview = torch.cat(
             [answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device)]
         )
     else:
-        train_tensor = torch.cat(
-            [
-                ask_tensor,
-                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                answer_tensor,
-                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-            ]
-        )
-        target_mask = torch.cat(
-            [
-                torch.zeros(ask_tensor.numel() + 1, dtype=torch.bool, device=device),
-                torch.ones(answer_tensor.numel() + 1, dtype=torch.bool, device=device),
-            ]
-        )
+        segments = [
+            (ask_tensor, False),
+            (TextTokenizer.START_GENERATION_TOKEN, False),
+            (answer_tensor, True),
+            (TextTokenizer.END_GENERATION_TOKEN, True),
+        ]
         preview = torch.cat(
             [answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device)]
         )
-    
+
+    train_tensor, target_mask = _build_train_sequence(segments)
     return train_tensor, target_mask, preview
 
 
@@ -211,18 +291,16 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
 
         text_tensor = TextTokenizer.encode(answer).to(device)
         if text_tensor.numel() < 2:
-            train_tensor = torch.cat([
-                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                text_tensor,
-                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-            ])
-            target_mask = torch.ones(train_tensor.numel(), dtype=torch.bool, device=device)
-            preview = text_tensor
-            _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
-
-            # 【显存优化】训练后主动释放显存，解决泄漏问题
-            torch.cuda.empty_cache()
             return
+
+        train_tensor, target_mask = _build_train_sequence([
+            (TextTokenizer.START_GENERATION_TOKEN, True),
+            (text_tensor, True),
+            (TextTokenizer.END_GENERATION_TOKEN, True),
+        ])
+        preview = train_tensor
+        _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
+        return
 
     # QA训练模式
     print(f"\n---Train{RESET}", flush=True)
@@ -239,55 +317,33 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             
             if hist_context := history_context:
                 history_tensor = TextTokenizer.encode(hist_context).to(device)
-                train_tensor = torch.cat(
-                    [
-                        torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                        history_tensor,
-                        torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-                        torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
-                        ask_tensor,
-                        torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                        torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device),
-                        think_tensor,
-                        torch.tensor([TextTokenizer.THINK_END_TOKEN], device=device),
-                        answer_tensor,
-                        torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-                    ]
-                )
-                non_target_len = 1 + history_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1 + 1
-                target_len = think_tensor.numel() + 1 + answer_tensor.numel() + 1
-                target_mask = torch.cat([
-                    torch.zeros(non_target_len, dtype=torch.bool, device=device),
-                    torch.ones(target_len, dtype=torch.bool, device=device),
+                train_tensor, target_mask = _build_train_sequence([
+                    (TextTokenizer.START_GENERATION_TOKEN, False),
+                    (history_tensor, False),
+                    (TextTokenizer.END_GENERATION_TOKEN, False),
+                    (TextTokenizer.HISTORY_CONTEXT_START_TOKEN, False),
+                    (ask_tensor, False),
+                    (TextTokenizer.START_GENERATION_TOKEN, False),
+                    (TextTokenizer.THINK_START_TOKEN, False),
+                    (think_tensor, True),
+                    (TextTokenizer.THINK_END_TOKEN, True),
+                    (answer_tensor, True),
+                    (TextTokenizer.END_GENERATION_TOKEN, True),
                 ])
-                assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
                 preview = torch.cat([think_tensor, answer_tensor])
                 _run_train_step(train_tensor, target_mask, preview, show_preview=False)
-                
-                torch.cuda.empty_cache()
             else:
-                train_tensor = torch.cat(
-                    [
-                        ask_tensor,
-                        torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                        torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device),
-                        think_tensor,
-                        torch.tensor([TextTokenizer.THINK_END_TOKEN], device=device),
-                        answer_tensor,
-                        torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-                    ]
-                )
-                non_target_len = ask_tensor.numel() + 1 + 1
-                target_len = think_tensor.numel() + 1 + answer_tensor.numel() + 1  # think + THINK_END + answer + END
-                target_mask = torch.cat([
-                    torch.zeros(non_target_len, dtype=torch.bool, device=device),
-                    torch.ones(target_len, dtype=torch.bool, device=device),
+                train_tensor, target_mask = _build_train_sequence([
+                    (ask_tensor, False),
+                    (TextTokenizer.START_GENERATION_TOKEN, False),
+                    (TextTokenizer.THINK_START_TOKEN, False),
+                    (think_tensor, True),
+                    (TextTokenizer.THINK_END_TOKEN, True),
+                    (answer_tensor, True),
+                    (TextTokenizer.END_GENERATION_TOKEN, True),
                 ])
-                assert target_mask.numel() == train_tensor.numel(), f"target_mask length {target_mask.numel()} != train_tensor length {train_tensor.numel()}"
                 preview = torch.cat([think_tensor, answer_tensor])
                 _run_train_step(train_tensor, target_mask, preview, show_preview=False)
-                
-                torch.cuda.empty_cache()
             return
         
         print(f"{GREEN}{answer}{RESET}", flush=True)
@@ -295,34 +351,77 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         if train_tensor is None:
             return
         _run_train_step(train_tensor, target_mask, preview, show_preview=False)
-        
-        torch.cuda.empty_cache()
     
-    # 自奖励评估和PPO强化学习（静默进行，不影响原有训练）
-    try:
-        reward_model.compute_total_reward(
-            think_text=think,
-            answer_text=answer,
-            context=history_context
-        )
+    # 自奖励评估 —— 根据训练收敛状态自动启用
+    if _update_rl_readiness():
+        try:
+            reward_model.compute_total_reward(
+                think_text=think,
+                answer_text=answer,
+                context=history_context
+            )
+            ppo_trainer.collect_episode(
+                prompt=ask if ask else "",
+                think_text=think if think else "",
+                answer_text=answer if answer else "",
+                context=history_context
+            )
+            if training_rounds > 0 and (training_rounds % 4) == 0:
+                ppo_trainer.update_policy(batch_size=4)
+        except Exception as e:
+            print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
+
+
+def _apply_top_k_top_p(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
+    """Top-K + Top-P 组合采样 (业界黄金标准)
+    
+    先用Top-K过滤极端低概率token，再用Top-P动态调整候选集大小。
+    """
+    # Top-K: 只保留概率最高的K个token
+    if 0 < top_k < logits.size(-1):
+        top_k_values, _ = torch.topk(logits, top_k)
+        threshold = top_k_values[..., -1]
+        logits = torch.where(logits < threshold, torch.full_like(logits, float("-inf")), logits)
+    
+    # Top-P (Nucleus): 保留累积概率达到P的最小集合
+    if 0.0 < top_p < 1.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+        cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
         
-        # 收集episode数据
-        ppo_trainer.collect_episode(
-            prompt=ask if ask else "",
-            think_text=think if think else "",
-            answer_text=answer if answer else "",
-            context=history_context
-        )
+        # 标记需要移除的token
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = False
         
-        # 定期更新PPO策略
-        if training_rounds > 0 and (training_rounds % 4) == 0:
-            ppo_trainer.update_policy(batch_size=4)
-    except Exception as e:
-        pass  # 静默处理错误，不影响原有训练
+        # 反向映射到原始顺序
+        indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
+        logits = torch.where(indices_to_remove, torch.full_like(logits, float("-inf")), logits)
+    
+    return logits
+
+
+def _check_perplexity_early_stop(logits: torch.Tensor, selected_token: int, threshold: float) -> tuple[bool, float]:
+    """精简版困惑度监控：计算当前步困惑度，超过阈值则建议停止
+    
+    原理: perplexity = exp(-log(prob))，反映模型对当前选择的"确定程度"
+    - 困惑度低: 模型很确定，生成质量高
+    - 困惑度高: 模型不确定，可能开始胡言乱语
+    
+    Returns:
+        (should_stop: bool, perplexity: float)
+    """
+    probs = torch.softmax(logits, dim=-1)
+    token_prob = probs[selected_token]
+    # 计算困惑度: PPL = exp(-log(P(token)))
+    perplexity = torch.exp(-torch.log(token_prob + 1e-10)).item()
+    
+    # 超过阈值则建议停止
+    should_stop = perplexity > threshold
+    return should_stop, perplexity
 
 
 def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
-    """生成函数
+    """生成函数 (精简增强版: Top-K + Top-P + 困惑度早停)
     
     Args:
         text: 输入文本/问题
@@ -367,380 +466,103 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
     print("\n---Generated reply:", flush=True)
 
-    # 最小生成 tokens
-    min_new_tokens = max(4, int(CONFIG.get("min_generate_tokens", 4)))
+    min_new_tokens = 1
     if max_generate_tokens is not None:
-        max_generate_tokens = max(min_new_tokens + 1, int(max_generate_tokens))
-
-    # 状态机：跟踪当前行动状态
-    prev_action = ACTION_THINKING  # 初始状态假设为思考
-    thinking_steps = 0             # 当前思考块已累积的步数（防止空块+死锁）
-    max_thinking_steps = int(CONFIG.get("max_thinking_steps", 200))
-    action_temperature = float(CONFIG.get("action_temperature", 0.5))
-    _TAG_CHARS = frozenset({'<', '>', '/', '《', '》'})
-    # 解码参数（反退化生成）
-    llm_temperature = float(CONFIG.get("temperature", 0.7))
-    rep_penalty = float(CONFIG.get("repetition_penalty", 1.15))
-    top_k = int(CONFIG.get("top_k", 50))
-    top_p = float(CONFIG.get("top_p", 0.9))
-    generated_ids: list[int] = []  # 历史 token 用于重复惩罚
-    # 转移掩码（log 域，0=禁止 → -inf）
-    _trans_mask = torch.tensor(TRANSITION_MASK, device=device, dtype=torch.float32)
-    _trans_mask = torch.where(_trans_mask > 0.5, torch.tensor(0.0, device=device),
-                              torch.tensor(float('-inf'), device=device))
+        max_generate_tokens = max(1, int(max_generate_tokens))
     
+    # 读取采样参数
+    top_k = int(CONFIG.get("top_k", 0))
+    top_p = float(CONFIG.get("top_p", 1.0))
+    perplexity_threshold = float(CONFIG.get("perplexity_threshold", 999.0))  # 默认不启用
+ 
     with torch.inference_mode():
+        thinking_started = False
         if thinking_available:
             has_think_token = (prompt == TextTokenizer.THINK_START_TOKEN).any()
-            if not has_think_token:
+            if has_think_token:
+                thinking_started = True
+            else:
+                thinking_started = True
                 think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
                 prompt = torch.cat([prompt, think_start_tensor])
         
         result = model(prompt, use_cache=True)
         if isinstance(result, tuple):
-            if len(result) == 4:
-                logits, action_logits, value_preds, past_key_values = result
-            elif len(result) == 3:
-                logits, action_logits, value_preds = result
-                past_key_values = None
-            else:
-                logits = result[0]
-                action_logits = result[1] if len(result) > 1 else None
-                value_preds = result[2] if len(result) > 2 else None
-                past_key_values = None
+            logits, past_key_values = result
         else:
             logits = result
-            action_logits = None
-            value_preds = None
-            past_key_values = None
 
         step = 0
         
         while max_generate_tokens is None or step < max_generate_tokens:
             try:
-                # ====================================================
-                # 阶段1: Action Head 采样决策（主动控制）
-                # ====================================================
-                do_think_jump = False      # 是否强制跳转思考/回答
-                force_token = None          # 强制注入的 token
-                force_token_reason = ""     # 调试用
-
-                if action_logits is not None:
-                    act_all = action_logits[-1].float()  # [4] -> [THINK, ANSWER, END, TERM]
-                    act_logit = act_all[:3]
-                    term_logit = act_all[3]
-                    # 应用状态转移掩码：禁止非法转移（仅作用于前三个 action logits）
-                    act_logit = act_logit + _trans_mask[prev_action]
-                    # 采样行动概率
-                    act_probs = torch.softmax(act_logit / action_temperature, dim=-1)
-
-                    # 在最小生成步数内禁止 END
-                    if step < min_new_tokens:
-                        act_probs = act_probs.clone()
-                        act_probs[ACTION_END] = 0.0
-                        if act_probs.sum() > 0:
-                            act_probs = act_probs / act_probs.sum()
-                        else:
-                            act_probs = torch.tensor([0.5, 0.5, 0.0], device=act_probs.device)
-
-                    sampled_action = int(torch.multinomial(act_probs, 1).item())
-                    # 记录 action 采样对数概率与动作，用于 PPO 后续更新
-                    try:
-                        logp = torch.log(act_probs[sampled_action].clamp_min(1e-12))
-                        if 'ppo_trainer' in globals():
-                            try:
-                                ppo_trainer.episode_data['log_probs'].append(logp)
-                                ppo_trainer.episode_data['actions'].append(sampled_action)
-                                # 记录简要状态（可选）：使用提示末尾的若干 token id
-                                try:
-                                    if 'prompt' in locals():
-                                        ppo_trainer.episode_data['states'].append(prompt[-16:].cpu().tolist() if isinstance(prompt, torch.Tensor) else str(prompt)[-64:])
-                                except Exception:
-                                    try:
-                                        ppo_trainer.episode_data['states'].append(str(prompt)[-64:])
-                                    except Exception:
-                                        ppo_trainer.episode_data['states'].append([])
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-
-                    # === 行动注入逻辑（支持多段 THINK/ANSWER） ===
-                    if sampled_action == ACTION_THINKING:
-                        if prev_action != ACTION_THINKING:
-                            # 从回答/初始 -> 思考：注入 THINK_START
-                            do_think_jump = True
-                            force_token = TextTokenizer.THINK_START_TOKEN
-                            thinking_steps = 0
-                    elif sampled_action == ACTION_ANSWER:
-                        if prev_action == ACTION_THINKING:
-                            # 从思考 -> 回答：注入 THINK_END
-                            do_think_jump = True
-                            force_token = TextTokenizer.THINK_END_TOKEN
-                        # 如果已经在 ANSWER 状态，则继续输出回答，不注入特殊 token
-                    elif sampled_action == ACTION_END and step >= min_new_tokens:
-                        force_token = TextTokenizer.END_GENERATION_TOKEN
-                        force_token_reason = "→END"
-
-                    # 更新状态（END 不改变 prev_action，END 会直接结束）
-                    if sampled_action != ACTION_END:
-                        prev_action = sampled_action
-
-                # ====================================================
-                # 阶段2: 执行生成（主语言模型）
-                # ====================================================
-                if force_token == TextTokenizer.END_GENERATION_TOKEN:
-                    break
-
-                if do_think_jump and force_token is not None:
-                    # 主动注入特殊 token（THINK_START / THINK_END）
-                    # 对于 THINK_START: 先进行短时规划（多候选采样 + reward 打分），选择最佳思路并一次性注入
-                    if force_token == TextTokenizer.THINK_START_TOKEN:
-                        # 使用 Tree-of-Thoughts 搜索替代短时规划器
-                        try:
-                            prompt_str = (history_context + "\n" + text) if history_context else text
-                            tot_iters = int(CONFIG.get('tot_iterations', 20))
-                            best_text, best_reward, breakdown = tree_search.search(prompt=prompt_str, context=history_context, max_iterations=tot_iters, thinking_available=thinking_available)
-                            if best_text and len(best_text) > 0:
-                                candidate_ids = TextTokenizer.encode(best_text).to(device)
-                                inject_seq = [force_token] + candidate_ids.tolist() + [TextTokenizer.THINK_END_TOKEN]
-                            else:
-                                inject_seq = [force_token]
-                        except Exception:
-                            inject_seq = [force_token]
-
-                        inject_tensor = torch.tensor(inject_seq, device=device)
-                        result = model(inject_tensor, past_key_values=past_key_values, use_cache=True)
-                        if isinstance(result, tuple):
-                            if len(result) == 4:
-                                logits, action_logits, value_preds, past_key_values = result
-                            elif len(result) == 3:
-                                logits, action_logits, value_preds = result
-                                past_key_values = None
-                            else:
-                                logits = result[0]
-                                action_logits = result[1] if len(result) > 1 else None
-                                value_preds = result[2] if len(result) > 2 else None
-                                past_key_values = None
-                        else:
-                            logits = result
-                            action_logits = None
-                        # 注入不消耗 step，继续下一步循环
-                        continue
-
-                    else:
-                        # THINK_END 或其他 token 简单注入
-                        inject_token = torch.tensor([force_token], device=device)
-                        result = model(inject_token, past_key_values=past_key_values, use_cache=True)
-                        if isinstance(result, tuple):
-                            if len(result) == 4:
-                                logits, action_logits, value_preds, past_key_values = result
-                            elif len(result) == 3:
-                                logits, action_logits, value_preds = result
-                                past_key_values = None
-                            else:
-                                logits = result[0]
-                                action_logits = result[1] if len(result) > 1 else None
-                                value_preds = result[2] if len(result) > 2 else None
-                                past_key_values = None
-                        else:
-                            logits = result
-                            action_logits = None
-                        continue
-
-                # 正常采样下一个 token（含重复惩罚 + Top-K + Top-P）
-                next_logits = logits[-1].clone()
+                next_logits = logits[-1]
                 if step < min_new_tokens:
+                    next_logits = next_logits.clone()
                     next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
 
-                # 1) 重复惩罚：已生成过的 token 降低概率
-                if rep_penalty != 1.0 and generated_ids:
-                    for past_id in set(generated_ids):
-                        score = next_logits[past_id].item()
-                        if score > 0:
-                            next_logits[past_id] = score / rep_penalty
-                        else:
-                            next_logits[past_id] = score * rep_penalty
+                # 1️⃣ 应用 Top-K + Top-P 组合采样
+                if top_k > 0 or top_p < 1.0:
+                    next_logits = _apply_top_k_top_p(next_logits, top_k, top_p)
 
-                # 2) Top-K 过滤
-                if top_k > 0 and top_k < next_logits.size(-1):
-                    kth = torch.topk(next_logits, top_k)[0][-1]
-                    next_logits[next_logits < kth] = float('-inf')
-
-                # 3) 温度缩放 + softmax
-                probs = torch.softmax(next_logits / llm_temperature, dim=-1)
-                probs = torch.nan_to_num(probs, nan=0.0)
-
-                # 4) Top-P (Nucleus) 过滤
-                if top_p < 1.0:
-                    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                    cumsum = torch.cumsum(sorted_probs, dim=-1)
-                    mask = cumsum > top_p
-                    mask[1:] = mask[:-1].clone()  # 至少保留一个
-                    mask[0] = False
-                    to_remove = torch.zeros_like(probs, dtype=torch.bool)
-                    to_remove.scatter_(dim=-1, index=sorted_indices[mask], src=torch.ones_like(sorted_indices[mask], dtype=torch.bool))
-                    probs[to_remove] = 0.0
-                    probs = probs / (probs.sum(dim=-1, keepdim=True).clamp(min=1e-8))
-
+                probs = torch.softmax(next_logits / CONFIG["temperature"], dim=-1)
                 index = int(torch.multinomial(probs, 1).item())
-                generated_ids.append(index)
 
-                # 累积思考步数（在特殊 token 跳过之前更新）
-                if prev_action == ACTION_THINKING:
-                    thinking_steps += 1
-                else:
-                    thinking_steps = 0
-
-                # 特殊 token 静默跳过 —— 同步 prev_action
-                if index in (TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN,
-                             TextTokenizer.HISTORY_CONTEXT_START_TOKEN, TextTokenizer.HISTORY_CONTEXT_END_TOKEN,
-                             TextTokenizer.START_GENERATION_TOKEN):
-                    if index == TextTokenizer.THINK_START_TOKEN:
-                        prev_action = ACTION_THINKING  # LM 自己生成 THINK_START → 同步
-                    elif index == TextTokenizer.THINK_END_TOKEN:
-                        prev_action = ACTION_ANSWER     # LM 自己生成 THINK_END → 同步
-                    next_token = torch.tensor([index], device=device)
-                    result = model(next_token, past_key_values=past_key_values, use_cache=True)
-                    if isinstance(result, tuple):
-                        if len(result) == 4:
-                            logits, action_logits, value_preds, past_key_values = result
-                        elif len(result) == 3:
-                            logits, action_logits, value_preds = result
-                            past_key_values = None
-                        else:
-                            logits = result[0]
-                            action_logits = result[1] if len(result) > 1 else None
-                            value_preds = result[2] if len(result) > 2 else None
-                            past_key_values = None
+                should_skip_output = False
+                
+                if index == TextTokenizer.THINK_END_TOKEN:
+                    if thinking_available and thinking_started:
+                        thinking_started = False
+                        print(f"{RESET}\n", end="", flush=True)
+                        should_skip_output = True
                     else:
-                        logits = result
-                        action_logits = None
-                    step += 1
-                    continue
-
-                if index == TextTokenizer.END_GENERATION_TOKEN:
+                        break
+                
+                elif index == TextTokenizer.END_GENERATION_TOKEN:
                     break
 
-                # 颜色：直接使用当前行动状态
-                current_color = BLUE if prev_action == ACTION_THINKING else GREEN
-
-                decoded_piece = TextTokenizer.decode(torch.tensor([index]))
-                if decoded_piece and decoded_piece in _TAG_CHARS:
-                    decoded_piece = ""
-                if decoded_piece:
-                    print(f"{current_color}{decoded_piece}{RESET}", end="", flush=True)
-                    output_text += decoded_piece
+                elif index == TextTokenizer.THINK_START_TOKEN:
+                    if thinking_available and not thinking_started:
+                        thinking_started = True
+                        should_skip_output = True
+                    elif not thinking_available:
+                        should_skip_output = True
+                
+                # 2️⃣ 困惑度监控 (生成至少5个token后启用)
+                if step >= 5 and perplexity_threshold < 100.0:
+                    should_stop, ppl = _check_perplexity_early_stop(next_logits, index, perplexity_threshold)
+                    if should_stop:
+                        print(f"\n[Stop] 困惑度过高(PPL={ppl:.1f}>{perplexity_threshold:.1f})，提前结束", flush=True)
+                        break
+                
+                if not should_skip_output:
+                    decoded_piece = TextTokenizer.decode(torch.tensor([index]))
+                    
+                    if decoded_piece:
+                        if thinking_started:
+                            print(f"{BLUE}{decoded_piece}{RESET}", end="", flush=True)
+                        else:
+                            print(f"{GREEN}{decoded_piece}{RESET}", end="", flush=True)
+                        
+                        output_text += decoded_piece
 
                 next_token = torch.tensor([index], device=device)
-                result = model(next_token, past_key_values=past_key_values, use_cache=True)
+                result = model(
+                    next_token,
+                    past_key_values=past_key_values,
+                    use_cache=True,
+                )
                 if isinstance(result, tuple):
-                    if len(result) == 4:
-                        logits, action_logits, value_preds, past_key_values = result
-                    elif len(result) == 3:
-                        logits, action_logits, value_preds = result
-                        past_key_values = None
-                    else:
-                        logits = result[0]
-                        action_logits = result[1] if len(result) > 1 else None
-                        value_preds = result[2] if len(result) > 2 else None
-                        past_key_values = None
+                    logits, past_key_values = result
                 else:
                     logits = result
-                    action_logits = None
-                    value_preds = None
                 
                 step += 1
             except Exception as e:
                 print(f"Error during generation: {e}", flush=True)
                 break
         
-        with torch.inference_mode():
-            torch.cuda.empty_cache()
-        
         return output_text
-
-
-def train_dynamic(ask: str, response: str, history_context: str = None) -> float:
-    """动态格式训练：response 可包含多段 <think>...内容...</think>交替。
-    
-    自动将文本中的 <think> 和 </think> 替换为特殊 token ID (5=THINK_START, 6=THINK_END)。
-    例如 response = "<think>先算12*15</think>12*15=180.<think>再算一半</think>90."
-    """
-    ask = str(ask).strip() if ask else ""
-    response = str(response).strip() if response else ""
-    if not ask or not response:
-        return float('inf')
-
-    model.train()
-
-    ask_tensor = TextTokenizer.encode(ask).to(device)
-
-    # 手动解析 <think> 和 </think> 标签 → 替换为特殊 token ID
-    resp_list = []
-    i = 0
-    n = len(response)
-    TAG_THINK = '<think>'
-    TAG_THINK_END = '</think>'
-    while i < n:
-        if response[i:].startswith(TAG_THINK):
-            resp_list.append(TextTokenizer.THINK_START_TOKEN)
-            i += len(TAG_THINK)
-        elif response[i:].startswith(TAG_THINK_END):
-            resp_list.append(TextTokenizer.THINK_END_TOKEN)
-            i += len(TAG_THINK_END)
-        else:
-            ch = response[i]
-            idx = ord(ch)
-            if TextTokenizer._is_valid_token(idx) and 0 <= idx < int(CONFIG["dict_size"]):
-                resp_list.append(idx)
-            else:
-                resp_list.append(TextTokenizer.UNKNOWN_TOKEN)
-            i += 1
-
-    if not resp_list:
-        return float('inf')
-    resp_tensor = torch.tensor(resp_list, dtype=torch.long, device=device)
-
-    if ask_tensor.numel() == 0 or resp_tensor.numel() == 0:
-        return float('inf')
-
-    if history_context and history_context.strip():
-        hist_tensor = TextTokenizer.encode(history_context).to(device)
-        if auto_compress_trigger(hist_tensor):
-            compressed_hist = model.compress_history_vectors(hist_tensor)
-            hist_tensor = torch.argmax(model.output_linear(compressed_hist), dim=-1)
-        train_tensor = torch.cat([
-            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-            hist_tensor,
-            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-            torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
-            ask_tensor,
-            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-            resp_tensor,
-            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-        ])
-        non_target_len = 1 + hist_tensor.numel() + 1 + 1 + ask_tensor.numel() + 1
-    else:
-        train_tensor = torch.cat([
-            ask_tensor,
-            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-            resp_tensor,
-            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-        ])
-        non_target_len = ask_tensor.numel() + 1
-
-    target_len = resp_tensor.numel() + 1
-    target_mask = torch.cat([
-        torch.zeros(non_target_len, dtype=torch.bool, device=device),
-        torch.ones(target_len, dtype=torch.bool, device=device),
-    ])
-    assert target_mask.numel() == train_tensor.numel(), \
-        f"mask len {target_mask.numel()} != train len {train_tensor.numel()}"
-
-    loss_val = _run_train_step(train_tensor, target_mask, resp_tensor, show_preview=False)
-    torch.cuda.empty_cache()
-    return loss_val
 
 
 def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, show_preview: bool = True, preview_color: str = None) -> float:
@@ -767,13 +589,15 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         result = model(train_tensor, use_cache=False)
         if isinstance(result, tuple):
             logits = result[0]
-            action_logits = result[1]
         else:
             logits = result
-            action_logits = None
 
-        # === 语言模型损失 (next-token prediction) ===
+        # 应用目标掩码并进行 next-token prediction 对齐
+        # 对于 next-token prediction，targets 应该是 train_tensor 右移一位
+        # 确保 logits 和 targets 长度相同
         if len(train_tensor) > 1:
+            # 正确的 next-token prediction 对齐
+            # logits 对应位置 i，targets 对应位置 i+1
             masked_logits = logits[:-1][target_mask[1:]]
             masked_targets = train_tensor[1:][target_mask[1:]]
             
@@ -789,46 +613,20 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                     print(f"[Warning] NaN or Inf detected in targets, skipping this step", flush=True)
                     return float('inf')
                 
-                lm_loss = loss_func(masked_logits, masked_targets)
+                loss = loss_func(masked_logits, masked_targets)
                 
-                if torch.isnan(lm_loss):
+                if torch.isnan(loss):
                     print(f"[Warning] NaN loss detected, skipping this step", flush=True)
                     return float('inf')
             else:
-                lm_loss = torch.tensor(0.0, device=device)
+                loss = torch.tensor(0.0, device=device)
         else:
-            lm_loss = torch.tensor(0.0, device=device)
-        
-        loss = lm_loss
-
-        # === 行动头损失 (hard label cross-entropy) ===
-        if action_logits is not None:
-            # 生成硬标签：compute_action_labels 返回 [seq_len, 3] 软标签
-            # 取 argmax 转为硬标签 [seq_len]
-            action_labels_soft = compute_action_labels(
-                train_tensor,
-                think_start_id=TextTokenizer.THINK_START_TOKEN,
-                think_end_id=TextTokenizer.THINK_END_TOKEN,
-                end_id=TextTokenizer.END_GENERATION_TOKEN,
-                temperature=float(CONFIG.get("action_label_temperature", 0.5)),
-            )
-            # 对齐: action_logits[:-1] 对应 action_labels[1:] (next-token prediction)
-            act_logits_aligned = action_logits[:-1, :3]  # [seq_len-1, 3]
-            mask = target_mask[1:]
-            # 使用软标签的 KL 散度作为行动损失（对模型输出的 log_probs 与目标分布匹配）
-            if mask.any():
-                act_logits_masked = act_logits_aligned[mask]  # [N, 3]
-                act_target_dist = action_labels_soft[1:][mask].float()  # [N, 3]
-                logp = F.log_softmax(act_logits_masked.float(), dim=-1)
-                action_ce_loss = F.kl_div(logp, act_target_dist, reduction='batchmean')
-                action_coef = float(CONFIG.get("action_loss_coef", 0.3))
-                action_loss = action_coef * action_ce_loss
-                loss = loss + action_loss
-                if not torch.isnan(action_ce_loss) and not torch.isinf(action_ce_loss):
-                    record_loss(action_ce_loss.item())
+            loss = torch.tensor(0.0, device=device)
         
         # 【修复】损失缩放，适配梯度累积
         loss = loss / GRADIENT_ACCUMULATION_STEPS
+        
+        record_loss(loss.item())
 
     # 检查损失是否有效
     if not torch.isnan(loss) and not torch.isinf(loss):

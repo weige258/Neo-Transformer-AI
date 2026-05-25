@@ -9,21 +9,6 @@ from torch.utils.checkpoint import checkpoint
 
 from config import CONFIG
 
-# === 行动智能头常量 ===
-ACTION_THINKING = 0  # 思考中
-ACTION_ANSWER = 1    # 回答中
-ACTION_END = 2       # 结束
-
-# 状态转移掩码矩阵：1=允许，0=禁止
-# 行=当前状态，列=下一状态
-#        T   A   E
-# 允许更灵活的多段思考/回答序列（例如：T→T→A→T→A→A→E）
-TRANSITION_MASK = [
-    [1.0, 1.0, 1.0],  # THINKING → (T, A, E)
-    [1.0, 1.0, 1.0],  # ANSWER   → (T, A, E)
-    [0.0, 0.0, 1.0],  # END      → (T, A, E)
-]
-
 
 CompressedKVCache = tuple[
     torch.Tensor,
@@ -69,8 +54,17 @@ class RotaryPositionEmbedding(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """交错式 (interleaved) RoPE 半旋转变换。
+
+    对于输入 [x0, x1, x2, x3, ...]，返回 [-x1, x0, -x3, x2, ...]。
+    这与 RotaryPositionEmbedding 中 torch.cat((freqs, freqs), dim=-1) 的
+    频率布局一致（每对相邻维度共享同一频率）。
+
+    注意：这是 LLaMA 风格的交错布局，不是 GPT-NeoX 的 split 布局。
+    """
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
+    # stack + flatten 保持最后一维长度不变
     return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
 
 
@@ -199,6 +193,11 @@ class CompressedSparseDynamicAttention(nn.Module):
     ) -> torch.Tensor:
         batch, heads, q_len, dim = q.shape
         k_len = k.size(-2)
+
+        # 边界情况：没有可注意的 key，返回零张量
+        if k_len == 0:
+            return torch.zeros(batch, heads, q_len, dim, device=q.device, dtype=q.dtype)
+
         outputs = []
         offsets = torch.arange(
             -self.window_size + 1,
@@ -206,22 +205,40 @@ class CompressedSparseDynamicAttention(nn.Module):
             device=q.device,
             dtype=torch.long,
         )
+        # 预计算一次 window_size
+        ws = self.window_size
 
         for start in range(0, q_len, self.chunk_size):
             end = min(start + self.chunk_size, q_len)
             q_chunk = q[:, :, start:end, :]
-            q_abs = torch.arange(q_start_pos + start, q_start_pos + end, device=q.device)
-            rel_idx = q_abs[:, None] + offsets[None, :] - k_start_pos
-            valid = (rel_idx >= 0) & (rel_idx < k_len)
-            gather_idx = rel_idx.clamp(0, max(k_len - 1, 0)).reshape(-1)
+            chunk_len = end - start
+            q_abs = torch.arange(q_start_pos + start, q_start_pos + end, device=q.device, dtype=torch.long)
+            rel_idx = q_abs[:, None] + offsets[None, :] - k_start_pos  # (chunk_len, ws)
+            valid = (rel_idx >= 0) & (rel_idx < k_len)  # (chunk_len, ws)
 
+            # 安全 clamp 到 [0, k_len-1]，避免 index_select 越界
+            gather_idx = rel_idx.clamp(0, k_len - 1).reshape(-1)  # (chunk_len * ws,)
+            # 使用 torch.long 确保 index_select 正确
+            gather_idx = gather_idx.to(torch.long)
+
+            # index_select 沿 dim=2 选取 → (batch, heads, chunk_len*ws, dim)
             selected_k = k.index_select(dim=2, index=gather_idx)
             selected_v = v.index_select(dim=2, index=gather_idx)
-            selected_k = selected_k.view(batch, heads, end - start, self.window_size, dim)
-            selected_v = selected_v.view(batch, heads, end - start, self.window_size, dim)
+
+            # 安全检查：确保形状匹配
+            expected_gather = chunk_len * ws
+            if selected_k.size(2) != expected_gather:
+                raise RuntimeError(
+                    f"_attend_local_window shape mismatch: "
+                    f"selected_k dim2={selected_k.size(2)}, expected={expected_gather}, "
+                    f"k_len={k_len}, chunk_len={chunk_len}, ws={ws}"
+                )
+
+            selected_k = selected_k.view(batch, heads, chunk_len, ws, dim)
+            selected_v = selected_v.view(batch, heads, chunk_len, ws, dim)
 
             scores = (q_chunk.unsqueeze(-2) * selected_k).sum(dim=-1) / math.sqrt(dim)
-            scores = scores.masked_fill(~valid.view(1, 1, end - start, self.window_size), float("-inf"))
+            scores = scores.masked_fill(~valid.view(1, 1, chunk_len, ws), float("-inf"))
             weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
             weights = torch.nan_to_num(weights, nan=0.0)
             outputs.append((weights.unsqueeze(-1) * selected_v).sum(dim=-2))
@@ -239,19 +256,28 @@ class CompressedSparseDynamicAttention(nn.Module):
         if mem_k.size(-2) == 0:
             return torch.zeros_like(q)
 
+        q_len = q.size(-2)
+        mem_len = mem_k.size(-2)
         scores = torch.matmul(q, mem_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         scores = scores + self.memory_gate(mem_k).transpose(-2, -1)
-        q_pos = torch.arange(q_start_pos, q_start_pos + q.size(-2), device=q.device)[:, None]
+        q_pos = torch.arange(q_start_pos, q_start_pos + q_len, device=q.device, dtype=torch.long)[:, None]
         scores = scores.masked_fill(mem_pos[None, :] > q_pos, float("-inf"))
 
-        topk = min(self.dynamic_topk, mem_k.size(-2))
-        top_scores, top_idx = torch.topk(scores, k=topk, dim=-1)
+        topk = min(self.dynamic_topk, mem_len)
+        if topk == 0:
+            return torch.zeros_like(q)
+        top_scores, top_idx = torch.topk(scores, k=topk, dim=-1)  # (batch, heads, q_len, topk)
         weights = torch.softmax(top_scores.float(), dim=-1).to(q.dtype)
         weights = torch.nan_to_num(weights, nan=0.0)
 
-        value_bank = mem_v.unsqueeze(2).expand(-1, -1, q.size(-2), -1, -1)
+        # 使用 torch.gather 安全地从 mem_v 中选取 top-k 位置
+        # mem_v: (batch, heads, mem_len, dim)
+        # 扩展为 (batch, heads, q_len, mem_len, dim)，在 dim=3(mem_len) 上 gather
+        value_bank = mem_v.unsqueeze(2).expand(-1, -1, q_len, -1, -1)
+        # top_idx: (batch, heads, q_len, topk) → (batch, heads, q_len, topk, dim)
         gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
         selected_v = torch.gather(value_bank, dim=3, index=gather_idx)
+        # selected_v: (batch, heads, q_len, topk, dim)
         return (weights.unsqueeze(-1) * selected_v).sum(dim=-2)
 
     def _build_cache(
@@ -407,124 +433,6 @@ class CompressedAttentionBlock(nn.Module):
         return x
 
 
-class ActionHead(nn.Module):
-    """行动智能头：从最终隐层状态预测 [思考, 回答, 结束] 行动。"""
-    def __init__(self, emb_size: int, hidden_dim: int = 128) -> None:
-        super().__init__()
-        self.fc1 = nn.Linear(emb_size, hidden_dim, bias=False)
-        self.fc2 = nn.Linear(hidden_dim, 3, bias=True)  # 3 actions: THINKING, ANSWER, END
-        # 置信/终止分支：输出单个标量，表示当前 token 的终止/置信度（可用于策略或 RL）
-        self.fc3 = nn.Linear(hidden_dim, 1, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch, seq_len, emb_size] or [seq_len, emb_size]
-        h = F.silu(self.fc1(x))
-        a_logits = self.fc2(h)
-        t_logit = self.fc3(h)
-        # Concatenate: last dim -> [THINK, ANSWER, END, TERM]
-        return torch.cat([a_logits, t_logit], dim=-1)  # [batch, seq_len, 4] or [seq_len, 4]
-
-
-def compute_action_labels(
-    tokens: torch.Tensor,
-    think_start_id: int = 5,
-    think_end_id: int = 6,
-    end_id: int = 2,
-    temperature: float = 0.5,
-) -> torch.Tensor:
-    """计算每个时间步的硬行动标签 [THINKING, ANSWER, END]。
-    
-    基于 token 序列中特殊标记位置生成硬标签（非软标签，避免模糊）：
-    - THINK_START ~ THINK_END 之间 → THINKING=1
-    - 连续思考区域之间的"中转间隙"（TE→TS 无需回答）→ THINKING=1
-    - 思考区域外（非中转）→ ANSWER=1
-    - 每个 END_GENERATION 位置 → END=1
-    """
-    seq_len = tokens.size(-1) if tokens.dim() > 1 else tokens.size(0)
-    device = tokens.device
-
-    labels = torch.zeros(seq_len, 3, device=device, dtype=torch.float32)
-
-    think_start_positions = (tokens == think_start_id).nonzero(as_tuple=True)[-1]
-    think_end_positions = (tokens == think_end_id).nonzero(as_tuple=True)[-1]
-    end_positions = (tokens == end_id).nonzero(as_tuple=True)[-1]
-
-    # --- 1) 构建思考区域列表（成对匹配，支持嵌套退化为平铺）---
-    # 简单栈匹配：每个 THINK_START 找其后的 THINK_END
-    think_regions = []  # [(start, end), ...]
-    te_idx = 0
-    for ts in think_start_positions:
-        # 找最近的未匹配 THINK_END
-        while te_idx < len(think_end_positions) and think_end_positions[te_idx] < ts:
-            te_idx += 1
-        if te_idx < len(think_end_positions):
-            te = think_end_positions[te_idx]
-            te_idx += 1
-            think_regions.append((ts.item(), te.item()))
-        else:
-            # 没有配对的 END，标记到序列末尾
-            think_regions.append((ts.item(), seq_len - 1))
-
-    # --- 3) 建立位置→区域映射 ---
-    # 先确定每个位置是否在某个思考区域内
-    in_think = torch.zeros(seq_len, device=device, dtype=torch.bool)
-    for s, e in think_regions:
-        in_think[s:e+1] = True
-
-    # --- 4) 检测"思考中转间隙" ---
-    # 标记短间隙（≤3 token）为中转：这允许模型在多个思考段之间存在短过渡
-    is_transition_gap = torch.zeros(seq_len, device=device, dtype=torch.bool)
-    for i in range(len(think_regions) - 1):
-        gap_start = think_regions[i][1] + 1  # 前一个区域的 TE + 1
-        gap_end = think_regions[i + 1][0]     # 后一个区域的 TS
-        gap_len = gap_end - gap_start
-        if 0 < gap_len <= 3:
-            is_transition_gap[gap_start:gap_end] = True
-
-    # --- 5) 标记 ANSWER 区域 ---
-    # 不在思考区域内且不是中转间隙 → ANSWER
-    is_answer = (~in_think) & (~is_transition_gap)
-
-    # --- 6) 计算各维标签 ---
-    # THINKING: 在思考区域内 + 中转间隙
-    think_weight = torch.zeros(seq_len, device=device)
-    think_weight[in_think] = 1.0
-    # 对中转间隙赋予较高的 thinking 倾向，以鼓励短暂的连续思考序列
-    think_weight[is_transition_gap] = 0.8
-
-    # ANSWER: 不在思考区域、不是中转间隙、不是 END
-    answer_weight = is_answer.float()
-
-    # END: 每个 END_GENERATION_TOKEN 位置
-    end_weight = torch.zeros(seq_len, device=device)
-    for ep in end_positions:
-        ep_idx = ep.item()
-        end_weight[ep_idx] = 1.0
-        # END 前 3 个位置开始渐入
-        fade_start = max(0, ep_idx - 3)
-        for fi in range(fade_start, ep_idx):
-            dist = (fi - fade_start) / max(ep_idx - fade_start, 1)
-            end_weight[fi] = max(end_weight[fi].item(), float(dist * dist))
-
-    # 确保每个位置标签和为 1
-    # 优先级: END > THINKING > ANSWER
-    labels[:, ACTION_END] = end_weight.clamp(0.0, 1.0)
-    remaining = 1.0 - end_weight
-    labels[:, ACTION_THINKING] = think_weight * remaining
-    labels[:, ACTION_ANSWER] = answer_weight * remaining
-
-    row_sum = labels.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-    labels = labels / row_sum
-
-    # 应用温度参数对标签做平滑处理，输出为软标签分布
-    temp = max(1e-6, float(temperature))
-    labels = torch.clamp(labels, min=1e-12)
-    # 通过 log + softmax 实现温度缩放，避免数值不稳定
-    labels = torch.softmax(torch.log(labels) / temp, dim=-1)
-
-    return labels  # [seq_len, 3]
-
-
 class MainModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -550,12 +458,6 @@ class MainModel(nn.Module):
         if bool(CONFIG.get("tie_token_embeddings", True)):
             self.output_linear.weight = self.token_embedding.weight
 
-        # === 行动智能头 ===
-        action_hidden = int(CONFIG.get("action_hidden_dim", 128))
-        self.action_head = ActionHead(emb_size, hidden_dim=action_hidden)
-        # === 价值头 (value head) 用于 PPO 的 value 预测 ===
-        self.value_head = nn.Linear(emb_size, 1, bias=True)
-
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -565,17 +467,6 @@ class MainModel(nn.Module):
         for module in self.modules():
             if isinstance(module, nn.Linear) and module.weight is not self.output_linear.weight:
                 nn.init.xavier_uniform_(module.weight)
-        # 初始化行动头
-        for name, param in self.action_head.named_parameters():
-            if 'weight' in name:
-                nn.init.xavier_uniform_(param)
-            elif 'bias' in name:
-                nn.init.zeros_(param)
-        # 初始化 value head
-        if hasattr(self, 'value_head'):
-            nn.init.xavier_uniform_(self.value_head.weight)
-            if self.value_head.bias is not None:
-                nn.init.zeros_(self.value_head.bias)
 
     def compress_history_vectors(
         self,
@@ -638,15 +529,9 @@ class MainModel(nn.Module):
                 else:
                     x = block(x)
 
-        hidden = self.final_norm(x)
-        logits = self.output_linear(hidden)
-        action_logits = self.action_head(hidden)
-        value_preds = self.value_head(hidden)
-        # squeeze batch dimension if input was 1D
+        logits = self.output_linear(self.final_norm(x))
         logits = logits.squeeze(0) if squeeze_batch else logits
-        action_logits = action_logits.squeeze(0) if squeeze_batch else action_logits
-        value_preds = value_preds.squeeze(0) if squeeze_batch else value_preds
 
         if use_cache:
-            return logits, action_logits, value_preds, next_key_values
-        return logits, action_logits, value_preds
+            return logits, next_key_values
+        return logits

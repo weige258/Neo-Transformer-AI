@@ -153,8 +153,11 @@ class WebCrawler:
                 
                 self.url_queue.task_done()
                 
+            except queue.Empty:
+                # 队列为空，正常等待
+                continue
             except Exception as e:
-                pass
+                logger.warning(f"爬虫工作线程异常: {e}", exc_info=True)
     
     def _get_headers(self):
         """获取反爬虫伪装请求头"""
@@ -290,7 +293,7 @@ class WebCrawler:
                 time.sleep(2)
                 
             except Exception as e:
-                pass
+                logger.warning(f"队列管理线程异常: {e}", exc_info=True)
     
     def _memory_cleaner(self):
         """内存清理线程 - 每10分钟清理一次所有成员数据"""
@@ -318,7 +321,7 @@ class WebCrawler:
                 print("【内存清理】完成\n", flush=True)
                 
             except Exception as e:
-                pass
+                logger.warning(f"内存清理线程异常: {e}", exc_info=True)
     
     def _add_to_cache(self, data):
         """将数据添加到缓存"""
@@ -395,8 +398,8 @@ class WebCrawler:
         # 等待所有任务完成
         try:
             self.executor.shutdown(wait=True, timeout=timeout)
-        except:
-            pass
+        except Exception:
+            logger.warning("线程池关闭超时，强制终止", exc_info=True)
     
     def __del__(self):
         """析构函数"""

@@ -1,34 +1,59 @@
 from typing import Any, Dict
 
 CONFIG: Dict[str, Any] = {
-    "dict_size": 60000,
-    "emb_size": 512,
-    "num_heads": 8,
-    "num_transformer_blocks": 8,
-    "attention_mix": {
-        "compressed": 2,
-        "sparse": 1.3,
-        "dynamic": 1,
+    # ═══════════════════════════════════════════════════════
+    # 1️⃣ 模型架构参数
+    # ═══════════════════════════════════════════════════════
+    "dict_size": 60000,              # 词表大小
+    "emb_size": 512,                 # 嵌入维度
+    "num_heads": 8,                  # 注意力头数
+    "num_transformer_blocks": 8,     # Transformer层数
+    "tie_token_embeddings": True,    # 绑定输入输出嵌入权重
+    "dropout": 0.05,                 # Dropout比率
+    
+    # ═══════════════════════════════════════════════════════
+    # 2️⃣ 注意力机制配置
+    # ═══════════════════════════════════════════════════════
+    "attention_mix": {               # 注意力混合权重
+        "compressed": 2,             # 压缩注意力权重
+        "sparse": 1.3,               # 稀疏注意力权重
+        "dynamic": 1,                # 动态注意力权重
     },
-    "sliding_window": 96,
-    "compress_stride": 16,
-    "dynamic_attention_topk": 16,
-    "attention_chunk_size": 64,
-    "tie_token_embeddings": True,
-    "dropout": 0.2,
-    "compress_trigger_len": 1200,
-    "compress_trigger_entropy": 0.7,
-    "compress_ratio": 0.3,
-    # === 解码策略（防止退化生成） ===
-    "temperature": 0.6,               # 温度：越高越随机（0.6→0.7）
-    "repetition_penalty": 1.2,        # 重复惩罚：>1 惩罚已生成 token
-    "top_k": 50,                       # Top-K 采样
-    "top_p": 0.9,                      # Top-P (Nucleus) 采样
-    "max_thinking_steps": 200,         # 思考块最大步数（防止死锁）
-    # === 行动智能头 (Action Head) ===
-    "action_loss_coef": 0.3,          # 行动损失权重
-    "action_label_temperature": 0.3,   # 标签温度
-    "action_temperature": 0.5,         # 生成时行动采样温度
-    "action_hidden_dim": 128,          # 行动头隐藏层维度
-    "min_generate_tokens": 4,          # 生成时最少 token 数
+    "sliding_window": 96,            # 滑动窗口大小
+    "attention_chunk_size": 64,      # 注意力块大小
+    "dynamic_attention_topk": 16,    # 动态注意力Top-K数量
+    
+    # ═══════════════════════════════════════════════════════
+    # 3️⃣ 历史上下文压缩
+    # ═══════════════════════════════════════════════════════
+    "compress_trigger_len": 1200,    # 触发压缩的长度阈值
+    "compress_trigger_entropy": 0.7, # 触发压缩的熵阈值
+    "compress_stride": 16,           # 压缩步长
+    "compress_ratio": 0.3,           # 压缩比例
+    
+    # ═══════════════════════════════════════════════════════
+    # 4️⃣ 生成采样策略 (业界标准: Top-K + Top-P)
+    # ═══════════════════════════════════════════════════════
+    "temperature": 0.6,              # 温度参数：控制生成随机性
+    "top_k": 50,                     # Top-K采样：只从最高概率的K个token采样
+    "top_p": 0.95,                   # Top-P核采样：累积概率阈值，动态调整候选集
+    
+    # ═══════════════════════════════════════════════════════
+    # 5️⃣ 生成质量监控 (困惑度早停)
+    # ═══════════════════════════════════════════════════════
+    "perplexity_threshold": 15.0,    # 困惑度阈值：超过此值提前停止生成
+    "repetition_penalty": 1.2,       # 重复惩罚系数：>1.0启用，防止复读机
+    
+    # ═══════════════════════════════════════════════════════
+    # 6️⃣ 强化学习自动就绪评估
+    # ═══════════════════════════════════════════════════════
+    # 系统根据训练损失自动判断是否启用PPO，满足以下条件时自动激活：
+    #   1. 最近N条loss平均值 < rl_loss_threshold
+    #   2. 最近N条loss标准差 < rl_loss_stability_std_threshold
+    #   3. 总训练轮数 >= rl_min_training_rounds
+    "rl_loss_threshold": 1.2,                    # Loss阈值
+    "rl_loss_stability_window": 5,               # 稳定性评估窗口大小
+    "rl_loss_stability_std_threshold": 0.15,     # Loss标准差阈值（收敛标志）
+    "rl_min_training_rounds": 3000,              # 最低训练轮数
+    "rl_check_interval": 200,                    # RL就绪检查间隔
 }
