@@ -54,10 +54,21 @@ class TextTokenizer(Tokenizer):
         tensor: list[int] = []
         dict_size = int(CONFIG["dict_size"])
         
+        # 保留前10个特殊Token ID（0-9），其余用于字符映射
+        # 特殊Token: UNKNOWN=0, START_GENERATION=1, END_GENERATION=2, etc.
+        SPECIAL_TOKEN_COUNT = 10
+        
         for letter in text:
             idx = ord(letter)
-            if TextTokenizer._is_valid_token(idx) and 0 <= idx < dict_size:
-                tensor.append(idx)
+            if TextTokenizer._is_valid_token(idx):
+                if idx < dict_size:
+                    # 正常范围内的字符直接映射
+                    tensor.append(idx)
+                else:
+                    # 【修复】高码点字符（如Emoji、生僻汉字）通过哈希桶映射到词表高位
+                    # 避免全部降级为UNKNOWN_TOKEN导致语义丢失
+                    hashed_idx = SPECIAL_TOKEN_COUNT + (idx % (dict_size - SPECIAL_TOKEN_COUNT))
+                    tensor.append(hashed_idx)
             else:
                 tensor.append(TextTokenizer.UNKNOWN_TOKEN)
         

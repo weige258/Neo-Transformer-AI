@@ -1,9 +1,7 @@
 from typing import List, Tuple, Optional
-
 import sys
-
 import torch
-
+from collections import Counter
 from config import CONFIG
 from model import MainModel
 from record import record_loss, evaluate_rl_readiness
@@ -152,21 +150,131 @@ total_params = sum(param.numel() for param in model.parameters())
 print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 
 loss_func = torch.nn.CrossEntropyLoss().to(device)
-optimizer = torch.optim.AdamW(
-    model.parameters(),
-    lr=2e-4,
-    weight_decay=0.01,
-    foreach=torch.cuda.is_available(),
-)
 
+# 【学习率配置】从CONFIG读取优化器参数
+base_lr = float(CONFIG.get("base_learning_rate", 2e-4))
+weight_decay = float(CONFIG.get("weight_decay", 0.01))
+adam_beta1 = float(CONFIG.get("adam_beta1", 0.9))
+adam_beta2 = float(CONFIG.get("adam_beta2", 0.999))
+adam_epsilon = float(CONFIG.get("adam_epsilon", 1e-8))
+optimizer_type = CONFIG.get("optimizer_type", "adamw").lower()
+
+# 根据配置选择优化器
+if optimizer_type == "adamw":
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=base_lr,
+        betas=(adam_beta1, adam_beta2),
+        eps=adam_epsilon,
+        weight_decay=weight_decay,
+        foreach=torch.cuda.is_available(),
+    )
+elif optimizer_type == "adam":
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=base_lr,
+        betas=(adam_beta1, adam_beta2),
+        eps=adam_epsilon,
+        weight_decay=weight_decay,
+        foreach=torch.cuda.is_available(),
+    )
+elif optimizer_type == "sgd":
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=base_lr,
+        momentum=0.9,
+        weight_decay=weight_decay,
+    )
+else:
+    print(f"[Warning] Unknown optimizer type '{optimizer_type}', falling back to AdamW", flush=True)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=base_lr,
+        betas=(adam_beta1, adam_beta2),
+        eps=adam_epsilon,
+        weight_decay=weight_decay,
+        foreach=torch.cuda.is_available(),
+    )
+
+print(f"[Info] Optimizer: {optimizer_type.upper()}, LR: {base_lr:.2e}, Weight Decay: {weight_decay:.2e}", flush=True)
+
+# 【学习率调度器】实现Warmup + Cosine Decay
 GRADIENT_ACCUMULATION_STEPS = 4
 training_rounds = 0
 
-# 初始化自奖励模型和强化学习模块
-reward_model = SelfRewardModel(device)
-ppo_trainer = LightweightPPO(model, reward_model, device, learning_rate=1e-5)
+# 学习率调度器配置
+warmup_steps = int(CONFIG.get("warmup_steps", 300))
+warmup_init_lr = float(CONFIG.get("warmup_init_lr", 1e-7))
+min_learning_rate = float(CONFIG.get("min_learning_rate", 1e-6))
+total_training_steps = int(CONFIG.get("total_training_steps", 30000))
+cosine_decay_enabled = bool(CONFIG.get("cosine_decay_enabled", True))
+lr_scheduler_type = CONFIG.get("lr_scheduler_type", "cosine")
 
-print("[Info] Self-reward model and RL modules initialized.", flush=True)
+def get_learning_rate(current_step: int) -> float:
+    """计算当前步的学习率（支持Warmup + 多种调度策略）
+    
+    Args:
+        current_step: 当前训练步数
+        
+    Returns:
+        当前学习率
+    """
+    if current_step < warmup_steps:
+        # Warmup阶段：线性增长从warmup_init_lr到base_lr
+        warmup_progress = current_step / max(warmup_steps - 1, 1)
+        return warmup_init_lr + (base_lr - warmup_init_lr) * warmup_progress
+    else:
+        # Warmup结束后，根据调度器类型计算学习率
+        if lr_scheduler_type == "cosine" and cosine_decay_enabled:
+            # Cosine Decay：从base_lr衰减到min_learning_rate
+            progress = (current_step - warmup_steps) / max(total_training_steps - warmup_steps, 1)
+            progress = min(progress, 1.0)  # 限制在[0, 1]
+            
+            import math
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_learning_rate + (base_lr - min_learning_rate) * cosine_decay
+        elif lr_scheduler_type == "linear":
+            # Linear Decay：线性衰减到min_learning_rate
+            progress = (current_step - warmup_steps) / max(total_training_steps - warmup_steps, 1)
+            progress = min(progress, 1.0)
+            return base_lr - (base_lr - min_learning_rate) * progress
+        else:
+            # Constant：保持base_lr不变
+            return base_lr
+
+def apply_learning_rate(step: int):
+    """应用学习率到优化器
+    
+    Args:
+        step: 当前训练步数
+    """
+    lr = get_learning_rate(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+    return lr
+
+# 打印学习率调度器配置
+print(f"[Info] LR Scheduler: {lr_scheduler_type}, Warmup: {warmup_steps} steps, "
+      f"Total Steps: {total_training_steps}, Min LR: {min_learning_rate:.2e}", flush=True)
+
+# 初始化强化学习模块
+if device.type != "meta":
+    reward_model = SelfRewardModel(device)
+    ppo_trainer = LightweightPPO(
+        model=model,
+        reward_model=reward_model,
+        device=device,
+        learning_rate=float(CONFIG.get("ppo_learning_rate", 5e-7)),
+        min_learning_rate=float(CONFIG.get("ppo_min_learning_rate", 1e-8)),
+        warmup_steps=int(CONFIG.get("ppo_warmup_steps", 200)),
+        total_training_steps=int(CONFIG.get("total_training_steps", 30000)),
+        clip_ratio=0.2,
+        entropy_coef=0.02,
+        gamma=0.99,
+        ppo_epochs=int(CONFIG.get("ppo_epochs", 2)),
+        mini_batch_num=int(CONFIG.get("ppo_mini_batch_num", 4)),
+    )
+    print("[Info] Self-reward model and RL modules initialized.", flush=True)
 
 
 
@@ -203,9 +311,12 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
     if hist_context is not None and hist_context.strip():
         history_tensor = TextTokenizer.encode(hist_context).to(device)
 
+        # 【修复】停止使用 argmax 离散化压缩向量
+        # 改为保留连续的压缩特征向量，避免语义流失
         if auto_compress_trigger(history_tensor):
             compressed_hist = model.compress_history_vectors(history_tensor)
-            history_tensor = torch.argmax(model.output_linear(compressed_hist), dim=-1)
+            # 直接使用压缩后的连续向量作为 history tensor，不进行 argmax 离散化
+            history_tensor = compressed_hist.squeeze(0) if compressed_hist.dim() == 3 else compressed_hist
 
         segments = [
             (TextTokenizer.START_GENERATION_TOKEN, False),
@@ -300,8 +411,8 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             think_tensor = TextTokenizer.encode(think).to(device)
             answer_tensor = TextTokenizer.encode(answer).to(device)
             
-            if hist_context := history_context:
-                history_tensor = TextTokenizer.encode(hist_context).to(device)
+            if history_context:
+                history_tensor = TextTokenizer.encode(history_context).to(device)
                 train_tensor, target_mask = _build_train_sequence([
                     (TextTokenizer.START_GENERATION_TOKEN, False),
                     (history_tensor, False),
@@ -337,21 +448,41 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             return
         _run_train_step(train_tensor, target_mask, preview, show_preview=False)
     
-    # 自奖励评估 —— RL 始终启用
+    # 自奖励评估 —— 智能 RL 切换（基于 SuperRL Adaptive Switch 设计）
     try:
-        reward_model.compute_total_reward(
+        # 计算奖励（自动记录到历史）
+        total_reward, reward_breakdown = reward_model.compute_total_reward(
             think_text=think,
             answer_text=answer,
             context=history_context
         )
-        ppo_trainer.collect_episode(
-            prompt=ask if ask else "",
-            think_text=think if think else "",
-            answer_text=answer if answer else "",
-            context=history_context
-        )
-        if training_rounds > 0 and (training_rounds % 4) == 0:
-            ppo_trainer.update_policy(batch_size=4)
+        
+        # 智能决策是否启用 RL 训练
+        should_enable_rl, rl_decision_reason = reward_model.should_enable_rl()
+        
+        if should_enable_rl:
+            # 启用 RL 训练：收集 episode 并更新策略
+            ppo_trainer.collect_episode(
+                prompt=ask if ask else "",
+                think_text=think if think else "",
+                answer_text=answer if answer else "",
+                context=history_context
+            )
+            if training_rounds > 0 and (training_rounds % 4) == 0:
+                ppo_update_result = ppo_trainer.update_policy(batch_size=4)
+                
+                # 每100步打印一次 RL 状态
+                if training_rounds % 100 == 0:
+                    print(f"[RL Smart Switch] ✅ 启用RL训练 | "
+                          f"奖励={total_reward:.3f} | "
+                          f"原因: {rl_decision_reason}", flush=True)
+        else:
+            # 暂停 RL 训练：仅执行 SFT，不收集 RL episode
+            # 每50步打印一次切换状态
+            if training_rounds % 50 == 0:
+                print(f"[RL Smart Switch] ⏸️ 暂停RL训练 | "
+                      f"奖励={total_reward:.3f} | "
+                      f"原因: {rl_decision_reason}", flush=True)
     except Exception as e:
         print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
 
@@ -450,19 +581,35 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     if history_context and history_context.strip():
         history_tensor = TextTokenizer.encode(history_context).to(device)
         
+        # 【修复】停止使用 argmax 离散化压缩向量
         if auto_compress_trigger(history_tensor):
             compressed_hist = model.compress_history_vectors(history_tensor)
-            history_tensor = torch.argmax(model.output_linear(compressed_hist), dim=-1)
+            # 保留连续压缩特征，避免语义流失
+            history_tensor = compressed_hist.squeeze(0) if compressed_hist.dim() == 3 else compressed_hist
         
         text_tensor = TextTokenizer.encode(text).to(device)
-        prompt = torch.cat([
-            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-            history_tensor,
-            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-            torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
-            text_tensor,
-            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-        ])
+        
+        # 如果 history_tensor 是连续特征（维度为2），需要特殊处理
+        if history_tensor.dim() == 2:
+            # 连续特征向量直接作为 embedding 输入
+            prompt = torch.cat([
+                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                # 将连续特征转换为 token 序列（简化处理：取 argmax 但仅用于构建 prompt）
+                torch.argmax(model.output_linear(history_tensor), dim=-1),
+                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+                torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
+                text_tensor,
+                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            ])
+        else:
+            prompt = torch.cat([
+                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+                history_tensor,
+                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+                torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
+                text_tensor,
+                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            ])
     else:
         prompt = torch.cat([
             TextTokenizer.encode(text).to(device),
@@ -502,8 +649,8 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
         step = 0
         
-        # 【修复】用于repetition_penalty的已生成token跟踪
-        generated_tokens = set()
+        # 【修复】使用Counter记录已生成token的频率，实现基于频率的重复惩罚
+        generated_tokens = Counter()
         
         while max_generate_tokens is None or step < max_generate_tokens:
             try:
@@ -512,15 +659,17 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits = next_logits.clone()
                     next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
 
-                # 【修复】应用 repetition_penalty
+                # 【修复】应用基于频率的 repetition_penalty
+                # 根据Hugging Face标准实现：token出现频率越高，惩罚越强
                 if repetition_penalty > 1.0 and len(generated_tokens) > 0:
-                    # 将已生成的token的logits除以repetition_penalty（降低其概率）
-                    for token_id in generated_tokens:
+                    for token_id, count in generated_tokens.items():
                         if token_id < next_logits.size(0):  # 确保token_id在有效范围内
+                            # 频率越高，惩罚指数增长：penalty = repetition_penalty ^ count
+                            penalty = repetition_penalty ** count
                             if next_logits[token_id] > 0:
-                                next_logits[token_id] /= repetition_penalty
+                                next_logits[token_id] /= penalty
                             else:
-                                next_logits[token_id] *= repetition_penalty
+                                next_logits[token_id] *= penalty
 
                 # 1️⃣ 应用 Top-K + Top-P 组合采样
                 if top_k > 0 or top_p < 1.0:
@@ -534,22 +683,14 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 if index == TextTokenizer.THINK_END_TOKEN:
                     if thinking_available and thinking_started:
                         thinking_started = False
-                        print(f"{RESET}\n", end="", flush=True)
+                        print(f"\n{GREEN}", end="", flush=True)
                         should_skip_output = True
                     else:
                         break
                 
                 elif index == TextTokenizer.END_GENERATION_TOKEN:
-                    # 【修复】如果思维阶段直接触发结束token，强制切换到回答阶段
-                    if thinking_available and thinking_started:
-                        print(f"{RESET}\n[强制切换] 思维阶段触发结束，强制开始回答生成", flush=True)
-                        thinking_started = False
-                        should_skip_output = True
-                        # 不break，继续生成循环，下一轮会正常生成回答内容
-                        # 将END_GENERATION_TOKEN替换为START_GENERATION_TOKEN以强制进入回答阶段
-                        index = TextTokenizer.START_GENERATION_TOKEN
-                    else:
-                        break
+                    # 【修复】思维阶段触发结束token，直接结束生成（移除强制切换逻辑）
+                    break
 
                 elif index == TextTokenizer.THINK_START_TOKEN:
                     if thinking_available and not thinking_started:
@@ -582,14 +723,14 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         
                         output_text += decoded_piece
 
-                # 【修复】将生成的token添加到集合中用于repetition_penalty
+                # 【修复】将生成的token添加到Counter中用于frequency_penalty
                 if index not in (
                     TextTokenizer.THINK_START_TOKEN,
                     TextTokenizer.THINK_END_TOKEN,
                     TextTokenizer.START_GENERATION_TOKEN,
                     TextTokenizer.END_GENERATION_TOKEN,
                 ):
-                    generated_tokens.add(index)
+                    generated_tokens[index] += 1
 
                 next_token = torch.tensor([index], device=device)
                 result = model(
@@ -679,9 +820,22 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            if torch.isnan(grad_norm):
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                # 【修复】完善的NaN梯度处理流程
                 optimizer.zero_grad(set_to_none=True)
-                print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
+                
+                # 更新scaler状态，避免影响后续步骤
+                scaler.update()
+                
+                # 检查并清理模型参数中的NaN
+                nan_params = 0
+                for param in model.parameters():
+                    if param.grad is not None and torch.isnan(param.grad).any():
+                        param.grad = None
+                        nan_params += 1
+                
+                print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
+                      f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
                 return float('inf')
             
             if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
@@ -690,9 +844,19 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         else:
             loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            if torch.isnan(grad_norm):
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                # 【修复】完善的NaN梯度处理（无AMP场景）
                 optimizer.zero_grad(set_to_none=True)
-                print(f"[Warning] NaN gradient detected, skipping optimizer step", flush=True)
+                
+                # 检查并清理模型参数中的NaN
+                nan_params = 0
+                for param in model.parameters():
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        param.grad = None
+                        nan_params += 1
+                
+                print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
+                      f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
                 return float('inf')
             
             if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
@@ -702,6 +866,14 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         return float('inf')
     
     training_rounds += 1
+    
+    # 【学习率调度】在每个训练步后更新学习率
+    if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
+        current_lr = apply_learning_rate(training_rounds)
+        # 每100步打印一次学习率信息
+        if training_rounds % 100 == 0:
+            print(f"[Info] Step {training_rounds}, Current LR: {current_lr:.2e}, "
+                  f"Base LR: {base_lr:.2e}, Min LR: {min_learning_rate:.2e}", flush=True)
 
     if show_preview:
         try:

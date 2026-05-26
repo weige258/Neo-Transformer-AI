@@ -45,15 +45,72 @@ CONFIG: Dict[str, Any] = {
     "repetition_stop_threshold": 5,  # 重复停止阈值：连续N个相同token或重复n-gram则停止
     
     # ═══════════════════════════════════════════════════════
-    # 6️⃣ 强化学习自动就绪评估
+    # 6️⃣ 学习率调度配置 (Warmup + Cosine Decay)
     # ═══════════════════════════════════════════════════════
+    # 【优化】基于 2025-2026 最新研究调节 SFT 学习率参数
+    # 参考: MiniMind 调优指南、GRPO 实战技巧、PPO Epochs 研究
+    "base_learning_rate": 2e-4,                  # 基础学习率（峰值学习率）- 保持合理值
+    "min_learning_rate": 1e-5,                   # 最小学习率（衰减终点）- 保持合理值
+    "warmup_steps": 300,                         # Warmup步数（约10%总训练步）- 保持合理值
+    "warmup_init_lr": 1e-5,                      # Warmup初始学习率 - 保持合理值
+    "cosine_decay_enabled": True,                # 是否启用余弦衰减
+    "total_training_steps": 30000,               # 总训练步数（用于cosine decay计算）- 保持合理值
+    "lr_scheduler_type": "cosine",               # 调度器类型: "cosine", "constant", "linear"
+    
+    # ═══════════════════════════════════════════════════════
+    # 7️⃣ 强化学习学习率配置
+    # ═══════════════════════════════════════════════════════
+    # 【优化】基于最新研究大幅降低 RL 学习率
+    # 参考: "强化学习阶段的学习率需要设置得非常小（通常在1e-7到1e-6之间）"
+    #       "PPO训练: learning_rate 5e-7"
+    #       "GRPO训练: learning_rate 6e-7"
+    "ppo_learning_rate": 5e-7,                   # 【优化】PPO策略网络学习率（从1e-5降低到5e-7）
+    "ppo_min_learning_rate": 1e-8,               # 【优化】PPO最小学习率（从1e-7降低到1e-8）
+    "ppo_warmup_steps": 200,                     # 【优化】PPO warmup步数（从100增加到200，更平滑）
+    "grpo_learning_rate": 6e-7,                  # 【优化】GRPO学习率（从5e-6降低到6e-7）
+    "ttrl_learning_rate": 5e-7,                  # 【优化】TTRL学习率（从1e-5降低到5e-7）
+    
+    # ═══════════════════════════════════════════════════════
+    # 8️⃣ 优化器配置
+    # ═══════════════════════════════════════════════════════
+    "optimizer_type": "adamw",                   # 优化器类型: "adamw", "adam", "sgd"
+    "weight_decay": 0.01,                        # 权重衰减（L2正则化）
+    "adam_beta1": 0.9,                           # Adam/AdamW beta1参数
+    "adam_beta2": 0.999,                         # Adam/AdamW beta2参数
+    "adam_epsilon": 1e-8,                        # Adam/AdamW epsilon参数
+    "max_grad_norm": 1.0,                        # 梯度裁剪最大范数
+    
+    # ═══════════════════════════════════════════════════════
+    # 9️⃣ 强化学习自动就绪评估
+    # ═══════════════════════════════════════════════════════
+    # 【优化】基于最新研究调整 RL 就绪评估参数
+    # 参考: "RL 应在模型具备基础语言能力后启用，避免过早引入导致训练崩溃"
+    #       "SFT → DPO → RL 的渐进式对齐是最佳实践"
     # 系统根据训练损失自动判断是否启用PPO，满足以下条件时自动激活：
     #   1. 最近N条loss平均值 < rl_loss_threshold
     #   2. 最近N条loss标准差 < rl_loss_stability_std_threshold
     #   3. 总训练轮数 >= rl_min_training_rounds
-    "rl_loss_threshold": 1.2,                    # Loss阈值
-    "rl_loss_stability_window": 5,               # 稳定性评估窗口大小
-    "rl_loss_stability_std_threshold": 0.15,     # Loss标准差阈值（收敛标志）
-    "rl_min_training_rounds": 3000,              # 最低训练轮数
-    "rl_check_interval": 200,                    # RL就绪检查间隔
+    "rl_loss_threshold": 1.5,                    # 【优化】Loss阈值从1.2提高到1.5，允许更早启用RL
+    "rl_loss_stability_window": 10,              # 【优化】稳定性评估窗口从5增加到10，更准确
+    "rl_loss_stability_std_threshold": 0.2,      # 【优化】Loss标准差阈值从0.15提高到0.2，更宽容
+    "rl_min_training_rounds": 2000,              # 【优化】最低训练轮数从3000降低到2000，更早启用RL
+    "rl_check_interval": 100,                    # 【优化】RL就绪检查间隔从200降低到100，更及时
+    
+    # ═══════════════════════════════════════════════════════
+    # 🔟 强化学习高级配置（基于最新研究新增）
+    # ═══════════════════════════════════════════════════════
+    # 【新增】KL 惩罚配置（防止策略偏离参考模型太远）
+    # 参考: "kl_coef=0.1 是稳定性锚点，当loss震荡大时↑，当acc停滞不前时↓"
+    "kl_coef": 0.1,                              # KL 惩罚系数（默认0.1）
+    "kl_target": 0.01,                           # KL 散度目标值
+    
+    # 【新增】PPO 更新配置（基于 Alpha Auto Research 研究）
+    # 参考: "mb_num / ppo_epochs 的作用不是让梯度更大，而是让同一批 rollout 被摊开到更多个优化器步"
+    "ppo_epochs": 2,                             # PPO epoch 数（推荐2）
+    "ppo_mini_batch_num": 4,                     # Mini-batch 数量（推荐4）
+    # ppo_epochs * ppo_mini_batch_num = 8，决定"一批rollout能换来多少次参数更新"
+    
+    # 【新增】采样配置
+    "grpo_group_size": 8,                        # GRPO 组内采样数（推荐8）
+    "rollout_batch_size": 256,                   # Rollout batch size（推荐256）
 }

@@ -28,6 +28,7 @@ class WebCrawler:
     failed_urls: set                    # 失败URL集合
     cache: deque                        # 爬取结果缓存（FIFO）
     cache_lock: threading.Lock          # 缓存线程锁
+    url_lock: threading.Lock            # URL集合线程锁（新增）
     
     queue_threshold: int                # 队列阈值
     max_workers: int                    # 最大工作线程数
@@ -71,6 +72,7 @@ class WebCrawler:
         # 数据缓存（FIFO）
         self.cache = deque(maxlen=max_cache_size)
         self.cache_lock = threading.Lock()
+        self.url_lock = threading.Lock()  # 【修复】新增URL集合线程锁
         
         # 控制标志
         self.is_running = False
@@ -135,12 +137,12 @@ class WebCrawler:
                 except queue.Empty:
                     continue
                 
-                # 跳过已访问或已失败的URL
-                if url in self.visited_urls or url in self.failed_urls:
-                    self.url_queue.task_done()
-                    continue
-                
-                self.visited_urls.add(url)
+                # 【修复】使用锁保护共享变量，防止并发数据竞争
+                with self.url_lock:
+                    if url in self.visited_urls or url in self.failed_urls:
+                        self.url_queue.task_done()
+                        continue
+                    self.visited_urls.add(url)
                 
                 # 爬取网页
                 success = self._fetch_and_parse(url)
@@ -148,7 +150,9 @@ class WebCrawler:
                 if success:
                     print(f"爬取成功: {url}", flush=True)
                 else:
-                    self.failed_urls.add(url)
+                    # 【修复】使用锁保护 failed_urls 的写入
+                    with self.url_lock:
+                        self.failed_urls.add(url)
                     print(f"失败url: {url}", flush=True)
                 
                 self.url_queue.task_done()
@@ -222,13 +226,18 @@ class WebCrawler:
                 absolute_url = urljoin(url, href)
                 
                 # 同域检查和去重
-                if self._is_valid_url(absolute_url) and absolute_url not in self.visited_urls:
-                    sub_urls.append(absolute_url)
+                if self._is_valid_url(absolute_url):
+                    # 【修复】使用锁保护 visited_urls 的读取
+                    with self.url_lock:
+                        if absolute_url not in self.visited_urls:
+                            sub_urls.append(absolute_url)
             
             # 添加子URL到队列（限制数量）
             for sub_url in sub_urls[:5]:  # 每个页面最多添加5个子URL
-                if sub_url not in self.visited_urls and sub_url not in self.failed_urls:
-                    self.url_queue.put(sub_url)
+                # 【修复】使用锁保护 visited_urls 和 failed_urls 的读取
+                with self.url_lock:
+                    if sub_url not in self.visited_urls and sub_url not in self.failed_urls:
+                        self.url_queue.put(sub_url)
             
             # 清洗HTML
             cleaned_content = self._clean_html(soup)
@@ -400,16 +409,44 @@ class WebCrawler:
         }
     
     def stop(self, timeout=5):
-        """停止爬虫"""
+        """停止爬虫
+        
+        修复：使用兼容Python 3.8+的方式关闭线程池
+        ThreadPoolExecutor.shutdown()没有timeout参数，应该使用cancel_futures参数
+        """
         self.is_running = False
         self.stop_event.set()
         
-        # 等待所有任务完成
+        # 【修复】兼容Python 3.8+的线程池关闭方式
         try:
-            self.executor.shutdown(wait=True, timeout=timeout)
-        except Exception:
-            logger.warning("线程池关闭超时，强制终止", exc_info=True)
-    
+            import sys
+            # Python 3.9+ 支持 cancel_futures 参数
+            if sys.version_info >= (3, 9):
+                self.executor.shutdown(wait=True, cancel_futures=True)
+            else:
+                # Python 3.8: 先取消未开始的future，再关闭
+                self.executor.shutdown(wait=False)
+                
+                # 等待timeout秒让活跃线程完成
+                import time
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    # 检查是否所有线程都已完成
+                    if not any(t.is_alive() for t in threading.enumerate() 
+                              if t != threading.main_thread() and t.name.startswith('ThreadPool')):
+                        break
+                    time.sleep(0.1)
+                
+                # 如果超时仍未完成，强制关闭
+                if any(t.is_alive() for t in threading.enumerate() 
+                      if t != threading.main_thread() and t.name.startswith('ThreadPool')):
+                    logger.warning("线程池关闭超时，部分工作线程仍在运行")
+                    
+        except Exception as e:
+            logger.warning(f"线程池关闭异常: {e}", exc_info=True)
+        
+        logger.info("爬虫已停止", flush=True)
+
     def __del__(self):
         """析构函数"""
         if self.is_running:
