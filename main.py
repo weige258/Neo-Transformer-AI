@@ -1,5 +1,6 @@
 from typing import List, Tuple, Optional
 import sys
+import os
 import torch
 from collections import Counter
 from config import CONFIG
@@ -8,6 +9,10 @@ from record import record_loss, evaluate_rl_readiness
 from tokenizer import TextTokenizer
 from rl import SelfRewardModel, LightweightPPO
 
+
+# 【显存优化】设置 PyTorch CUDA 内存分配策略，避免显存碎片化
+# expandable_segments:True 允许内存段动态扩展，减少碎片
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
 if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8")
@@ -137,7 +142,8 @@ else:
     amp_dtype = torch.float32
 
 # 【修复】仅float16启用scaler，bfloat16无需缩放，避免梯度爆炸
-scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and amp_dtype == torch.float16))
+# 【PyTorch 2.x 更新】使用 torch.amp.GradScaler('cuda') 替代已弃用的 torch.cuda.amp.GradScaler
+scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
 
 print(f"Using device: {device}", flush=True)
 print(f"AMP enabled: {use_amp}, AMP dtype: {amp_dtype}", flush=True)
@@ -311,12 +317,16 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
     if hist_context is not None and hist_context.strip():
         history_tensor = TextTokenizer.encode(hist_context).to(device)
 
-        # 【修复】停止使用 argmax 离散化压缩向量
-        # 改为保留连续的压缩特征向量，避免语义流失
+        # 【修复】检测压缩触发条件，但跳过压缩样本以避免维度不匹配
+        # 原因：compress_history_vectors返回2维连续向量[compress_num, emb_size]，
+        # 而_build_train_sequence期望1维token索引[seq_len]，直接拼接会导致
+        # "Tensors must have same number of dimensions: got 1 and 2" 错误
+        # 当前架构不支持混合离散token和连续向量输入
         if auto_compress_trigger(history_tensor):
-            compressed_hist = model.compress_history_vectors(history_tensor)
-            # 直接使用压缩后的连续向量作为 history tensor，不进行 argmax 离散化
-            history_tensor = compressed_hist.squeeze(0) if compressed_hist.dim() == 3 else compressed_hist
+            # 跳过该样本，记录日志
+            logging.debug(f"跳过训练样本：历史上下文过长（seq_len={history_tensor.numel()}），"
+                         f"触发压缩但架构不支持混合输入")
+            return None, None, None
 
         segments = [
             (TextTokenizer.START_GENERATION_TOKEN, False),
@@ -581,35 +591,25 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     if history_context and history_context.strip():
         history_tensor = TextTokenizer.encode(history_context).to(device)
         
-        # 【修复】停止使用 argmax 离散化压缩向量
+        # 【修复】与_prepare_training_data保持一致：跳过压缩触发的样本
+        # 原因：compress_history_vectors返回2维连续向量，与1维token序列不兼容
+        # 直接拼接会导致"Tensors must have same number of dimensions: got 1 and 2"错误
         if auto_compress_trigger(history_tensor):
-            compressed_hist = model.compress_history_vectors(history_tensor)
-            # 保留连续压缩特征，避免语义流失
-            history_tensor = compressed_hist.squeeze(0) if compressed_hist.dim() == 3 else compressed_hist
+            logging.warning(f"生成时历史上下文过长（seq_len={history_tensor.numel()}），"
+                           f"跳过压缩，使用原始序列")
+            # 不压缩，直接使用原始token序列（可能会被模型的最大长度限制截断）
         
         text_tensor = TextTokenizer.encode(text).to(device)
         
-        # 如果 history_tensor 是连续特征（维度为2），需要特殊处理
-        if history_tensor.dim() == 2:
-            # 连续特征向量直接作为 embedding 输入
-            prompt = torch.cat([
-                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                # 将连续特征转换为 token 序列（简化处理：取 argmax 但仅用于构建 prompt）
-                torch.argmax(model.output_linear(history_tensor), dim=-1),
-                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-                torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
-                text_tensor,
-                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-            ])
-        else:
-            prompt = torch.cat([
-                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-                history_tensor,
-                torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
-                torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
-                text_tensor,
-                torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
-            ])
+        # 统一处理：始终使用1维token序列
+        prompt = torch.cat([
+            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            history_tensor,
+            torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
+            torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
+            text_tensor,
+            torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+        ])
     else:
         prompt = torch.cat([
             TextTokenizer.encode(text).to(device),
