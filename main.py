@@ -2,6 +2,7 @@ from typing import List, Tuple, Optional
 import sys
 import os
 import torch
+import logging
 from collections import Counter
 from config import CONFIG
 from model import MainModel
