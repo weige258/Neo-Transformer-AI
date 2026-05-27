@@ -142,9 +142,13 @@ else:
     use_amp = False
     amp_dtype = torch.float32
 
+# 允许通过配置覆盖是否启用 AMP（便于在某些环境下手动关闭）
+use_amp = bool(CONFIG.get("use_amp", use_amp))
+
 # 【修复】仅float16启用scaler，bfloat16无需缩放，避免梯度爆炸
 # 【PyTorch 2.x 更新】使用 torch.amp.GradScaler('cuda') 替代已弃用的 torch.cuda.amp.GradScaler
-scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
+s_cl_en = (use_amp and amp_dtype == torch.float16)
+scaler = torch.amp.GradScaler('cuda', enabled=s_cl_en)
 
 print(f"Using device: {device}", flush=True)
 print(f"AMP enabled: {use_amp}, AMP dtype: {amp_dtype}", flush=True)
@@ -375,12 +379,9 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
                 # 计算压缩向量（在模型当前device上计算），然后卸载到CPU并保存到磁盘临时文件
                 with torch.no_grad():
                     comp = model.compress_history_vectors(history_tokens)
+                # 将压缩向量移动到 CPU（不再保存到磁盘）以避免生成临时文件
                 comp_cpu = comp.cpu()
-                import time
-                ts = int(time.time() * 1000)
-                path = f"compressed_history_{ts}.pt"
-                torch.save({"vectors": comp_cpu}, path)
-                logging.info(f"历史上下文已压缩并卸载到 {path} （shape={tuple(comp_cpu.shape)})")
+                logging.info(f"历史上下文已压缩并迁移到 CPU（shape={tuple(comp_cpu.shape)})，未写入磁盘")
                 # 释放GPU上的历史tokens并清理缓存
                 try:
                     del history_tokens
@@ -868,10 +869,11 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         reserved = torch.cuda.memory_reserved() / 1024**3
         print(f"[Memory] Step {training_rounds}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB", flush=True)
         
-        # 【新增】如果reserved显存过高，定期清理缓存
-        if reserved > 5.0:  # 超过5GB时清理
+        # 【新增】如果reserved显存过高，定期清理缓存（阈值来自 CONFIG）
+        cache_thresh = float(CONFIG.get("gpu_cache_clear_threshold_gb", 5.0))
+        if reserved > cache_thresh:  # 超过阈值时清理
             torch.cuda.empty_cache()
-            print(f"[Memory] Cleared GPU cache", flush=True)
+            print(f"[Memory] Cleared GPU cache (threshold {cache_thresh}GB)", flush=True)
     
     if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
         optimizer.zero_grad(set_to_none=True)

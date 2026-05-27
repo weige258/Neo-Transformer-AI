@@ -525,8 +525,9 @@ class MainModel(nn.Module):
                 x, present = block(x, past_key_value=past, use_cache=True)
                 next_key_values.append(present)
         else:
+            use_gc = bool(CONFIG.get("use_gradient_checkpointing", True))
             for block in self.transformers:
-                if self.training:
+                if self.training and use_gc:
                     x = checkpoint(block, x, use_reentrant=False)
                 else:
                     x = block(x)

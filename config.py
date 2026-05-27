@@ -31,6 +31,10 @@ CONFIG: Dict[str, Any] = {
     "compress_stride": 16,           # 压缩步长
     "compress_ratio": 0.3,           # 压缩比例
     "compress_on_memory_ratio": 0.9,  # 当 GPU 显存占用超过该比例时触发压缩并卸载（0-1）
+    # 运行时显存优化开关
+    "use_amp": True,                          # 是否启用自动混合精度（AMP）
+    "use_gradient_checkpointing": True,       # 是否在Transformer block上启用梯度检查点
+    "gpu_cache_clear_threshold_gb": 5.0,      # 当 reserved 显存超过此值（GB）时定期清理 cache
     
     # ═══════════════════════════════════════════════════════
     # 【新增】4️⃣ 序列长度限制（防止长文本显存爆炸）
