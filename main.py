@@ -421,9 +421,8 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
             (answer_tensor, True),
             (TextTokenizer.END_GENERATION_TOKEN, True),
         ]
-        preview = torch.cat(
-            [answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device)]
-        )
+        # 保持 preview 在 CPU 上，避免与 GPU tensors 混合导致 torch.cat 设备不一致错误
+        preview = torch.cat([answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN])])
     else:
         segments = [
             (ask_tensor, False),
@@ -431,9 +430,7 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
             (answer_tensor, True),
             (TextTokenizer.END_GENERATION_TOKEN, True),
         ]
-        preview = torch.cat(
-            [answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device)]
-        )
+        preview = torch.cat([answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN])])
 
     train_tensor, target_mask = _build_train_sequence(segments)
     return train_tensor, target_mask, preview
@@ -519,6 +516,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                     (answer_tensor, True),
                     (TextTokenizer.END_GENERATION_TOKEN, True),
                 ])
+                # preview 保持在 CPU，避免不必要的 GPU 移动
                 preview = torch.cat([think_tensor, answer_tensor])
                 _run_train_step(train_tensor, target_mask, preview, show_preview=False)
             else:
@@ -879,6 +877,24 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
         optimizer.zero_grad(set_to_none=True)
 
+    # 【新增】在开始前向/迁移之前进行显存预检查，防止在显存极低时触发大规模迁移导致 OOM
+    try:
+        if torch.cuda.is_available():
+            mem_ratio_now = _get_gpu_memory_ratio(device)
+            skip_thresh = float(CONFIG.get("mem_skip_sample_threshold", 0.995))
+            if mem_ratio_now >= skip_thresh:
+                print(f"[Memory] GPU 显存占用过高 ({mem_ratio_now:.3f}), 跳过当前样本以防 OOM", flush=True)
+                # 清理缓存以释放一些碎片并返回
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                except Exception:
+                    pass
+                return float('inf')
+    except Exception:
+        # 若显存检测失败，继续执行（以防误伤）
+        pass
+
     try:
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
             # 对于超长序列，采用分块前向以限制单次GPU内存占用。
@@ -919,16 +935,22 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                         logits = result
 
                     if logits.size(0) > 1:
-                        local_mask = chunk_mask[1:]
-                        if local_mask.any():
-                            masked_logits = logits[:-1][local_mask.to(device)]
-                            masked_targets = train_tensor[start + 1:end][local_mask].to(device)
-                            if masked_logits.numel() > 0:
-                                loss_chunk = loss_func(masked_logits, masked_targets)
+                            local_mask = chunk_mask[1:]
+                            if local_mask.any():
+                                # 将 mask 移到 device 用于 logits 的索引
+                                mask_on_device = local_mask.to(device)
+                                masked_logits = logits[:-1][mask_on_device]
+
+                                # 在 CPU 上用 CPU 掩码索引原始 train_tensor 切片，避免将整个切片一次性迁移到 GPU
+                                cpu_mask = local_mask.cpu()
+                                cpu_targets_slice = train_tensor[start + 1:end][cpu_mask]
+                                if cpu_targets_slice.numel() > 0:
+                                    masked_targets = cpu_targets_slice.to(device)
+                                    loss_chunk = loss_func(masked_logits, masked_targets)
+                                else:
+                                    loss_chunk = torch.tensor(0.0, device=device)
                             else:
                                 loss_chunk = torch.tensor(0.0, device=device)
-                        else:
-                            loss_chunk = torch.tensor(0.0, device=device)
                     else:
                         loss_chunk = torch.tensor(0.0, device=device)
 
