@@ -19,9 +19,9 @@ CONFIG: Dict[str, Any] = {
         "sparse": 1.3,               # 稀疏注意力权重
         "dynamic": 1,                # 动态注意力权重
     },
-    "sliding_window": 96,            # 滑动窗口大小
-    "attention_chunk_size": 64,      # 注意力块大小
-    "dynamic_attention_topk": 16,    # 动态注意力Top-K数量
+    "sliding_window": 64,            # 滑动窗口大小（6GB显存推荐64，降低显存占用）
+    "attention_chunk_size": 32,      # 注意力块大小（6GB显存推荐32，减小中间张量）
+    "dynamic_attention_topk": 8,     # 动态注意力Top-K数量（6GB显存推荐8）
     
     # ═══════════════════════════════════════════════════════
     # 3️⃣ 历史上下文压缩
@@ -29,22 +29,24 @@ CONFIG: Dict[str, Any] = {
     "compress_trigger_len": 1200,    # 触发压缩的长度阈值
     "compress_trigger_entropy": 0.7, # 触发压缩的熵阈值
     "compress_stride": 16,           # 压缩步长
-    "compress_ratio": 0.3,           # 压缩比例
-    "compress_on_memory_ratio": 0.9,  # 当 GPU 显存占用超过该比例时触发压缩并卸载（0-1）
+    "compress_ratio": 0.25,          # 压缩比例（6GB显存推荐0.25，更激进的压缩）
+    "compress_on_memory_ratio": 0.80, # 当 GPU 显存占用超过该比例时触发压缩并卸载（0-1）
     # 运行时显存优化开关
     "use_amp": True,                          # 是否启用自动混合精度（AMP）
     "use_gradient_checkpointing": True,       # 是否在Transformer block上启用梯度检查点
-    "gpu_cache_clear_threshold_gb": 5.0,      # 当 reserved 显存超过此值（GB）时定期清理 cache
+    "gpu_cache_clear_threshold_gb": 4.0,      # 当 reserved 显存超过此值（GB）时定期清理 cache（6GB显卡推荐4GB）
     # 在前向时对超长序列进行分块处理，避免一次性分配过大显存
-    "max_forward_chunk": 1024,                # 前向时每个子序列的最大长度（token数）
+    "max_forward_chunk": 512,                 # 前向时每个子序列的最大长度（token数，6GB推荐512）
     
     # ═══════════════════════════════════════════════════════
     # 【新增】4️⃣ 序列长度限制（防止长文本显存爆炸）
     # ═══════════════════════════════════════════════════════
-    # 移除硬性截断：优先在运行时触发向量压缩/卸载以避免显存爆炸
-    # 注：已移除 RAG/本地向量检索相关配置；当历史过长或显存紧张时，
-    # 会使用 `model.compress_history_vectors()` 生成压缩向量并卸载到 CPU/磁盘。
-    "max_generation_len": 512,       # 最大生成长度限制（保留生成长限制）
+    # 6GB 显存适配：严格控制训练序列长度，超过限制则智能截断
+    "max_train_seq_len": 1024,       # 训练时最大序列长度（token数），6GB显卡推荐≤1024
+    "max_generation_len": 512,       # 最大生成长度限制
+    # 显存安全阈值：当显存占用超过此比例时主动跳过样本或触发压缩
+    "gpu_memory_safe_ratio": 0.85,   # 安全显存比例（6GB显卡推荐0.80-0.85）
+    "gpu_memory_skip_ratio": 0.92,   # 跳过样本的显存比例阈值（高于此值跳过，避免OOM）
     
     # ═══════════════════════════════════════════════════════
     # 5️⃣ 生成采样策略 (业界标准: Top-K + Top-P)

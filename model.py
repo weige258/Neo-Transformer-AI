@@ -175,15 +175,32 @@ class CompressedSparseDynamicAttention(nn.Module):
         mem_pos: torch.Tensor,
         q_start_pos: int,
     ) -> torch.Tensor:
+        """压缩记忆注意力（显存优化版，使用 F.scaled_dot_product_attention）"""
         if mem_k.size(-2) == 0:
             return torch.zeros_like(q)
 
-        scores = torch.matmul(q, mem_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        q_pos = torch.arange(q_start_pos, q_start_pos + q.size(-2), device=q.device)[:, None]
-        scores = scores.masked_fill(mem_pos[None, :] > q_pos, float("-inf"))
-        weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-        weights = torch.nan_to_num(weights, nan=0.0)
-        return torch.matmul(weights, mem_v)
+        q_len = q.size(-2)
+        mem_len = mem_k.size(-2)
+
+        # 构建 causal mask：(q_len, mem_len)，True = 屏蔽
+        q_pos = torch.arange(q_start_pos, q_start_pos + q_len, device=q.device, dtype=torch.float32)
+        # mem_pos[None, :] > q_pos[:, None] 意味着 key 在 query 之后 → 屏蔽
+        causal_mask = mem_pos.float()[None, :] > q_pos[:, None]  # (q_len, mem_len)
+
+        try:
+            return F.scaled_dot_product_attention(
+                q, mem_k, mem_v,
+                attn_mask=causal_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        except RuntimeError:
+            # 回退到手动计算
+            scores = torch.matmul(q, mem_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            scores = scores.masked_fill(mem_pos[None, :] > q_pos, float("-inf"))
+            weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+            weights = torch.nan_to_num(weights, nan=0.0)
+            return torch.matmul(weights, mem_v)
 
     def _attend_local_window(
         self,
@@ -193,57 +210,86 @@ class CompressedSparseDynamicAttention(nn.Module):
         q_start_pos: int,
         k_start_pos: int,
     ) -> torch.Tensor:
+        """局部滑动窗口注意力（显存优化版）
+
+        使用 F.scaled_dot_product_attention 替代手动 index_select + matmul，
+        利用 PyTorch 内置的 FlashAttention / Memory-Efficient Attention 后端，
+        大幅降低显存占用。
+
+        对超过窗口范围的 key 使用 causal mask 屏蔽。
+        """
         batch, heads, q_len, dim = q.shape
         k_len = k.size(-2)
+        ws = self.window_size
 
-        # 边界情况：没有可注意的 key，返回零张量
         if k_len == 0:
             return torch.zeros(batch, heads, q_len, dim, device=q.device, dtype=q.dtype)
 
         outputs = []
-        offsets = torch.arange(
-            -self.window_size + 1,
-            1,
-            device=q.device,
-            dtype=torch.long,
-        )
-        # 预计算一次 window_size
-        ws = self.window_size
 
         for start in range(0, q_len, self.chunk_size):
             end = min(start + self.chunk_size, q_len)
-            q_chunk = q[:, :, start:end, :]
+            q_chunk = q[:, :, start:end, :]  # (batch, heads, chunk_len, dim)
             chunk_len = end - start
-            q_abs = torch.arange(q_start_pos + start, q_start_pos + end, device=q.device, dtype=torch.long)
-            rel_idx = q_abs[:, None] + offsets[None, :] - k_start_pos  # (chunk_len, ws)
-            valid = (rel_idx >= 0) & (rel_idx < k_len)  # (chunk_len, ws)
 
-            # 安全 clamp 到 [0, k_len-1]，避免 index_select 越界
-            gather_idx = rel_idx.clamp(0, k_len - 1).reshape(-1)  # (chunk_len * ws,)
-            # 使用 torch.long 确保 index_select 正确
-            gather_idx = gather_idx.to(torch.long)
+            # 确定此 chunk 需要关注的最小/最大 key 位置
+            q_abs_min = q_start_pos + start
+            q_abs_max = q_start_pos + end - 1
 
-            # index_select 沿 dim=2 选取 → (batch, heads, chunk_len*ws, dim)
-            selected_k = k.index_select(dim=2, index=gather_idx)
-            selected_v = v.index_select(dim=2, index=gather_idx)
+            # 局部窗口范围：[q_pos - ws + 1, q_pos]（因果）
+            k_abs_min = max(0, q_abs_min - ws + 1)
+            k_abs_max = q_abs_max
 
-            # 安全检查：确保形状匹配
-            expected_gather = chunk_len * ws
-            if selected_k.size(2) != expected_gather:
-                raise RuntimeError(
-                    f"_attend_local_window shape mismatch: "
-                    f"selected_k dim2={selected_k.size(2)}, expected={expected_gather}, "
-                    f"k_len={k_len}, chunk_len={chunk_len}, ws={ws}"
+            # 转换为相对于 raw_k 的索引
+            k_rel_min = max(0, k_abs_min - k_start_pos)
+            k_rel_max = min(k_len - 1, k_abs_max - k_start_pos)
+
+            if k_rel_min > k_rel_max:
+                # 此 chunk 没有可关注的 key
+                outputs.append(torch.zeros(batch, heads, chunk_len, dim, device=q.device, dtype=q.dtype))
+                continue
+
+            # 提取局部窗口的 k, v
+            k_local = k[:, :, k_rel_min:k_rel_max + 1, :]  # (batch, heads, local_k_len, dim)
+            v_local = v[:, :, k_rel_min:k_rel_max + 1, :]
+            local_k_len = k_local.size(-2)
+
+            # 构建 causal mask：(chunk_len, local_k_len)
+            # 每个 query 只能看到 key_pos <= query_pos 的 key
+            q_abs = torch.arange(q_abs_min, q_abs_max + 1, device=q.device, dtype=torch.float32)
+            k_abs_local = torch.arange(
+                k_start_pos + k_rel_min,
+                k_start_pos + k_rel_max + 1,
+                device=q.device,
+                dtype=torch.float32,
+            )
+            # causal: (chunk_len, local_k_len), True = 允许关注
+            causal_mask = k_abs_local[None, :] <= q_abs[:, None]
+
+            # 同时也需要窗口掩码：key 必须在 [q_pos - ws + 1, q_pos] 范围内
+            window_mask = k_abs_local[None, :] >= (q_abs[:, None] - ws + 1)
+            attn_mask = causal_mask & window_mask  # (chunk_len, local_k_len)
+
+            # 使用 F.scaled_dot_product_attention（自动选择最优后端）
+            # 需要 [batch, heads, chunk_len, dim] x [batch, heads, local_k_len, dim]
+            # attn_mask 形状: (chunk_len, local_k_len) → 广播到 (batch, heads, chunk_len, local_k_len)
+            try:
+                attn_out = F.scaled_dot_product_attention(
+                    q_chunk,
+                    k_local,
+                    v_local,
+                    attn_mask=attn_mask.logical_not(),  # True = 屏蔽
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=False,
                 )
-
-            selected_k = selected_k.view(batch, heads, chunk_len, ws, dim)
-            selected_v = selected_v.view(batch, heads, chunk_len, ws, dim)
-
-            scores = (q_chunk.unsqueeze(-2) * selected_k).sum(dim=-1) / math.sqrt(dim)
-            scores = scores.masked_fill(~valid.view(1, 1, chunk_len, ws), float("-inf"))
-            weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
-            weights = torch.nan_to_num(weights, nan=0.0)
-            outputs.append((weights.unsqueeze(-1) * selected_v).sum(dim=-2))
+                outputs.append(attn_out)
+            except RuntimeError:
+                # 回退：如果 sdpa 不支持（极少数情况），使用手动计算
+                scores = torch.matmul(q_chunk, k_local.transpose(-2, -1)) / math.sqrt(dim)
+                scores = scores.masked_fill(~attn_mask.view(1, 1, chunk_len, local_k_len), float("-inf"))
+                weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
+                weights = torch.nan_to_num(weights, nan=0.0)
+                outputs.append(torch.matmul(weights, v_local))
 
         return torch.cat(outputs, dim=-2)
 
@@ -255,6 +301,10 @@ class CompressedSparseDynamicAttention(nn.Module):
         mem_pos: torch.Tensor,
         q_start_pos: int,
     ) -> torch.Tensor:
+        """动态Top-K记忆注意力（显存优化版：避免 expand 大张量）
+
+        使用批量索引选取替代 value_bank.expand，减少中间张量大小。
+        """
         if mem_k.size(-2) == 0:
             return torch.zeros_like(q)
 
@@ -262,24 +312,35 @@ class CompressedSparseDynamicAttention(nn.Module):
         mem_len = mem_k.size(-2)
         scores = torch.matmul(q, mem_k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         scores = scores + self.memory_gate(mem_k).transpose(-2, -1)
+
+        # causal mask
         q_pos = torch.arange(q_start_pos, q_start_pos + q_len, device=q.device, dtype=torch.long)[:, None]
         scores = scores.masked_fill(mem_pos[None, :] > q_pos, float("-inf"))
 
         topk = min(self.dynamic_topk, mem_len)
         if topk == 0:
             return torch.zeros_like(q)
+
         top_scores, top_idx = torch.topk(scores, k=topk, dim=-1)  # (batch, heads, q_len, topk)
         weights = torch.softmax(top_scores.float(), dim=-1).to(q.dtype)
         weights = torch.nan_to_num(weights, nan=0.0)
 
-        # 使用 torch.gather 安全地从 mem_v 中选取 top-k 位置
+        # 【显存优化】使用批量索引代替 expand + gather，避免 (batch, heads, q_len, mem_len, dim) 大张量
+        # top_idx: (batch, heads, q_len, topk)
         # mem_v: (batch, heads, mem_len, dim)
-        # 扩展为 (batch, heads, q_len, mem_len, dim)，在 dim=3(mem_len) 上 gather
-        value_bank = mem_v.unsqueeze(2).expand(-1, -1, q_len, -1, -1)
-        # top_idx: (batch, heads, q_len, topk) → (batch, heads, q_len, topk, dim)
-        gather_idx = top_idx.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
-        selected_v = torch.gather(value_bank, dim=3, index=gather_idx)
-        # selected_v: (batch, heads, q_len, topk, dim)
+        # 将 top_idx 展平后用 index_select 选取，再 reshape
+        b, h, _, _ = q.shape
+        topk_flat = top_idx.reshape(b * h, q_len * topk)  # (b*h, q_len*topk)
+
+        # 对每个 (batch*head) 独立选取
+        mem_v_flat = mem_v.reshape(b * h, mem_len, self.head_dim)  # (b*h, mem_len, dim)
+
+        # 使用 gather 在 dim=1 上选取
+        # 扩展索引维度
+        topk_idx_expanded = topk_flat.unsqueeze(-1).expand(-1, -1, self.head_dim)  # (b*h, q_len*topk, dim)
+        selected_v = torch.gather(mem_v_flat, dim=1, index=topk_idx_expanded)  # (b*h, q_len*topk, dim)
+        selected_v = selected_v.view(b, h, q_len, topk, self.head_dim)  # (b, h, q_len, topk, dim)
+
         return (weights.unsqueeze(-1) * selected_v).sum(dim=-2)
 
     def _build_cache(
@@ -359,22 +420,51 @@ class CompressedSparseDynamicAttention(nn.Module):
         if past_key_value is None and seq_len > 1:
             mem_k, mem_v, mem_pos = self._compress_kv(raw_k, raw_v, raw_k_start_pos)
 
-        compressed_out = self._attend_compressed(q, mem_k, mem_v, mem_pos, q_start_pos)
-        sparse_out = self._attend_local_window(q, raw_k, raw_v, q_start_pos, raw_k_start_pos)
-        dynamic_out = self._attend_dynamic_memory(q, mem_k, mem_v, mem_pos, q_start_pos)
-
-        compressed_out = compressed_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
-        sparse_out = sparse_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
-        dynamic_out = dynamic_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
-
+        # 【显存优化】预计算 mix 权重，然后顺序计算三种注意力并累加
+        # 避免同时持有三种注意力的中间张量，大幅降低峰值显存
         prior = attention_mix_prior(x.device, torch.float32)
         mix = torch.softmax(self.router(x).float() + prior, dim=-1).to(x.dtype)
-        out = (
-            compressed_out * mix[..., 0:1]
-            + sparse_out * mix[..., 1:2]
-            + dynamic_out * mix[..., 2:3]
-        )
-        out = self.out_proj(out)
+        # mix: (batch, seq_len, 3), 分别对应 compressed, sparse, dynamic 权重
+
+        # 初始化累积输出为零
+        out_accum = None  # (batch, seq_len, emb_size)
+
+        # ── 路径1: 压缩注意力 ──
+        if mix[..., 0:1].abs().max().item() > 1e-8:
+            compressed_out = self._attend_compressed(q, mem_k, mem_v, mem_pos, q_start_pos)
+            compressed_out = compressed_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
+            out_accum = compressed_out * mix[..., 0:1]
+            del compressed_out
+
+        # ── 路径2: 局部稀疏窗口注意力 ──
+        if mix[..., 1:2].abs().max().item() > 1e-8:
+            sparse_out = self._attend_local_window(q, raw_k, raw_v, q_start_pos, raw_k_start_pos)
+            sparse_out = sparse_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
+            if out_accum is None:
+                out_accum = sparse_out * mix[..., 1:2]
+            else:
+                out_accum = out_accum + sparse_out * mix[..., 1:2]
+            del sparse_out
+
+        # ── 路径3: 动态Top-K记忆注意力 ──
+        if mix[..., 2:3].abs().max().item() > 1e-8:
+            dynamic_out = self._attend_dynamic_memory(q, mem_k, mem_v, mem_pos, q_start_pos)
+            dynamic_out = dynamic_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
+            if out_accum is None:
+                out_accum = dynamic_out * mix[..., 2:3]
+            else:
+                out_accum = out_accum + dynamic_out * mix[..., 2:3]
+            del dynamic_out
+
+        # 极端情况：所有权重都为零，返回零张量
+        if out_accum is None:
+            out_accum = torch.zeros(batch, seq_len, self.emb_size, device=x.device, dtype=x.dtype)
+
+        # 释放 q 引用（raw_k/raw_v 在 use_cache 时仍需保留）
+        del q
+
+        out = self.out_proj(out_accum)
+        del out_accum
 
         if use_cache:
             cache = self._build_cache(
@@ -479,7 +569,50 @@ class MainModel(nn.Module):
             compress_ratio = float(CONFIG.get("compress_ratio", 0.3))
         with torch.no_grad():
             emb_weight = self.token_embedding.weight
-            # 如果 history_tokens 不在 embedding 权重同一设备上，则在 CPU 上执行压缩计算
+            prefer_gpu = bool(CONFIG.get("prefer_gpu_compress", True))
+
+            # 如果 history_tokens 不在 embedding 权重同一设备上，但配置允许在 GPU 上分块压缩，
+            # 则采用分块流式编码：仅把小片段移动到 embedding 设备进行 embedding_lookup 和聚合，
+            # 最终在 embedding 设备上返回压缩向量，避免把压缩结果搬回 CPU。
+            if history_tokens.device != emb_weight.device and prefer_gpu:
+                device = emb_weight.device
+                hist_idx = history_tokens.to(torch.long)
+                if hist_idx.dim() == 2 and hist_idx.size(0) == 1:
+                    hist_idx = hist_idx.squeeze(0)
+
+                seq_len = hist_idx.numel()
+                compress_num = max(16, int(seq_len * compress_ratio))
+
+                # 流式读取与 embedding：逐块映射到 GPU
+                chunk = int(max(1024, seq_len // max(1, min(8, seq_len // 1024))))
+                emb_parts: list[torch.Tensor] = []
+                for start in range(0, seq_len, chunk):
+                    end = min(start + chunk, seq_len)
+                    idx_slice = hist_idx[start:end].to(device)
+                    emb_slice = self.token_embedding(idx_slice)
+                    if emb_slice.dim() == 3:
+                        emb_slice = emb_slice.squeeze(0)
+                    emb_parts.append(emb_slice)
+
+                hist_emb = torch.cat(emb_parts, dim=0)
+                # 后续逻辑与原来在同设备时保持一致
+                if hist_emb.dim() == 3:
+                    hist_emb = hist_emb.squeeze(0)
+                if seq_len <= max(16, compress_num):
+                    return self.final_norm(hist_emb)
+
+                scores = hist_emb.norm(dim=-1)
+                boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
+                pieces: list[torch.Tensor] = []
+                for idx in range(compress_num):
+                    start = int(boundaries[idx].item())
+                    end = max(start + 1, int(boundaries[idx + 1].item()))
+                    segment = hist_emb[start:end]
+                    weights = torch.softmax(scores[start:end].float(), dim=0).to(hist_emb.dtype)
+                    pieces.append((segment * weights[:, None]).sum(dim=0))
+                return self.final_norm(torch.stack(pieces, dim=0))
+
+            # 若 history_tokens 在同设备，或不启用 GPU 分块压缩，走原有路径
             if history_tokens.device != emb_weight.device:
                 # 在 CPU 上进行 embedding lookup 与压缩，避免把大张量搬到 GPU
                 hist_idx = history_tokens.to(torch.long).to("cpu")

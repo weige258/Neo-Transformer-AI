@@ -2,6 +2,7 @@ from typing import List, Tuple, Optional
 import sys
 import os
 import torch
+import time
 import logging
 from collections import Counter
 from config import CONFIG
@@ -73,6 +74,7 @@ def _build_train_sequence(
 
 
 def _load_model() -> MainModel:
+    t0 = time.time()
     try:
         # 安全加载：不使用不存在的 `weights_only` 参数，使用 map_location
         loaded = torch.load("model.pth", map_location=device)
@@ -380,16 +382,19 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
                 # 计算压缩向量（在模型当前device上计算），然后卸载到CPU并保存到磁盘临时文件
                 with torch.no_grad():
                     comp = model.compress_history_vectors(history_tokens)
-                # 将压缩向量移动到 CPU（不再保存到磁盘）以避免生成临时文件
-                comp_cpu = comp.cpu()
-                logging.info(f"历史上下文已压缩并迁移到 CPU（shape={tuple(comp_cpu.shape)})，未写入磁盘")
-                # 释放GPU上的历史tokens并清理缓存
+                # 保持压缩向量在 model.embedding 权重设备（通常为 GPU），避免把压缩结果迁移到 CPU
+                try:
+                    comp_on_device = comp.to(device)
+                except Exception:
+                    comp_on_device = comp
+                # 将压缩向量缓存到模型内部，供后续推理/训练使用，避免写入磁盘或保持在 CPU
+                setattr(model, "_compressed_history", comp_on_device)
+                logging.info(f"历史上下文已压缩并缓存至模型（device={comp_on_device.device}, shape={tuple(comp_on_device.shape)})")
+                # 释放临时 history_tokens 引用以减少内存峰值
                 try:
                     del history_tokens
                 except Exception:
                     pass
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 # 不把完整历史放回训练序列；使用空历史占位符
                 hist_context = ""
             else:
@@ -446,6 +451,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         history_context: 历史对话上下文
     """
     model.train()
+    t0 = time.time()
     
     def _sanitize(text):
         if text is None:
@@ -845,6 +851,39 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         return output_text
 
 
+def _truncate_train_sequence(
+    train_tensor: torch.Tensor,
+    target_mask: torch.Tensor,
+    max_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """智能截断训练序列到 max_len，保留末尾的 target token。
+    
+    策略：如果序列过长，保留前 max_len//2 的上下文 + 后 max_len//2 的目标 token。
+    这样既能保留足够的上下文，又能保留需要学习的回答部分。
+    """
+    seq_len = train_tensor.numel()
+    if seq_len <= max_len:
+        return train_tensor, target_mask
+
+    # 保留开头和结尾，中间部分丢弃
+    keep_head = max_len // 3
+    keep_tail = max_len - keep_head
+
+    head_t = train_tensor[:keep_head]
+    head_m = target_mask[:keep_head]
+    tail_t = train_tensor[-keep_tail:]
+    tail_m = target_mask[-keep_tail:]
+
+    truncated_tensor = torch.cat([head_t, tail_t], dim=0)
+    truncated_mask = torch.cat([head_m, tail_m], dim=0)
+
+    logging.info(
+        f"序列截断: {seq_len} → {max_len} tokens "
+        f"(保留前{keep_head}+后{keep_tail})"
+    )
+    return truncated_tensor, truncated_mask
+
+
 def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, show_preview: bool = True, preview_color: str = None) -> float:
     """执行单步训练
     
@@ -860,16 +899,24 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     """
     global training_rounds
     
+    # 【显存优化】对超长序列进行智能截断
+    max_train_seq_len = int(CONFIG.get("max_train_seq_len", 1024))
+    if train_tensor.numel() > max_train_seq_len:
+        train_tensor, target_mask = _truncate_train_sequence(
+            train_tensor, target_mask, max_train_seq_len
+        )
+    
     model.train()
     
     # 【新增】显存监控：每100步输出一次显存使用情况
     if training_rounds > 0 and training_rounds % 100 == 0 and torch.cuda.is_available():
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
-        print(f"[Memory] Step {training_rounds}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB", flush=True)
+        total = torch.cuda.get_device_properties(device).total_memory / 1024**3
+        print(f"[Memory] Step {training_rounds}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, Total={total:.2f}GB", flush=True)
         
         # 【新增】如果reserved显存过高，定期清理缓存（阈值来自 CONFIG）
-        cache_thresh = float(CONFIG.get("gpu_cache_clear_threshold_gb", 5.0))
+        cache_thresh = float(CONFIG.get("gpu_cache_clear_threshold_gb", 4.0))
         if reserved > cache_thresh:  # 超过阈值时清理
             torch.cuda.empty_cache()
             print(f"[Memory] Cleared GPU cache (threshold {cache_thresh}GB)", flush=True)
@@ -877,145 +924,201 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
         optimizer.zero_grad(set_to_none=True)
 
-    # 【新增】在开始前向/迁移之前进行显存预检查，防止在显存极低时触发大规模迁移导致 OOM
+    # 【显存保护】在开始前向之前进行显存预检查
     try:
         if torch.cuda.is_available():
             mem_ratio_now = _get_gpu_memory_ratio(device)
-            skip_thresh = float(CONFIG.get("mem_skip_sample_threshold", 0.995))
+            skip_thresh = float(CONFIG.get("gpu_memory_skip_ratio", 0.92))
+            safe_thresh = float(CONFIG.get("gpu_memory_safe_ratio", 0.85))
+            
             if mem_ratio_now >= skip_thresh:
-                print(f"[Memory] GPU 显存占用过高 ({mem_ratio_now:.3f}), 跳过当前样本以防 OOM", flush=True)
-                # 清理缓存以释放一些碎片并返回
-                try:
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                except Exception:
-                    pass
+                print(f"[Memory] GPU 显存占用过高 ({mem_ratio_now:.3f} >= {skip_thresh}), 跳过当前样本以防 OOM", flush=True)
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
                 return float('inf')
+            
+            if mem_ratio_now >= safe_thresh:
+                # 接近安全阈值，主动清理缓存
+                torch.cuda.empty_cache()
+                print(f"[Memory] GPU 显存偏高 ({mem_ratio_now:.3f}), 已主动清理缓存", flush=True)
     except Exception:
-        # 若显存检测失败，继续执行（以防误伤）
         pass
 
+    # 【显存优化】实时显存估算与动态分段训练
     try:
-        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-            # 对于超长序列，采用分块前向以限制单次GPU内存占用。
-            chunk_size = int(CONFIG.get("max_forward_chunk", 1024))
-            seq_len = train_tensor.numel()
+        seq_len = train_tensor.numel()
+        # 更保守的单token字节估算（实测约2-4KB/token，取4KB安全边际）
+        bytes_per_token = int(CONFIG.get("bytes_per_token_estimate", 4096))
+        estimated_peak = seq_len * bytes_per_token
 
-            if seq_len <= chunk_size:
-                result = model(train_tensor.to(device), use_cache=False)
+        if torch.cuda.is_available():
+            idx = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(idx)
+            total_bytes = float(props.total_memory)
+            reserved = float(torch.cuda.memory_reserved(idx))
+            allocated = float(torch.cuda.memory_allocated(idx))
+            used = max(reserved, allocated)
+            free_bytes = max(0.0, total_bytes - used)
+        else:
+            free_bytes = float('inf')
+
+        # 动态分段阈值：当估算峰值超过可用显存的指定比例时启用分段
+        dynamic_thresh = float(CONFIG.get("dynamic_split_threshold", 0.75))
+        if estimated_peak > free_bytes * dynamic_thresh:
+            seg_size = int(CONFIG.get("dynamic_segment_size", 512))
+            overlap = int(CONFIG.get("dynamic_segment_overlap", 32))
+            step = max(1, seg_size - overlap)
+
+            print(f"[Memory] 启用动态分段训练: seq_len={seq_len}, seg_size={seg_size}, "
+                  f"free={free_bytes/1024**3:.2f}GB, est_peak={estimated_peak/1024**3:.2f}GB", flush=True)
+
+            def _forward_compute_loss(local_tensor: torch.Tensor, local_mask: torch.Tensor):
+                result = model(local_tensor, use_cache=False)
                 if isinstance(result, tuple):
                     logits = result[0]
                 else:
                     logits = result
 
-                if len(train_tensor) > 1:
-                    masked_logits = logits[:-1][target_mask[1:].to(device)]
-                    masked_targets = train_tensor[1:].to(device)[target_mask[1:].to(device)]
+                if local_tensor.numel() > 1:
+                    masked_logits = logits[:-1][local_mask[1:].to(device)]
+                    masked_targets = local_tensor[1:].to(device)[local_mask[1:].to(device)]
                     if masked_logits.numel() > 0:
-                        if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
-                            print(f"[Warning] NaN/Inf in logits. seq_len: {seq_len}, preview: {TextTokenizer.decode(preview[:50])[:100]}", flush=True)
-                            return float('inf')
-                        loss = loss_func(masked_logits, masked_targets)
+                        return loss_func(masked_logits, masked_targets)
                     else:
+                        return torch.tensor(0.0, device=device)
+                else:
+                    return torch.tensor(0.0, device=device)
+
+            total_loss = None
+            for seg_start in range(0, seq_len, step):
+                seg_end = min(seg_start + seg_size, seq_len)
+                seg = train_tensor[seg_start:seg_end].to(device)
+                seg_mask = target_mask[seg_start:seg_end]
+
+                try:
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                        loss_seg = _forward_compute_loss(seg, seg_mask)
+                        loss_seg = loss_seg / GRADIENT_ACCUMULATION_STEPS
+
+                    if scaler.is_enabled():
+                        scaler.scale(loss_seg).backward()
+                    else:
+                        loss_seg.backward()
+
+                    total_loss = loss_seg if total_loss is None else total_loss + loss_seg
+
+                    # 【显存优化】每段后释放显存
+                    del seg, loss_seg
+                except RuntimeError as e_seg:
+                    if "out of memory" in str(e_seg).lower():
+                        print(f"[Memory] Segment OOM at {seg_start}:{seg_end}, 清理后跳过", flush=True)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                        # 清理可能已累积的梯度
+                        optimizer.zero_grad(set_to_none=True)
+                        continue
+                    else:
+                        raise
+
+            if total_loss is None:
+                return float('inf')
+
+            loss = total_loss
+
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                if scaler.is_enabled():
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                        for param in model.parameters():
+                            if param.grad is not None and torch.isnan(param.grad).any():
+                                param.grad = None
+                        print(f"[Warning] NaN/Inf gradient after segment processing, skipping optimizer step", flush=True)
+                        return float('inf')
+                    if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                        scaler.step(optimizer)
+                        scaler.update()
+                else:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        for param in model.parameters():
+                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                                param.grad = None
+                        print(f"[Warning] NaN/Inf gradient after segment processing, skipping optimizer step", flush=True)
+                        return float('inf')
+                    if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                        optimizer.step()
+            else:
+                print(f"[Warning] Invalid loss after segment processing: {loss}", flush=True)
+                return float('inf')
+
+            # 后续走统一的 training_rounds++ 和 lr 更新流程
+        else:
+            # 不分段：标准前向+反向传播
+            train_tensor_gpu = train_tensor.to(device)
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                result = model(train_tensor_gpu, use_cache=False)
+                if isinstance(result, tuple):
+                    logits = result[0]
+                else:
+                    logits = result
+
+                if train_tensor.numel() > 1:
+                    masked_logits = logits[:-1][target_mask[1:].to(device)]
+                    masked_targets = train_tensor_gpu[1:][target_mask[1:].to(device)]
+                    if masked_logits.numel() == 0:
                         loss = torch.tensor(0.0, device=device)
+                    else:
+                        loss = loss_func(masked_logits, masked_targets)
+                        loss = loss / GRADIENT_ACCUMULATION_STEPS
                 else:
                     loss = torch.tensor(0.0, device=device)
+
+            # 检查损失是否有效
+            if not torch.isnan(loss) and not torch.isinf(loss):
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                        nan_params = 0
+                        for param in model.parameters():
+                            if param.grad is not None and torch.isnan(param.grad).any():
+                                param.grad = None
+                                nan_params += 1
+                        print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
+                              f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
+                        return float('inf')
+                    if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                        scaler.step(optimizer)
+                        scaler.update()
+                else:
+                    loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        nan_params = 0
+                        for param in model.parameters():
+                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                                param.grad = None
+                                nan_params += 1
+                        print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
+                              f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
+                        return float('inf')
+                    if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                        optimizer.step()
             else:
-                # 分块处理，使用 past_key_values 传递上下文，保持上下文连续性
-                past = None
-                total_loss = None
-                for start in range(0, seq_len, chunk_size):
-                    end = min(start + chunk_size, seq_len)
-                    chunk = train_tensor[start:end].to(device)
-                    chunk_mask = target_mask[start:end]
-                    result = model(chunk, past_key_values=past, use_cache=True)
-                    if isinstance(result, tuple):
-                        logits, past = result[0], result[1]
-                    else:
-                        logits = result
+                print(f"[Warning] Invalid loss detected: {loss}, skipping optimizer step", flush=True)
+                return float('inf')
 
-                    if logits.size(0) > 1:
-                            local_mask = chunk_mask[1:]
-                            if local_mask.any():
-                                # 将 mask 移到 device 用于 logits 的索引
-                                mask_on_device = local_mask.to(device)
-                                masked_logits = logits[:-1][mask_on_device]
-
-                                # 在 CPU 上用 CPU 掩码索引原始 train_tensor 切片，避免将整个切片一次性迁移到 GPU
-                                cpu_mask = local_mask.cpu()
-                                cpu_targets_slice = train_tensor[start + 1:end][cpu_mask]
-                                if cpu_targets_slice.numel() > 0:
-                                    masked_targets = cpu_targets_slice.to(device)
-                                    loss_chunk = loss_func(masked_logits, masked_targets)
-                                else:
-                                    loss_chunk = torch.tensor(0.0, device=device)
-                            else:
-                                loss_chunk = torch.tensor(0.0, device=device)
-                    else:
-                        loss_chunk = torch.tensor(0.0, device=device)
-
-                    total_loss = loss_chunk if total_loss is None else total_loss + loss_chunk
-
-                loss = total_loss if total_loss is not None else torch.tensor(0.0, device=device)
-
-            # 缩放损失以适配梯度累积
-            loss = loss / GRADIENT_ACCUMULATION_STEPS
-            
-            record_loss(loss.item())
-
-        # 检查损失是否有效
-        if not torch.isnan(loss) and not torch.isinf(loss):
-            if scaler.is_enabled():
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    # 【修复】完善的NaN梯度处理流程
-                    optimizer.zero_grad(set_to_none=True)
-                    
-                    # 更新scaler状态，避免影响后续步骤
-                    scaler.update()
-                    
-                    # 检查并清理模型参数中的NaN
-                    nan_params = 0
-                    for param in model.parameters():
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            param.grad = None
-                            nan_params += 1
-                    
-                    print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
-                          f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
-                    return float('inf')
-                
-                if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                    scaler.step(optimizer)
-                    scaler.update()
-            else:
-                loss.backward()
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    # 【修复】完善的NaN梯度处理（无AMP场景）
-                    optimizer.zero_grad(set_to_none=True)
-                    
-                    # 检查并清理模型参数中的NaN
-                    nan_params = 0
-                    for param in model.parameters():
-                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                            param.grad = None
-                            nan_params += 1
-                    
-                    print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
-                          f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
-                    return float('inf')
-                
-                if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                    optimizer.step()
-        else:
-            print(f"[Warning] Invalid loss detected: {loss}, skipping optimizer step", flush=True)
-            return float('inf')
-        
         training_rounds += 1
-        
+
         # 【学习率调度】在每个训练步后更新学习率
         if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
             current_lr = apply_learning_rate(training_rounds)
@@ -1035,19 +1138,19 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             except Exception as e:
                 print(f"[Warning] Failed to decode preview: {e}", flush=True)
             print("", flush=True)
-        
+
         return loss.item()
-    
+
     except RuntimeError as e:
         # 【修复】捕获CUDA运行时错误
         error_msg = str(e)
         if "CUDA" in error_msg or "cuda" in error_msg.lower():
             print(f"[CUDA Error] CUDA运行时错误: {e}", flush=True)
             print(f"[CUDA Error] 尝试恢复CUDA状态...", flush=True)
-            
+
             # 清理优化器状态和梯度
             optimizer.zero_grad(set_to_none=True)
-            
+
             # 清理GPU缓存
             if torch.cuda.is_available():
                 try:
@@ -1056,7 +1159,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                     print(f"[CUDA Error] GPU缓存已清理，跳过当前样本", flush=True)
                 except Exception as cleanup_error:
                     print(f"[CUDA Error] 清理GPU缓存失败: {cleanup_error}", flush=True)
-            
+
             return float('inf')
         else:
             # 其他RuntimeError
@@ -1066,3 +1169,15 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         # 【修复】捕获所有其他异常
         print(f"[Error] 训练步骤发生未知错误: {e}, skipping this sample", flush=True)
         return float('inf')
+    finally:
+        # Per-step profiling: 时间与显存（分配/保留）
+        try:
+            elapsed = time.time() - t0
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"[Profile] Step {training_rounds}: time={elapsed:.3f}s, Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB", flush=True)
+            else:
+                print(f"[Profile] Step {training_rounds}: time={elapsed:.3f}s, no CUDA", flush=True)
+        except Exception:
+            pass
