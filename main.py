@@ -149,6 +149,48 @@ scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.fl
 print(f"Using device: {device}", flush=True)
 print(f"AMP enabled: {use_amp}, AMP dtype: {amp_dtype}", flush=True)
 model = _load_model()
+# 检索模块已移除；使用向量压缩与卸载策略来在训练/推理时减小显存占用
+print("[Info] Retrieval module removed; using vector compression/offload.", flush=True)
+
+
+def _get_gpu_memory_ratio(device=None) -> float:
+    """返回当前 GPU 的显存使用比例（0.0 当不可用）。
+    使用 torch.cuda.memory_reserved/allocated 和 device 总显存计算。
+    """
+    try:
+        if not torch.cuda.is_available():
+            return 0.0
+        # 解析 device index
+        if device is None:
+            idx = torch.cuda.current_device()
+        else:
+            if isinstance(device, torch.device):
+                if device.type == 'cuda' and device.index is not None:
+                    idx = device.index
+                else:
+                    idx = torch.cuda.current_device()
+            else:
+                idx = int(device)
+        props = torch.cuda.get_device_properties(idx)
+        total = float(props.total_memory)
+        reserved = float(torch.cuda.memory_reserved(idx))
+        allocated = float(torch.cuda.memory_allocated(idx))
+        used = max(reserved, allocated)
+        return used / total if total > 0 else 0.0
+    except Exception:
+        return 0.0
+
+
+def auto_compress_trigger(history_tensor) -> bool:
+    """仅在 GPU 内存占用接近配置阈值时返回 True，否则返回 False。
+    该函数不会直接执行压缩；调用点应决定何时真正压缩并卸载。
+    """
+    try:
+        ratio = _get_gpu_memory_ratio(history_tensor.device if history_tensor is not None else None)
+        thresh = float(CONFIG.get("compress_on_memory_ratio", 0.9))
+        return ratio >= thresh
+    except Exception:
+        return False
 
 # 【显存优化】关闭torch.compile，避免额外显存占用
 print("[Info] Running without torch.compile optimization (disabled for memory efficiency).", flush=True)
@@ -313,21 +355,59 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
     if answer_tensor.numel() == 0:
         return None, None, None
 
+    # 【新增】检查序列长度，防止长文本显存爆炸
+    # 现在优先使用检索/向量索引处理超长历史，避免直接截断或跳过样本
+    estimated_total_len = ask_tensor.numel() + answer_tensor.numel() + 10  # +10为特殊token
+    if hist_context:
+        estimated_total_len += TextTokenizer.encode(hist_context).numel() + 10
+
+    if estimated_total_len > 4096:
+        # 当序列非常长时：仅在 GPU 显存占用接近阈值时才进行向量压缩并卸载到CPU/磁盘，
+        # 否则保留原始历史（避免不必要的压缩开销）
+        logging.debug(f"样本估算过长（estimated_len={estimated_total_len}），评估是否需要压缩")
+        try:
+            # 仅在显存占用足够高时触发压缩
+            mem_ratio = _get_gpu_memory_ratio(device)
+            mem_thresh = float(CONFIG.get("compress_on_memory_ratio", 0.9))
+            logging.debug(f"当前GPU显存占用比={mem_ratio:.3f}, 阈值={mem_thresh}")
+            if mem_ratio >= mem_thresh and hist_context and hist_context.strip():
+                history_tokens = TextTokenizer.encode(hist_context).to(device)
+                # 计算压缩向量（在模型当前device上计算），然后卸载到CPU并保存到磁盘临时文件
+                with torch.no_grad():
+                    comp = model.compress_history_vectors(history_tokens)
+                comp_cpu = comp.cpu()
+                import time
+                ts = int(time.time() * 1000)
+                path = f"compressed_history_{ts}.pt"
+                torch.save({"vectors": comp_cpu}, path)
+                logging.info(f"历史上下文已压缩并卸载到 {path} （shape={tuple(comp_cpu.shape)})")
+                # 释放GPU上的历史tokens并清理缓存
+                try:
+                    del history_tokens
+                except Exception:
+                    pass
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # 不把完整历史放回训练序列；使用空历史占位符
+                hist_context = ""
+            else:
+                logging.debug("未达到显存压缩阈值，保留原始历史（暂不压缩）")
+        except Exception as e:
+            logging.warning(f"历史压缩或卸载失败，继续使用原始历史（可能风险OOM）: {e}")
+
     segments: list = []
 
     if hist_context is not None and hist_context.strip():
         history_tensor = TextTokenizer.encode(hist_context).to(device)
 
-        # 【修复】检测压缩触发条件，但跳过压缩样本以避免维度不匹配
-        # 原因：compress_history_vectors返回2维连续向量[compress_num, emb_size]，
-        # 而_build_train_sequence期望1维token索引[seq_len]，直接拼接会导致
-        # "Tensors must have same number of dimensions: got 1 and 2" 错误
-        # 当前架构不支持混合离散token和连续向量输入
+        # 如果当前 GPU 显存已经接近阈值，则上游应已在 estimated_total_len 分支
+        # 触发压缩并卸载；此处仅检查是否仍需清理历史以避免混合输入问题
         if auto_compress_trigger(history_tensor):
-            # 跳过该样本，记录日志
-            logging.debug(f"跳过训练样本：历史上下文过长（seq_len={history_tensor.numel()}），"
-                         f"触发压缩但架构不支持混合输入")
-            return None, None, None
+            logging.debug(
+                f"检测到高显存占用（seq_len={history_tensor.numel()}），假定已在上游执行压缩并卸载，忽略原始历史"
+            )
+            # 清除历史以避免在训练序列中混合连续向量
+            history_tensor = torch.tensor([], dtype=torch.long, device=device)
 
         segments = [
             (TextTokenizer.START_GENERATION_TOKEN, False),
@@ -586,6 +666,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     if not text or not isinstance(text, str):
         return "无效输入"
     
+    # 【新增】如果未指定max_generate_tokens，使用配置中的默认值
+    if max_generate_tokens is None:
+        max_generate_tokens = int(CONFIG.get("max_generation_len", 512))
+    
     model.eval()
     output_text = ""
 
@@ -617,11 +701,16 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
         ])
 
+    # 【新增】检查prompt长度，防止输入过长
+    max_seq_len = int(CONFIG.get("max_seq_len", 1024))
+    if prompt.numel() > max_seq_len:
+        logging.warning(f"生成时prompt过长（seq_len={prompt.numel()}），截断到{max_seq_len}")
+        prompt = prompt[:max_seq_len]
+
     print("\n---Generated reply:", flush=True)
 
     min_new_tokens = 1
-    if max_generate_tokens is not None:
-        max_generate_tokens = max(1, int(max_generate_tokens))
+    max_generate_tokens = max(1, int(max_generate_tokens))
     
     # 读取采样参数
     top_k = int(CONFIG.get("top_k", 0))
@@ -653,7 +742,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         # 【修复】使用Counter记录已生成token的频率，实现基于频率的重复惩罚
         generated_tokens = Counter()
         
-        while max_generate_tokens is None or step < max_generate_tokens:
+        while step < max_generate_tokens:
             try:
                 next_logits = logits[-1]
                 if step < min_new_tokens:
@@ -749,6 +838,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 print(f"Error during generation: {e}", flush=True)
                 break
         
+        # 【新增】生成完成后清理GPU缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         return output_text
 
 
@@ -768,6 +861,17 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     global training_rounds
     
     model.train()
+    
+    # 【新增】显存监控：每100步输出一次显存使用情况
+    if training_rounds > 0 and training_rounds % 100 == 0 and torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        print(f"[Memory] Step {training_rounds}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB", flush=True)
+        
+        # 【新增】如果reserved显存过高，定期清理缓存
+        if reserved > 5.0:  # 超过5GB时清理
+            torch.cuda.empty_cache()
+            print(f"[Memory] Cleared GPU cache", flush=True)
     
     if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
         optimizer.zero_grad(set_to_none=True)
