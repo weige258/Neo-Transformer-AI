@@ -772,120 +772,150 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
         optimizer.zero_grad(set_to_none=True)
 
-    with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-        result = model(train_tensor, use_cache=False)
-        if isinstance(result, tuple):
-            logits = result[0]
-        else:
-            logits = result
+    try:
+        with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+            result = model(train_tensor, use_cache=False)
+            if isinstance(result, tuple):
+                logits = result[0]
+            else:
+                logits = result
 
-        # 应用目标掩码并进行 next-token prediction 对齐
-        # 对于 next-token prediction，targets 应该是 train_tensor 右移一位
-        # 确保 logits 和 targets 长度相同
-        if len(train_tensor) > 1:
-            # 正确的 next-token prediction 对齐
-            # logits 对应位置 i，targets 对应位置 i+1
-            masked_logits = logits[:-1][target_mask[1:]]
-            masked_targets = train_tensor[1:][target_mask[1:]]
-            
-            if len(masked_logits) > 0 and len(masked_targets) > 0:
-                if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
-                    print(f"[Warning] NaN/Inf in logits. "
-                          f"train_tensor range: [{train_tensor.min()}, {train_tensor.max()}], "
-                          f"seq_len: {len(train_tensor)}, "
-                          f"preview: {TextTokenizer.decode(preview[:50])[:100]}", flush=True)
-                    return float('inf')
+            # 应用目标掩码并进行 next-token prediction 对齐
+            # 对于 next-token prediction，targets 应该是 train_tensor 右移一位
+            # 确保 logits 和 targets 长度相同
+            if len(train_tensor) > 1:
+                # 正确的 next-token prediction 对齐
+                # logits 对应位置 i，targets 对应位置 i+1
+                masked_logits = logits[:-1][target_mask[1:]]
+                masked_targets = train_tensor[1:][target_mask[1:]]
                 
-                if torch.isnan(masked_targets).any() or torch.isinf(masked_targets).any():
-                    print(f"[Warning] NaN or Inf detected in targets, skipping this step", flush=True)
-                    return float('inf')
-                
-                loss = loss_func(masked_logits, masked_targets)
-                
-                if torch.isnan(loss):
-                    print(f"[Warning] NaN loss detected, skipping this step", flush=True)
-                    return float('inf')
+                if len(masked_logits) > 0 and len(masked_targets) > 0:
+                    if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
+                        print(f"[Warning] NaN/Inf in logits. "
+                              f"train_tensor range: [{train_tensor.min()}, {train_tensor.max()}], "
+                              f"seq_len: {len(train_tensor)}, "
+                              f"preview: {TextTokenizer.decode(preview[:50])[:100]}", flush=True)
+                        return float('inf')
+                    
+                    if torch.isnan(masked_targets).any() or torch.isinf(masked_targets).any():
+                        print(f"[Warning] NaN or Inf detected in targets, skipping this step", flush=True)
+                        return float('inf')
+                    
+                    loss = loss_func(masked_logits, masked_targets)
+                    
+                    if torch.isnan(loss):
+                        print(f"[Warning] NaN loss detected, skipping this step", flush=True)
+                        return float('inf')
+                else:
+                    loss = torch.tensor(0.0, device=device)
             else:
                 loss = torch.tensor(0.0, device=device)
-        else:
-            loss = torch.tensor(0.0, device=device)
-        
-        # 【修复】损失缩放，适配梯度累积
-        loss = loss / GRADIENT_ACCUMULATION_STEPS
-        
-        record_loss(loss.item())
-
-    # 检查损失是否有效
-    if not torch.isnan(loss) and not torch.isinf(loss):
-        if scaler.is_enabled():
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                # 【修复】完善的NaN梯度处理流程
-                optimizer.zero_grad(set_to_none=True)
-                
-                # 更新scaler状态，避免影响后续步骤
-                scaler.update()
-                
-                # 检查并清理模型参数中的NaN
-                nan_params = 0
-                for param in model.parameters():
-                    if param.grad is not None and torch.isnan(param.grad).any():
-                        param.grad = None
-                        nan_params += 1
-                
-                print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
-                      f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
-                return float('inf')
             
-            if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                scaler.step(optimizer)
-                scaler.update()
-        else:
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                # 【修复】完善的NaN梯度处理（无AMP场景）
-                optimizer.zero_grad(set_to_none=True)
-                
-                # 检查并清理模型参数中的NaN
-                nan_params = 0
-                for param in model.parameters():
-                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                        param.grad = None
-                        nan_params += 1
-                
-                print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
-                      f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
-                return float('inf')
+            # 【修复】损失缩放，适配梯度累积
+            loss = loss / GRADIENT_ACCUMULATION_STEPS
             
-            if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                optimizer.step()
-    else:
-        print(f"[Warning] Invalid loss detected: {loss}, skipping optimizer step", flush=True)
-        return float('inf')
-    
-    training_rounds += 1
-    
-    # 【学习率调度】在每个训练步后更新学习率
-    if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
-        current_lr = apply_learning_rate(training_rounds)
-        # 每100步打印一次学习率信息
-        if training_rounds % 100 == 0:
-            print(f"[Info] Step {training_rounds}, Current LR: {current_lr:.2e}, "
-                  f"Base LR: {base_lr:.2e}, Min LR: {min_learning_rate:.2e}", flush=True)
+            record_loss(loss.item())
 
-    if show_preview:
-        try:
-            decoded_preview = TextTokenizer.decode(preview[preview != 0])
-            RESET = '\033[0m'
-            if preview_color:
-                print(f"{preview_color}{decoded_preview}{RESET}", end="", flush=True)
+        # 检查损失是否有效
+        if not torch.isnan(loss) and not torch.isinf(loss):
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    # 【修复】完善的NaN梯度处理流程
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    # 更新scaler状态，避免影响后续步骤
+                    scaler.update()
+                    
+                    # 检查并清理模型参数中的NaN
+                    nan_params = 0
+                    for param in model.parameters():
+                        if param.grad is not None and torch.isnan(param.grad).any():
+                            param.grad = None
+                            nan_params += 1
+                    
+                    print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
+                          f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
+                    return float('inf')
+                
+                if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                    scaler.step(optimizer)
+                    scaler.update()
             else:
-                print(decoded_preview, end="", flush=True)
-        except Exception as e:
-            print(f"[Warning] Failed to decode preview: {e}", flush=True)
-        print("", flush=True)
+                loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    # 【修复】完善的NaN梯度处理（无AMP场景）
+                    optimizer.zero_grad(set_to_none=True)
+                    
+                    # 检查并清理模型参数中的NaN
+                    nan_params = 0
+                    for param in model.parameters():
+                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                            param.grad = None
+                            nan_params += 1
+                    
+                    print(f"[Warning] NaN/Inf gradient detected (grad_norm={grad_norm:.4f}), "
+                          f"cleaned {nan_params} parameter gradients, skipping optimizer step", flush=True)
+                    return float('inf')
+                
+                if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                    optimizer.step()
+        else:
+            print(f"[Warning] Invalid loss detected: {loss}, skipping optimizer step", flush=True)
+            return float('inf')
+        
+        training_rounds += 1
+        
+        # 【学习率调度】在每个训练步后更新学习率
+        if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
+            current_lr = apply_learning_rate(training_rounds)
+            # 每100步打印一次学习率信息
+            if training_rounds % 100 == 0:
+                print(f"[Info] Step {training_rounds}, Current LR: {current_lr:.2e}, "
+                      f"Base LR: {base_lr:.2e}, Min LR: {min_learning_rate:.2e}", flush=True)
+
+        if show_preview:
+            try:
+                decoded_preview = TextTokenizer.decode(preview[preview != 0])
+                RESET = '\033[0m'
+                if preview_color:
+                    print(f"{preview_color}{decoded_preview}{RESET}", end="", flush=True)
+                else:
+                    print(decoded_preview, end="", flush=True)
+            except Exception as e:
+                print(f"[Warning] Failed to decode preview: {e}", flush=True)
+            print("", flush=True)
+        
+        return loss.item()
     
-    return loss.item()
+    except RuntimeError as e:
+        # 【修复】捕获CUDA运行时错误
+        error_msg = str(e)
+        if "CUDA" in error_msg or "cuda" in error_msg.lower():
+            print(f"[CUDA Error] CUDA运行时错误: {e}", flush=True)
+            print(f"[CUDA Error] 尝试恢复CUDA状态...", flush=True)
+            
+            # 清理优化器状态和梯度
+            optimizer.zero_grad(set_to_none=True)
+            
+            # 清理GPU缓存
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    print(f"[CUDA Error] GPU缓存已清理，跳过当前样本", flush=True)
+                except Exception as cleanup_error:
+                    print(f"[CUDA Error] 清理GPU缓存失败: {cleanup_error}", flush=True)
+            
+            return float('inf')
+        else:
+            # 其他RuntimeError
+            print(f"[RuntimeError] {e}, skipping this sample", flush=True)
+            return float('inf')
+    except Exception as e:
+        # 【修复】捕获所有其他异常
+        print(f"[Error] 训练步骤发生未知错误: {e}, skipping this sample", flush=True)
+        return float('inf')
