@@ -353,8 +353,8 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
     if ask_text is None or answer_text is None:
         return None, None, None
 
-    ask_tensor = TextTokenizer.encode(ask_text).to(device)
-    answer_tensor = TextTokenizer.encode(answer_text).to(device)
+    ask_tensor = TextTokenizer.encode(ask_text)
+    answer_tensor = TextTokenizer.encode(answer_text)
 
     if answer_tensor.numel() == 0:
         return None, None, None
@@ -375,7 +375,8 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
             mem_thresh = float(CONFIG.get("compress_on_memory_ratio", 0.9))
             logging.debug(f"当前GPU显存占用比={mem_ratio:.3f}, 阈值={mem_thresh}")
             if mem_ratio >= mem_thresh and hist_context and hist_context.strip():
-                history_tokens = TextTokenizer.encode(hist_context).to(device)
+                # 在 CPU 上编码 tokens，避免一次性把大张量移到 GPU 导致 OOM
+                history_tokens = TextTokenizer.encode(hist_context)
                 # 计算压缩向量（在模型当前device上计算），然后卸载到CPU并保存到磁盘临时文件
                 with torch.no_grad():
                     comp = model.compress_history_vectors(history_tokens)
@@ -399,7 +400,7 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
     segments: list = []
 
     if hist_context is not None and hist_context.strip():
-        history_tensor = TextTokenizer.encode(hist_context).to(device)
+        history_tensor = TextTokenizer.encode(hist_context)
 
         # 如果当前 GPU 显存已经接近阈值，则上游应已在 estimated_total_len 分支
         # 触发压缩并卸载；此处仅检查是否仍需清理历史以避免混合输入问题
@@ -477,7 +478,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
     if ask is None:
         print(f"\n---Train{RESET}", flush=True)
 
-        text_tensor = TextTokenizer.encode(answer).to(device)
+        text_tensor = TextTokenizer.encode(answer)
         if text_tensor.numel() < 2:
             return
 
@@ -499,12 +500,12 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             print(f"{BLUE}{think}{RESET}", flush=True)
             print(f"{GREEN}{answer}{RESET}", flush=True)
             
-            ask_tensor = TextTokenizer.encode(ask).to(device)
-            think_tensor = TextTokenizer.encode(think).to(device)
-            answer_tensor = TextTokenizer.encode(answer).to(device)
+            ask_tensor = TextTokenizer.encode(ask)
+            think_tensor = TextTokenizer.encode(think)
+            answer_tensor = TextTokenizer.encode(answer)
             
             if history_context:
-                history_tensor = TextTokenizer.encode(history_context).to(device)
+                history_tensor = TextTokenizer.encode(history_context)
                 train_tensor, target_mask = _build_train_sequence([
                     (TextTokenizer.START_GENERATION_TOKEN, False),
                     (history_tensor, False),
@@ -880,44 +881,62 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
 
     try:
         with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-            result = model(train_tensor, use_cache=False)
-            if isinstance(result, tuple):
-                logits = result[0]
-            else:
-                logits = result
+            # 对于超长序列，采用分块前向以限制单次GPU内存占用。
+            chunk_size = int(CONFIG.get("max_forward_chunk", 1024))
+            seq_len = train_tensor.numel()
 
-            # 应用目标掩码并进行 next-token prediction 对齐
-            # 对于 next-token prediction，targets 应该是 train_tensor 右移一位
-            # 确保 logits 和 targets 长度相同
-            if len(train_tensor) > 1:
-                # 正确的 next-token prediction 对齐
-                # logits 对应位置 i，targets 对应位置 i+1
-                masked_logits = logits[:-1][target_mask[1:]]
-                masked_targets = train_tensor[1:][target_mask[1:]]
-                
-                if len(masked_logits) > 0 and len(masked_targets) > 0:
-                    if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
-                        print(f"[Warning] NaN/Inf in logits. "
-                              f"train_tensor range: [{train_tensor.min()}, {train_tensor.max()}], "
-                              f"seq_len: {len(train_tensor)}, "
-                              f"preview: {TextTokenizer.decode(preview[:50])[:100]}", flush=True)
-                        return float('inf')
-                    
-                    if torch.isnan(masked_targets).any() or torch.isinf(masked_targets).any():
-                        print(f"[Warning] NaN or Inf detected in targets, skipping this step", flush=True)
-                        return float('inf')
-                    
-                    loss = loss_func(masked_logits, masked_targets)
-                    
-                    if torch.isnan(loss):
-                        print(f"[Warning] NaN loss detected, skipping this step", flush=True)
-                        return float('inf')
+            if seq_len <= chunk_size:
+                result = model(train_tensor.to(device), use_cache=False)
+                if isinstance(result, tuple):
+                    logits = result[0]
+                else:
+                    logits = result
+
+                if len(train_tensor) > 1:
+                    masked_logits = logits[:-1][target_mask[1:].to(device)]
+                    masked_targets = train_tensor[1:].to(device)[target_mask[1:].to(device)]
+                    if masked_logits.numel() > 0:
+                        if torch.isnan(masked_logits).any() or torch.isinf(masked_logits).any():
+                            print(f"[Warning] NaN/Inf in logits. seq_len: {seq_len}, preview: {TextTokenizer.decode(preview[:50])[:100]}", flush=True)
+                            return float('inf')
+                        loss = loss_func(masked_logits, masked_targets)
+                    else:
+                        loss = torch.tensor(0.0, device=device)
                 else:
                     loss = torch.tensor(0.0, device=device)
             else:
-                loss = torch.tensor(0.0, device=device)
-            
-            # 【修复】损失缩放，适配梯度累积
+                # 分块处理，使用 past_key_values 传递上下文，保持上下文连续性
+                past = None
+                total_loss = None
+                for start in range(0, seq_len, chunk_size):
+                    end = min(start + chunk_size, seq_len)
+                    chunk = train_tensor[start:end].to(device)
+                    chunk_mask = target_mask[start:end]
+                    result = model(chunk, past_key_values=past, use_cache=True)
+                    if isinstance(result, tuple):
+                        logits, past = result[0], result[1]
+                    else:
+                        logits = result
+
+                    if logits.size(0) > 1:
+                        local_mask = chunk_mask[1:]
+                        if local_mask.any():
+                            masked_logits = logits[:-1][local_mask.to(device)]
+                            masked_targets = train_tensor[start + 1:end][local_mask].to(device)
+                            if masked_logits.numel() > 0:
+                                loss_chunk = loss_func(masked_logits, masked_targets)
+                            else:
+                                loss_chunk = torch.tensor(0.0, device=device)
+                        else:
+                            loss_chunk = torch.tensor(0.0, device=device)
+                    else:
+                        loss_chunk = torch.tensor(0.0, device=device)
+
+                    total_loss = loss_chunk if total_loss is None else total_loss + loss_chunk
+
+                loss = total_loss if total_loss is not None else torch.tensor(0.0, device=device)
+
+            # 缩放损失以适配梯度累积
             loss = loss / GRADIENT_ACCUMULATION_STEPS
             
             record_loss(loss.item())

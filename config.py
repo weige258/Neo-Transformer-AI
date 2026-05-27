@@ -35,6 +35,8 @@ CONFIG: Dict[str, Any] = {
     "use_amp": True,                          # 是否启用自动混合精度（AMP）
     "use_gradient_checkpointing": True,       # 是否在Transformer block上启用梯度检查点
     "gpu_cache_clear_threshold_gb": 5.0,      # 当 reserved 显存超过此值（GB）时定期清理 cache
+    # 在前向时对超长序列进行分块处理，避免一次性分配过大显存
+    "max_forward_chunk": 1024,                # 前向时每个子序列的最大长度（token数）
     
     # ═══════════════════════════════════════════════════════
     # 【新增】4️⃣ 序列长度限制（防止长文本显存爆炸）

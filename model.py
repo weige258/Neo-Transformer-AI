@@ -477,26 +477,60 @@ class MainModel(nn.Module):
     ) -> torch.Tensor:
         if compress_ratio is None:
             compress_ratio = float(CONFIG.get("compress_ratio", 0.3))
-
         with torch.no_grad():
-            hist_emb = self.token_embedding(history_tokens)
-            if hist_emb.dim() == 3:
-                hist_emb = hist_emb.squeeze(0)
-            seq_len = hist_emb.size(0)
-            compress_num = max(16, int(seq_len * compress_ratio))
-            if seq_len <= compress_num:
-                return self.final_norm(hist_emb)
+            emb_weight = self.token_embedding.weight
+            # 如果 history_tokens 不在 embedding 权重同一设备上，则在 CPU 上执行压缩计算
+            if history_tokens.device != emb_weight.device:
+                # 在 CPU 上进行 embedding lookup 与压缩，避免把大张量搬到 GPU
+                hist_idx = history_tokens.to(torch.long).to("cpu")
+                weight_cpu = emb_weight.detach().to("cpu")
+                hist_emb = weight_cpu[hist_idx]
+                if hist_emb.dim() == 3:
+                    hist_emb = hist_emb.squeeze(0)
+                seq_len = hist_emb.size(0)
+                compress_num = max(16, int(seq_len * compress_ratio))
+                if seq_len <= compress_num:
+                    # 手动应用 final_norm（在 CPU 上）以避免移动 module
+                    w = self.final_norm.weight.detach().to("cpu")
+                    eps = self.final_norm.eps
+                    normed = hist_emb * torch.rsqrt(hist_emb.pow(2).mean(dim=-1, keepdim=True) + eps)
+                    return normed * w
 
-            scores = hist_emb.norm(dim=-1)
-            boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
-            pieces: list[torch.Tensor] = []
-            for idx in range(compress_num):
-                start = int(boundaries[idx].item())
-                end = max(start + 1, int(boundaries[idx + 1].item()))
-                segment = hist_emb[start:end]
-                weights = torch.softmax(scores[start:end].float(), dim=0).to(hist_emb.dtype)
-                pieces.append((segment * weights[:, None]).sum(dim=0))
-            return self.final_norm(torch.stack(pieces, dim=0))
+                scores = hist_emb.norm(dim=-1)
+                boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
+                pieces: list[torch.Tensor] = []
+                for idx in range(compress_num):
+                    start = int(boundaries[idx].item())
+                    end = max(start + 1, int(boundaries[idx + 1].item()))
+                    segment = hist_emb[start:end]
+                    weights = torch.softmax(scores[start:end].float(), dim=0).to(hist_emb.dtype)
+                    pieces.append((segment * weights[:, None]).sum(dim=0))
+                pieces_stacked = torch.stack(pieces, dim=0)
+                # final_norm on CPU
+                w = self.final_norm.weight.detach().to("cpu")
+                eps = self.final_norm.eps
+                normed = pieces_stacked * torch.rsqrt(pieces_stacked.pow(2).mean(dim=-1, keepdim=True) + eps)
+                return normed * w
+            else:
+                # 常规路径：history_tokens 与 embedding 在同一设备，按原逻辑处理
+                hist_emb = self.token_embedding(history_tokens)
+                if hist_emb.dim() == 3:
+                    hist_emb = hist_emb.squeeze(0)
+                seq_len = hist_emb.size(0)
+                compress_num = max(16, int(seq_len * compress_ratio))
+                if seq_len <= compress_num:
+                    return self.final_norm(hist_emb)
+
+                scores = hist_emb.norm(dim=-1)
+                boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
+                pieces: list[torch.Tensor] = []
+                for idx in range(compress_num):
+                    start = int(boundaries[idx].item())
+                    end = max(start + 1, int(boundaries[idx + 1].item()))
+                    segment = hist_emb[start:end]
+                    weights = torch.softmax(scores[start:end].float(), dim=0).to(hist_emb.dtype)
+                    pieces.append((segment * weights[:, None]).sum(dim=0))
+                return self.final_norm(torch.stack(pieces, dim=0))
 
     def forward(
         self,
