@@ -304,6 +304,10 @@ class CompressedSparseDynamicAttention(nn.Module):
         """动态Top-K记忆注意力（显存优化版：避免 expand 大张量）
 
         使用批量索引选取替代 value_bank.expand，减少中间张量大小。
+        
+        性能说明：torch.topk 在 mem_len 较大时是瓶颈。
+        由于 Path 2（滑动窗口）已覆盖局部精确注意力，Path 3 的 mem_k
+        是压缩后的远距离记忆，mem_len 通常远小于原始序列长度。
         """
         if mem_k.size(-2) == 0:
             return torch.zeros_like(q)
@@ -547,15 +551,36 @@ class MainModel(nn.Module):
         )
         self.final_norm = RMSNorm(emb_size)
         self.output_linear = nn.Linear(emb_size, dict_size, bias=False)
+        
+        # ── 权重绑定（Weight Tying） ──
+        # 将输出投影层权重与输入 embedding 共享，减少参数量约 30%，
+        # 同时利用输入/输出语义空间的对称性提升泛化能力。
+        # 
+        # 梯度流说明（配合梯度检查点）：
+        #   forward: tokens → token_embedding → [transformer blocks]* → output_linear → logits
+        #   backward: loss → output_linear.weight.grad ← (来自 logits 的梯度)
+        #             loss → [transformer blocks]* → token_embedding.weight.grad ← (来自 lookup 的梯度)
+        #   PyTorch 自动对共享权重的梯度求和，这是正确且期望的行为。
+        #   * 标记的 transformer blocks 在 use_gradient_checkpointing=True 时会重计算。
+        #   由于 token_embedding 在 checkpoint 区域之外，梯度流不受影响。
         if bool(CONFIG.get("tie_token_embeddings", True)):
             self.output_linear.weight = self.token_embedding.weight
+            # 显式确保梯度状态：nn.Embedding.weight 默认为 requires_grad=True，
+            # 但显式调用可防止未来 PyTorch 版本行为变化导致的静默 bug
+            self.token_embedding.weight.requires_grad_(True)
+            # 输出层无 bias（bias=False），无需额外处理
+            # 注意：共享权重意味着 token_embedding.weight.grad 会同时累积
+            # 来自 embedding lookup 和 output projection 的梯度，PyTorch 自动求和
 
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
+        # 初始化输入 embedding（如果与输出绑定，则同时初始化了两者）
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        # 仅在未绑定时独立初始化输出层（避免覆盖共享权重的初始化）
         if self.output_linear.weight is not self.token_embedding.weight:
             nn.init.normal_(self.output_linear.weight, mean=0.0, std=0.02)
+        # 初始化其他线性层（排除已绑定权重的 output_linear）
         for module in self.modules():
             if isinstance(module, nn.Linear) and module.weight is not self.output_linear.weight:
                 nn.init.xavier_uniform_(module.weight)

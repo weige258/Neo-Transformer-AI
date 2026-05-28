@@ -52,11 +52,12 @@ class SelfRewardModel:
         self.unk_token_id = TextTokenizer.UNKNOWN_TOKEN
         
         self.reward_weights = {
-            'cot_completeness': 0.25,
-            'output_consistency': 0.25,
-            'length_compliance': 0.15,
-            'no_unk': 0.15,
-            'semantic_novelty': 0.20,
+            'cot_completeness': 0.20,
+            'output_consistency': 0.20,
+            'length_compliance': 0.10,
+            'no_unk': 0.10,
+            'semantic_novelty': 0.15,
+            'answer_completeness': 0.25,   # 【新增】回答完整性：严惩"只有思维链无回答"的作弊行为
         }
         
         # 【优化】基于最新研究调整奖励阈值参数
@@ -255,6 +256,108 @@ class SelfRewardModel:
         else:
             return max_len / text_len
     
+    @staticmethod
+    def evaluate_generation_completeness(tokens: list) -> float:
+        """检查生成序列的完整性：思维链结束后是否有实际回答内容。
+        
+        这是对抗"奖励作弊"（Reward Hacking）的核心机制。
+        模型可能学会只输出思维链就直接结束以获取高奖励，
+        此函数检测并严厉惩罚这种行为。
+        
+        Args:
+            tokens: 原始 token ID 列表（包含特殊 token）
+            
+        Returns:
+            惩罚分数：0.0 = 正常，负值 = 无回答（越大越严厉）
+        """
+        try:
+            think_end_idx = tokens.index(TextTokenizer.THINK_END_TOKEN)
+        except ValueError:
+            # 没有 THINK_END，可能是无思维链的纯回答模式，不惩罚
+            return 0.0
+        
+        # 找到 THINK_END 之后的所有 token
+        answer_tokens = tokens[think_end_idx + 1:]
+        
+        # 过滤掉特殊 token（END_GENERATION, UNKNOWN, START_GENERATION 等）
+        # 只保留普通字符 token（id > 6 且有效）
+        valid_answer_tokens = [
+            t for t in answer_tokens 
+            if t > 6 and TextTokenizer._is_valid_token(t)
+        ]
+        
+        # 如果思维链结束后没有有效回答内容 → 毁灭性惩罚
+        if len(valid_answer_tokens) == 0:
+            return -10.0  # 极大负奖励，彻底扼杀作弊动机
+        
+        # 回答太短（少于5个有效token）→ 适度惩罚
+        if len(valid_answer_tokens) < 5:
+            return -2.0
+        
+        return 0.0
+    
+    def compute_answer_completeness(
+        self, 
+        think_text: str = None, 
+        answer_text: str = None,
+        full_tokens: list = None
+    ) -> float:
+        """评估回答完整性：思维链之后是否包含有意义的回答。
+        
+        这是防止 PPO 策略网络作弊的关键维度。
+        如果模型只输出思维链就直接结束，将受到严厉惩罚。
+        
+        Args:
+            think_text: 思维链文本
+            answer_text: 回答文本
+            full_tokens: 完整的 token ID 序列（可选，用于精确检查）
+            
+        Returns:
+            0.0 ~ 1.0，无回答时返回 0.0
+        """
+        # 如果有 token 序列，使用精确的 token 级别检查
+        if full_tokens is not None and len(full_tokens) > 0:
+            penalty = self.evaluate_generation_completeness(full_tokens)
+            if penalty < 0:
+                return 0.0  # 毁灭性惩罚 → 此项奖励为0
+        
+        # 基于文本的检查
+        has_think = think_text and think_text.strip()
+        has_answer = answer_text and answer_text.strip()
+        
+        # 情况1：没有思维链（纯问答模式），不扣分
+        if not has_think:
+            return 0.5  # 中性分数，不奖励也不惩罚
+        
+        # 情况2：有思维链但没有回答 → 零分！
+        if has_think and not has_answer:
+            return 0.0
+        
+        # 情况3：有思维链且有回答
+        if has_think and has_answer:
+            score = 0.6  # 基础分
+            
+            # 回答长度合理性
+            answer_len = len(answer_text)
+            if answer_len >= 20:
+                score += 0.3  # 足够长的回答
+            elif answer_len >= 10:
+                score += 0.2
+            elif answer_len >= 5:
+                score += 0.1
+            
+            # 回答不应是思维链的重复
+            if len(think_text) > 0 and len(answer_text) > 0:
+                # 简单的字符级重叠检查
+                think_chars = set(think_text)
+                answer_chars = set(answer_text)
+                if len(answer_chars - think_chars) > 0:
+                    score += 0.1  # 回答有新内容
+            
+            return min(score, 1.0)
+        
+        return 0.5
+    
     def compute_no_unk(self, generated_text: str) -> float:
         """评估是否包含未知token"""
         if not generated_text:
@@ -299,9 +402,20 @@ class SelfRewardModel:
         context: str = None,
         reference_texts: List[str] = None,
         min_length: int = 10,
-        max_length: int = 500
+        max_length: int = 500,
+        full_tokens: list = None  # 【新增】原始token序列，用于精确检测奖励作弊
     ) -> Tuple[float, Dict[str, float]]:
-        """计算总奖励并自动记录到历史"""
+        """计算总奖励并自动记录到历史
+        
+        Args:
+            think_text: 思维链文本
+            answer_text: 回答文本
+            context: 上下文
+            reference_texts: 参考文本列表
+            min_length: 最小长度
+            max_length: 最大长度
+            full_tokens: 【新增】完整token ID序列，用于精确检测"只有思维链无回答"
+        """
         rewards = {}
         
         if think_text:
@@ -314,6 +428,13 @@ class SelfRewardModel:
         rewards['length_compliance'] = self.compute_length_compliance(generated_text, min_length, max_length)
         rewards['no_unk'] = self.compute_no_unk(generated_text)
         rewards['semantic_novelty'] = self.compute_semantic_novelty(generated_text, reference_texts)
+        
+        # 【新增】回答完整性评估：严惩"只有思维链无回答"的作弊行为
+        rewards['answer_completeness'] = self.compute_answer_completeness(
+            think_text=think_text,
+            answer_text=answer_text,
+            full_tokens=full_tokens
+        )
         
         total_reward = sum(
             rewards[key] * self.reward_weights[key]
@@ -415,8 +536,11 @@ class LightweightPPO:
         context: str = None,
         reference_texts: List[str] = None,
         model_log_probs: torch.Tensor | None = None,
-    ) -> float:
-        """收集一个episode的数据并计算奖励。
+    ) -> Tuple[float, Dict[str, float]]:
+        """收集一个 episode 的数据并计算奖励。
+
+        【修复】始终在收集时计算旧策略的逐 token log_prob，
+        不再使用 0.0 占位值（之前会导致 ratio 计算完全失效）。
 
         Args:
             prompt: 输入提示
@@ -424,8 +548,7 @@ class LightweightPPO:
             answer_text: 回答文本
             context: 上下文
             reference_texts: 参考文本列表
-            model_log_probs: 模型输出的对数概率（可选）。若为 None，
-                             将在update时通过当前策略重新计算。
+            model_log_probs: 【已弃用】保留参数兼容性，实际会被忽略
         """
         total_reward, reward_breakdown = self.reward_model.compute_total_reward(
             think_text=think_text,
@@ -436,7 +559,7 @@ class LightweightPPO:
 
         self.episode_data['rewards'].append(float(total_reward))
 
-        # 保存生成的文本内容，用于后续重新计算current_log_prob
+        # 构建完整生成文本
         generated_text = ""
         if think_text:
             generated_text += think_text
@@ -445,50 +568,56 @@ class LightweightPPO:
                 generated_text += " "
             generated_text += answer_text
         
-        # 保存prompt和generated_text用于后续计算
         self.episode_data['prompts'].append(prompt)
         self.episode_data['generated_texts'].append(generated_text)
 
-        if model_log_probs is not None:
-            # 使用模型真实输出的对数概率
-            if isinstance(model_log_probs, torch.Tensor):
-                self.episode_data['log_probs'].append(
-                    model_log_probs.detach().to(self.device).mean()
-                )
+        # 【核心修复】在 no_grad 下记录旧策略的逐 token log_prob
+        # 关键：必须在 torch.no_grad() 内计算，否则：
+        # 1. 前向传播的计算图会污染 SFT 训练的梯度状态
+        # 2. 在 train() 调用链中，optimizer.zero_grad 可能尚未执行
+        # 3. 额外计算图占用显存且无意义（我们只需记录值，不需要梯度）
+        if prompt and generated_text:
+            with torch.no_grad():
+                old_token_lps = self._compute_token_log_probs(prompt, generated_text)
+            if old_token_lps is not None:
+                self.episode_data['log_probs'].append(old_token_lps.detach())
             else:
                 self.episode_data['log_probs'].append(
-                    torch.tensor(float(model_log_probs), device=self.device)
+                    torch.tensor([0.0], device=self.device)
                 )
         else:
-            # 使用占位值，将在update_policy时重新计算真实的current_log_prob
-            self.episode_data['log_probs'].append(torch.tensor(0.0, device=self.device))
+            self.episode_data['log_probs'].append(
+                torch.tensor([0.0], device=self.device)
+            )
 
         return total_reward, reward_breakdown
     
-    def _compute_current_log_prob(self, prompt: str, generated_text: str) -> torch.Tensor:
-        """计算当前策略下生成文本的对数概率
+    def _compute_token_log_probs(
+        self, prompt: str, generated_text: str
+    ) -> torch.Tensor | None:
+        """计算当前策略下每个生成 token 的对数概率（逐 token，非均值）。
+        
+        这是标准 PPO 所要求的：ratio 必须在每个 token 级别计算和裁剪，
+        而非先在序列维度取均值再计算单一 ratio。
         
         Args:
             prompt: 输入提示文本
             generated_text: 生成的文本
             
         Returns:
-            平均对数概率值
+            (G,) 形状的逐 token log_prob 张量，或 None（无法计算时）
         """
         if not generated_text or not generated_text.strip():
-            return torch.tensor(0.0, device=self.device)
+            return None
         
-        # 编码prompt和generated_text
         prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
         generated_tokens = TextTokenizer.encode(generated_text).to(self.device)
         
         if generated_tokens.numel() == 0:
-            return torch.tensor(0.0, device=self.device)
+            return None
         
-        # 拼接完整的输入序列
         full_sequence = torch.cat([prompt_tokens, generated_tokens])
         
-        # 前向传播获取logits
         with torch.set_grad_enabled(True):
             result = self.model(full_sequence, use_cache=False)
             if isinstance(result, tuple):
@@ -496,31 +625,29 @@ class LightweightPPO:
             else:
                 logits = result
         
-        # 计算logits对应的log_prob
-        # logits shape: (seq_len, vocab_size)
-        # 我们需要计算generated_tokens中每个token的log_prob
-        # 对于自回归模型，位置i的logit预测位置i+1的token
-        if len(logits) < len(generated_tokens) + 1:
-            return torch.tensor(0.0, device=self.device)
-        
-        # 提取对应generated_tokens位置的logits
-        # prompt有P个token，generated有G个token
-        # logits[P:P+G]对应预测generated_tokens的logits
         prompt_len = len(prompt_tokens)
-        generated_logits = logits[prompt_len:prompt_len + len(generated_tokens)]
+        gen_len = len(generated_tokens)
         
-        # 计算log_softmax
+        if len(logits) < gen_len + 1:
+            return None
+        
+        # logits[p:p+g] 预测 generated_tokens
+        generated_logits = logits[prompt_len:prompt_len + gen_len]
         log_probs = F.log_softmax(generated_logits, dim=-1)
         
-        # 提取实际generated_tokens对应的log_prob
-        # log_probs[i, generated_tokens[i]]就是第i个token的log_prob
+        # 逐 token 提取 log_prob → (G,) 形状
         token_log_probs = log_probs.gather(
-            dim=-1, 
-            index=generated_tokens.unsqueeze(-1)
+            dim=-1, index=generated_tokens.unsqueeze(-1)
         ).squeeze(-1)
         
-        # 返回平均log_prob
-        return token_log_probs.mean()
+        return token_log_probs  # (G,)
+    
+    def _compute_current_log_prob(self, prompt: str, generated_text: str) -> torch.Tensor:
+        """【保留兼容】返回平均对数概率（标量），旧接口。"""
+        token_lps = self._compute_token_log_probs(prompt, generated_text)
+        if token_lps is None:
+            return torch.tensor(0.0, device=self.device)
+        return token_lps.mean()
     
     def compute_advantages(self, rewards: List[float]) -> List[float]:
         """计算优势函数"""
@@ -537,97 +664,126 @@ class LightweightPPO:
         return advantages.tolist()
     
     def update_policy(self, batch_size: int = 4) -> Dict[str, float]:
-        """更新策略网络
+        """标准 PPO 策略更新（逐 token 比率 + 裁剪 + 多轮次）。
         
-        修复：正确计算PPO的重要性采样比率
-        ratio = exp(current_log_prob - old_log_prob)
+        核心改进（相比之前的简化实现）：
+        1. 逐 token 计算 ratio = exp(π_new - π_old)，而非先均值再单一 ratio
+        2. 逐 token 裁剪：clamp(ratio, 1-ε, 1+ε)，精确控制每步策略变化幅度
+        3. 多轮次 PPO：在相同 rollout 数据上迭代 ppo_epochs 次（充分利用数据）
+        4. 每次 epoch 重新前向计算 current_log_prob（因为模型参数已更新）
+        
+        参考：Schulman et al. "Proximal Policy Optimization Algorithms" (2017)
         """
         if len(self.episode_data['rewards']) < batch_size:
             return {'loss': 0.0, 'policy_loss': 0.0, 'entropy_loss': 0.0}
         
-        advantages = self.compute_advantages(self.episode_data['rewards'])
+        advantages_raw = self.compute_advantages(self.episode_data['rewards'])
         
+        # 选择高奖励样本（中位数以上）
         reward_threshold = sorted(self.episode_data['rewards'])[len(self.episode_data['rewards']) // 2]
         high_reward_indices = [
             i for i, r in enumerate(self.episode_data['rewards'])
             if r >= reward_threshold
         ]
-        
         if len(high_reward_indices) == 0:
             high_reward_indices = list(range(len(self.episode_data['rewards'])))
         
-        total_loss = None
         total_policy_loss = 0.0
         total_entropy_loss = 0.0
+        total_approx_kl = 0.0
         update_count = 0
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        for idx in high_reward_indices:
-            old_log_prob = self.episode_data['log_probs'][idx]
-            advantage = advantages[idx]
-
-            # Ensure tensors
-            if not isinstance(old_log_prob, torch.Tensor):
-                old_log_prob = torch.tensor(old_log_prob, device=self.device, dtype=torch.float32)
-            if not isinstance(advantage, torch.Tensor):
-                advantage = torch.tensor(advantage, device=self.device, dtype=torch.float32)
-
-            # 修复：使用当前策略重新计算current_log_prob
-            # 这是PPO算法的核心：ratio = exp(log π_new(a|s) - log π_old(a|s))
-            prompt = self.episode_data['prompts'][idx]
-            generated_text = self.episode_data['generated_texts'][idx]
-            
-            if prompt and generated_text:
-                # 通过当前模型重新前向传播计算真实的current_log_prob
-                current_log_prob = self._compute_current_log_prob(prompt, generated_text)
-                
-                # 计算importance sampling ratio
-                # ratio = π_new(a|s) / π_old(a|s) = exp(log π_new(a|s) - log π_old(a|s))
-                ratio = torch.exp(current_log_prob - old_log_prob.detach())
-                
-                # PPO clipped surrogate objective
-                surr1 = ratio * advantage
-                surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantage
-
-                policy_loss = -torch.min(surr1, surr2).mean()
-
-                # Entropy bonus for exploration
-                entropy = -current_log_prob.mean()
-                entropy_loss = -self.entropy_coef * entropy
-
-                loss = policy_loss + entropy_loss
-            else:
-                # 如果缺少prompt或generated_text，跳过此样本
-                print(f"[Warning] PPO更新: 样本{idx}缺少prompt或generated_text，跳过", flush=True)
-                continue
-
-            if total_loss is None:
-                total_loss = loss
-            else:
-                total_loss = total_loss + loss
-
-            total_policy_loss += policy_loss.item()
-            total_entropy_loss += entropy_loss.item()
-            update_count += 1
-
-        if update_count > 0 and total_loss is not None:
-            total_loss.backward()
-
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-            # 【PPO学习率调度】在更新前应用学习率
-            current_lr = self.apply_ppo_learning_rate()
-            self.ppo_training_steps += 1
-
-            self.optimizer.step()
-            
-            # 每100步打印一次学习率信息
-            if self.ppo_training_steps % 100 == 0:
-                print(f"[PPO] Step {self.ppo_training_steps}, Current LR: {current_lr:.2e}, "
-                      f"Base LR: {self.base_learning_rate:.2e}", flush=True)
         
-        # 清空episode数据
+        # ── 多轮次 PPO（核心） ──
+        for epoch in range(self.ppo_epochs):
+            self.optimizer.zero_grad(set_to_none=True)
+            epoch_policy_loss = 0.0
+            epoch_entropy_loss = 0.0
+            epoch_update_count = 0
+            
+            for idx in high_reward_indices:
+                old_token_lps = self.episode_data['log_probs'][idx]  # (G,) 或标量占位
+                advantage = advantages_raw[idx]
+                
+                if not isinstance(old_token_lps, torch.Tensor):
+                    old_token_lps = torch.tensor([old_token_lps], device=self.device, dtype=torch.float32)
+                if not isinstance(advantage, torch.Tensor):
+                    advantage = torch.tensor(advantage, device=self.device, dtype=torch.float32)
+                
+                prompt = self.episode_data['prompts'][idx]
+                generated_text = self.episode_data['generated_texts'][idx]
+                
+                if not prompt or not generated_text:
+                    continue
+                
+                # 【关键】每轮 epoch 重新计算当前策略的逐 token log_prob
+                current_token_lps = self._compute_token_log_probs(prompt, generated_text)
+                if current_token_lps is None:
+                    continue
+                
+                # ── 对齐序列长度（安全网） ──
+                old_len = old_token_lps.numel()
+                new_len = current_token_lps.numel()
+                min_len = min(old_len, new_len)
+                if min_len == 0:
+                    continue
+                
+                # 截断到相同长度
+                old_lps = old_token_lps[:min_len].to(self.device)
+                new_lps = current_token_lps[:min_len].to(self.device)
+                
+                # ── 逐 token 重要性采样比率 ──
+                # ratio_t = π_new(a_t|s_t) / π_old(a_t|s_t)
+                #         = exp(log π_new - log π_old)
+                log_ratio = new_lps - old_lps.detach()
+                ratio = torch.exp(log_ratio)  # (min_len,)
+                
+                # ── PPO Clipped Surrogate Objective（逐 token） ──
+                # L^CLIP(θ) = E_t[min(ratio_t * A_t, clip(ratio_t, 1-ε, 1+ε) * A_t)]
+                surr1 = ratio * advantage        # 未裁剪
+                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantage
+                
+                # 逐 token 取 min 后取均值
+                policy_loss = -torch.min(surr1, surr2).mean()
+                
+                # ── 熵奖励（鼓励探索） ──
+                entropy = -new_lps.mean()
+                entropy_loss = -self.entropy_coef * entropy
+                
+                # ── 近似 KL 散度（监控指标） ──
+                # KL(π_old || π_new) ≈ mean(log π_old - log π_new)
+                approx_kl = (old_lps.detach() - new_lps).mean()
+                
+                loss = policy_loss + entropy_loss
+                
+                # 梯度累积（多轮次 + 多样本混合）
+                (loss / (self.ppo_epochs * len(high_reward_indices))).backward()
+                
+                epoch_policy_loss += policy_loss.item()
+                epoch_entropy_loss += entropy_loss.item()
+                total_approx_kl += approx_kl.item()
+                epoch_update_count += 1
+            
+            # ── 每个 epoch 结束后执行优化器步进 ──
+            if epoch_update_count > 0:
+                # 梯度裁剪（标准 PPO 做法）
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                current_lr = self.apply_ppo_learning_rate()
+                self.ppo_training_steps += 1
+                self.optimizer.step()
+                
+                total_policy_loss += epoch_policy_loss
+                total_entropy_loss += epoch_entropy_loss
+                update_count += epoch_update_count
+                
+                if self.ppo_training_steps % 50 == 0:
+                    avg_kl = total_approx_kl / max(epoch_update_count, 1)
+                    print(f"[PPO] Epoch {epoch+1}/{self.ppo_epochs}, Step {self.ppo_training_steps}, "
+                          f"LR={current_lr:.2e}, PolicyLoss={epoch_policy_loss/max(epoch_update_count,1):.4f}, "
+                          f"Entropy={epoch_entropy_loss/max(epoch_update_count,1):.4f}, "
+                          f"ApproxKL={avg_kl:.4f}", flush=True)
+        
+        # ── 清空 episode 数据 ──
         self.episode_data = {
             'log_probs': [],
             'rewards': [],
@@ -638,10 +794,12 @@ class LightweightPPO:
             'generated_texts': []
         }
         
+        n_updates = max(update_count, 1)
         return {
-            'loss': total_loss.item() if total_loss is not None else 0.0,
-            'policy_loss': total_policy_loss / max(update_count, 1),
-            'entropy_loss': total_entropy_loss / max(update_count, 1)
+            'loss': (total_policy_loss + total_entropy_loss) / n_updates,
+            'policy_loss': total_policy_loss / n_updates,
+            'entropy_loss': total_entropy_loss / n_updates,
+            'approx_kl': total_approx_kl / n_updates
         }
     
     def clear_data(self):

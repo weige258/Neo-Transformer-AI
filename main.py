@@ -41,6 +41,15 @@ def _build_train_sequence(
       - is_target: True = 该段参与 loss 计算，False = 仅作为上下文
 
     返回 (train_tensor, target_mask)，两者长度严格相等。
+    
+    Loss Mask 语义（重要）：
+      target_mask[i]=True 表示 logits[i-1] → token[i] 的预测参与 loss 计算。
+      即：模型在位置 i-1 的输出需要正确预测位置 i 的 token。
+      
+    对于 CoT 训练，必须确保：
+      - THINK_END_TOKEN 位置的 mask=True → 模型学会在思考结束时输出 THINK_END
+      - answer 首 token 位置的 mask=True → 模型学会在 THINK_END 后立即输出回答
+      这两者缺一不可，否则模型会学会"只思考不回答"。
     """
     tensors: List[torch.Tensor] = []
     masks: List[torch.Tensor] = []
@@ -509,6 +518,11 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             
             if history_context:
                 history_tensor = TextTokenizer.encode(history_context)
+                # CoT 训练序列 Loss Mask 设计说明：
+                # target_mask[i]=True → logits[i-1] 预测 token[i] 时计算loss
+                # 关键：THINK_END_TOKEN 的 mask=True 确保其前面位置的logit学习输出THINK_END
+                #       answer 首token 的 mask=True 确保 THINK_END 位置的logit学习输出回答首字符
+                #       这保证了"思维链→回答"的过渡被正确训练，防止模型在THINK_END后直接结束
                 train_tensor, target_mask = _build_train_sequence([
                     (TextTokenizer.START_GENERATION_TOKEN, False),
                     (history_tensor, False),
@@ -516,24 +530,26 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                     (TextTokenizer.HISTORY_CONTEXT_START_TOKEN, False),
                     (ask_tensor, False),
                     (TextTokenizer.START_GENERATION_TOKEN, False),
-                    (TextTokenizer.THINK_START_TOKEN, False),
-                    (think_tensor, True),
-                    (TextTokenizer.THINK_END_TOKEN, True),
-                    (answer_tensor, True),
-                    (TextTokenizer.END_GENERATION_TOKEN, True),
+                    (TextTokenizer.THINK_START_TOKEN, False),   # 不预测思考开始标记
+                    (think_tensor, True),                        # 学习生成思维链内容
+                    (TextTokenizer.THINK_END_TOKEN, True),       # 学习在思考结束时输出THINK_END
+                    (answer_tensor, True),                       # ★ 学习从THINK_END过渡到回答
+                    (TextTokenizer.END_GENERATION_TOKEN, True),  # 学习在回答结束时输出END
                 ])
                 # preview 保持在 CPU，避免不必要的 GPU 移动
                 preview = torch.cat([think_tensor, answer_tensor])
                 _run_train_step(train_tensor, target_mask, preview, show_preview=False)
             else:
+                # CoT 训练序列 Loss Mask（无历史上下文版本）
+                # 同上：THINK_END→answer 的过渡是关键，两者 mask 皆为 True
                 train_tensor, target_mask = _build_train_sequence([
-                    (ask_tensor, False),
-                    (TextTokenizer.START_GENERATION_TOKEN, False),
-                    (TextTokenizer.THINK_START_TOKEN, False),
-                    (think_tensor, True),
-                    (TextTokenizer.THINK_END_TOKEN, True),
-                    (answer_tensor, True),
-                    (TextTokenizer.END_GENERATION_TOKEN, True),
+                    (ask_tensor, False),                         # 问题不参与loss
+                    (TextTokenizer.START_GENERATION_TOKEN, False), # 分隔符不参与loss
+                    (TextTokenizer.THINK_START_TOKEN, False),    # 不预测思考开始标记
+                    (think_tensor, True),                        # 学习生成思维链内容
+                    (TextTokenizer.THINK_END_TOKEN, True),       # 学习在思考结束时输出THINK_END
+                    (answer_tensor, True),                       # ★ 学习从THINK_END过渡到回答
+                    (TextTokenizer.END_GENERATION_TOKEN, True),  # 学习在回答结束时输出END
                 ])
                 preview = torch.cat([think_tensor, answer_tensor])
                 _run_train_step(train_tensor, target_mask, preview, show_preview=False)
@@ -726,6 +742,11 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
     with torch.inference_mode():
         thinking_started = False
+        # 【新增】CoT 完整性保护：追踪思维链结束后的强制回答步数
+        # 防止模型在 THINK_END 后直接输出 END_GENERATION_TOKEN 结束（奖励作弊）
+        force_answer_steps = 0      # 剩余强制回答步数（>0时禁止输出结束符）
+        FORCE_ANSWER_MIN_STEPS = 8  # THINK_END后至少强制生成8个有效token
+        
         if thinking_available:
             has_think_token = (prompt == TextTokenizer.THINK_START_TOKEN).any()
             if has_think_token:
@@ -750,10 +771,24 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         
         while step < max_generate_tokens:
             try:
-                next_logits = logits[-1]
+                next_logits = logits[-1].clone()  # 【修复】始终clone，避免修改原始logits
+                
                 if step < min_new_tokens:
-                    next_logits = next_logits.clone()
                     next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
+                
+                # ── 【新增】CoT 完整性强制干预 ──
+                # 如果刚结束思维链，强制禁止直接输出 END_GENERATION_TOKEN
+                # 这是对抗"奖励作弊"的关键机制：模型不能只思考不回答
+                if force_answer_steps > 0:
+                    # 强制抹去结束符和特殊符的概率，逼迫模型生成实际回答内容
+                    next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
+                    next_logits[TextTokenizer.UNKNOWN_TOKEN] = float("-inf")
+                    next_logits[TextTokenizer.THINK_START_TOKEN] = float("-inf")
+                    next_logits[TextTokenizer.THINK_END_TOKEN] = float("-inf")
+                    # 也抹去历史上下文标记，防止模型试图用上下文标记"混过去"
+                    next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
+                    next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
+                    force_answer_steps -= 1
 
                 # 【修复】应用基于频率的 repetition_penalty
                 # 根据Hugging Face标准实现：token出现频率越高，惩罚越强
@@ -779,14 +814,20 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 if index == TextTokenizer.THINK_END_TOKEN:
                     if thinking_available and thinking_started:
                         thinking_started = False
+                        # 【新增】思维链刚结束，启动强制回答期
+                        force_answer_steps = FORCE_ANSWER_MIN_STEPS
                         print(f"\n{GREEN}", end="", flush=True)
                         should_skip_output = True
                     else:
                         break
                 
                 elif index == TextTokenizer.END_GENERATION_TOKEN:
-                    # 【修复】思维阶段触发结束token，直接结束生成（移除强制切换逻辑）
-                    break
+                    # 【修复】如果还在强制回答期内，跳过结束符，重新采样
+                    # 不喂入模型，直接continue让模型从相同logits重新选择
+                    if force_answer_steps > 0:
+                        continue  # 跳过本次迭代，重新采样（END_GEN已被设为-inf）
+                    else:
+                        break
 
                 elif index == TextTokenizer.THINK_START_TOKEN:
                     if thinking_available and not thinking_started:
