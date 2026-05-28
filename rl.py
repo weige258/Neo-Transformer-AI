@@ -618,12 +618,17 @@ class LightweightPPO:
         
         full_sequence = torch.cat([prompt_tokens, generated_tokens])
         
-        with torch.set_grad_enabled(True):
-            result = self.model(full_sequence, use_cache=False)
-            if isinstance(result, tuple):
-                logits = result[0]
-            else:
-                logits = result
+        # 注意：不使用 torch.set_grad_enabled(True)！
+        # set_grad_enabled 会穿透外层的 torch.no_grad() 上下文，
+        # 导致 collect_episode 中意外构建计算图、污染 SFT 训练的梯度。
+        # 让调用方控制梯度状态即可：
+        #   collect_episode → torch.no_grad() → 不构建计算图
+        #   update_policy → 默认 grad 开启 → 正常构建计算图
+        result = self.model(full_sequence, use_cache=False)
+        if isinstance(result, tuple):
+            logits = result[0]
+        else:
+            logits = result
         
         prompt_len = len(prompt_tokens)
         gen_len = len(generated_tokens)

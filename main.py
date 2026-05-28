@@ -971,10 +971,12 @@ def _chunked_forward_backward(
                 num_chunks = max(1, (seq_len + step - 1) // step)
                 loss_scaled = loss_chunk / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
 
-            if scaler.is_enabled():
-                scaler.scale(loss_scaled).backward()
-            else:
-                loss_scaled.backward()
+            # 【修复】零 loss（无 grad_fn）时跳过 backward，避免崩溃
+            if loss_scaled.requires_grad:
+                if scaler.is_enabled():
+                    scaler.scale(loss_scaled).backward()
+                else:
+                    loss_scaled.backward()
 
             chunk_losses.append(loss_chunk.detach())
             del seg, logits, loss_chunk, loss_scaled
@@ -1052,10 +1054,11 @@ def _chunk_one_segment(
                     loss_sub = torch.tensor(0.0, device=device)
                 loss_scaled = loss_sub / GRADIENT_ACCUMULATION_STEPS
 
-            if scaler.is_enabled():
-                scaler.scale(loss_scaled).backward()
-            else:
-                loss_scaled.backward()
+            if loss_scaled.requires_grad:
+                if scaler.is_enabled():
+                    scaler.scale(loss_scaled).backward()
+                else:
+                    loss_scaled.backward()
             seg_losses.append(loss_sub.detach())
             del sub, logits, loss_sub, loss_scaled
 
@@ -1151,6 +1154,15 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                     loss = torch.tensor(0.0, device=device)
 
             loss = loss / GRADIENT_ACCUMULATION_STEPS
+            
+            # 【修复】标准训练路径必须显式调用 backward()
+            # 原代码缺少此调用，导致梯度从未被计算，训练完全无效！
+            # requires_grad 检查防止零 loss（无 grad_fn）时的崩溃
+            if loss.requires_grad:
+                if scaler.is_enabled():
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
         else:
             # ✅ 策略 2: KV Cache 分段训练（完整上下文，零截断）
