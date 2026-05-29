@@ -52,17 +52,24 @@ CONFIG: Dict[str, Any] = {
     "gpu_memory_skip_ratio": 0.92,   # 跳过样本的显存比例阈值（高于此值跳过，不做截断）
     
     # ═══════════════════════════════════════════════════════
-    # 5️⃣ 生成采样策略 (业界标准: Top-K + Top-P)
+    # 5️⃣ 生成采样策略 (Min-p Sampling — ICLR 2025 最新方案)
     # ═══════════════════════════════════════════════════════
-    "temperature": 0.6,              # 温度参数
-    "top_k": 50,                     # Top-K采样
-    "top_p": 0.95,                   # Top-P核采样
+    # Min-p 论文: "Turning Up the Heat" (Nguyen et al., ICLR 2025)
+    # 核心: 动态截断阈值 = 最大概率 × min_p_ratio，天然过滤垃圾token
+    # 已被 HuggingFace Transformers / VLLM 等主流框架采纳
+    "temperature": 0.5,              # 【修复】小模型降温至0.5，减少噪声
+    "min_p": 0.05,                   # Min-p 比例（0.05 为高质量推荐值）
+    "top_k": 0,                      # 【修复】关闭top-k，min-p更优
+    "top_p": 1.0,                    # 【修复】关闭top-p，min-p替代
     
     # ═══════════════════════════════════════════════════════
-    # 6️⃣ 生成质量控制 (重复惩罚 + 重复检测停止)
+    # 6️⃣ 生成质量控制
     # ═══════════════════════════════════════════════════════
-    "repetition_penalty": 1.05,      # 【修复】降低重复惩罚，避免常用中文字符被过度压制
-    "repetition_stop_threshold": 5,  # 重复停止阈值：连续N个相同token或重复n-gram则停止
+    "repetition_penalty": 1.02,      # 【修复】进一步降低，避免中文常用字被惩罚
+    "repetition_stop_threshold": 8,  # 重复停止阈值
+    # ── CoT 与输出完整性保护 ──
+    "force_answer_min_steps": 16,    # 【修复】THINK_END后最少强制的回答步数
+    "max_consecutive_garbage": 3,    # 【新增】连续垃圾token数阈值（触发重采样/停止）
     
     # ═══════════════════════════════════════════════════════
     # 7️⃣ 学习率调度配置 (SGDR + ReduceLROnPlateau — 适用于无限循环训练)

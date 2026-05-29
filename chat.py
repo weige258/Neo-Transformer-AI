@@ -5,6 +5,8 @@ import sys
 while True:
     try:
         user_input = input("\n请输入: ")
+        if not user_input or not user_input.strip():
+            continue
         generation(user_input)
     except KeyboardInterrupt:
         # 允许KeyboardInterrupt传播，让用户可以Ctrl+C退出
