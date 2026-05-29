@@ -216,7 +216,7 @@ print(f"模型参数: {total_params / 1e+8}亿", flush=True)
 loss_func = torch.nn.CrossEntropyLoss().to(device)
 
 # 【学习率配置】从CONFIG读取优化器参数
-base_lr = float(CONFIG.get("base_learning_rate", 2e-4))
+base_lr = float(CONFIG.get("base_learning_rate", 3e-4))
 weight_decay = float(CONFIG.get("weight_decay", 0.01))
 adam_beta1 = float(CONFIG.get("adam_beta1", 0.9))
 adam_beta2 = float(CONFIG.get("adam_beta2", 0.999))
@@ -262,65 +262,177 @@ else:
 
 print(f"[Info] Optimizer: {optimizer_type.upper()}, LR: {base_lr:.2e}, Weight Decay: {weight_decay:.2e}", flush=True)
 
-# 【学习率调度器】实现Warmup + Cosine Decay
-GRADIENT_ACCUMULATION_STEPS = int(CONFIG.get("gradient_accumulation_steps", 4))
+# ═══════════════════════════════════════════════════════════
+# 学习率调度器: SGDR + ReduceLROnPlateau (适用于无限循环训练)
+# ═══════════════════════════════════════════════════════════
+# 替换原因：旧系统固定 3000 步后 LR 永久平躺 → 无限训练中模型"脑死亡"
+# 新系统：SGDR 周期性重启 + Plateau 自动降 LR，天然适配 while True
+GRADIENT_ACCUMULATION_STEPS = int(CONFIG.get("gradient_accumulation_steps", 1))
 training_rounds = 0
-optimizer_step_count = 0  # 【修复】真实优化器步数，调度器按此计数而非每样本计数
+optimizer_step_count = 0  # 保留全局计数器，与调度器内部同步
 
-# 学习率调度器配置
-warmup_steps = int(CONFIG.get("warmup_steps", 300))
-warmup_init_lr = float(CONFIG.get("warmup_init_lr", 1e-7))
-min_learning_rate = float(CONFIG.get("min_learning_rate", 1e-6))
-total_training_steps = int(CONFIG.get("total_training_steps", 30000))
-cosine_decay_enabled = bool(CONFIG.get("cosine_decay_enabled", True))
-lr_scheduler_type = CONFIG.get("lr_scheduler_type", "cosine")
 
-def get_learning_rate(current_step: int) -> float:
-    """计算当前步的学习率（支持Warmup + 多种调度策略）
-    
-    Args:
-        current_step: 当前训练步数
-        
-    Returns:
-        当前学习率
+class LRSchedulerManager:
+    """SGDR + ReduceLROnPlateau 混合学习率调度器
+
+    解决旧系统"固定步数后永久平躺"的致命缺陷，适配无限循环训练。
+
+    两大机制协同：
+    ┌─────────────────────────────────────────────────────┐
+    │ ① SGDR (Cosine Annealing with Warm Restarts)       │
+    │    Loshchilov & Hutter, ICLR 2017                  │
+    │    LR 每 T_0 步从 current_base_lr 余弦衰减到       │
+    │    eta_min，然后"重启"回峰值。每个后续周期         │
+    │    长度 × T_mult，逐渐变长，越来越精细。           │
+    │                                                     │
+    │ ② ReduceLROnPlateau                                │
+    │    PyTorch 原生，loss 驱动                           │
+    │    loss 不改善时 current_base_lr 减半               │
+    │    防止 SGDR 在无效高 LR 区间浪费计算               │
+    └─────────────────────────────────────────────────────┘
+
+    学习率曲线示意:
+    LR ↑
+    3e-4 ┤  ╱╲          ← SGDR 周期1: 峰值=base_lr
+         │ ╱  ╲    ╱╲    ← 周期2: 更长, 峰值可能因plateau降低
+         │╱    ╲╱  ╲╱╲
+    1e-6 ┤            ╲╲  ← 永不跌破 plateau_min_lr (1e-7)
+         └──────────────────────→ ∞ optimizer steps
+           warmup
     """
-    if current_step < warmup_steps:
-        # Warmup阶段：线性增长从warmup_init_lr到base_lr
-        warmup_progress = current_step / max(warmup_steps - 1, 1)
-        return warmup_init_lr + (base_lr - warmup_init_lr) * warmup_progress
-    else:
-        # Warmup结束后，根据调度器类型计算学习率
-        if lr_scheduler_type == "cosine" and cosine_decay_enabled:
-            # Cosine Decay：从base_lr衰减到min_learning_rate
-            progress = (current_step - warmup_steps) / max(total_training_steps - warmup_steps, 1)
-            progress = min(progress, 1.0)  # 限制在[0, 1]
-            
-            import math
-            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
-            return min_learning_rate + (base_lr - min_learning_rate) * cosine_decay
-        elif lr_scheduler_type == "linear":
-            # Linear Decay：线性衰减到min_learning_rate
-            progress = (current_step - warmup_steps) / max(total_training_steps - warmup_steps, 1)
-            progress = min(progress, 1.0)
-            return base_lr - (base_lr - min_learning_rate) * progress
+
+    def __init__(self, optimizer: torch.optim.Optimizer, config: dict):
+        self.optimizer = optimizer
+
+        # 基础参数
+        self._base_lr = float(config.get("base_learning_rate", 3e-4))
+        self._warmup_steps = int(config.get("warmup_steps", 300))
+        self._warmup_init_lr = float(config.get("warmup_init_lr", 1e-7))
+
+        # SGDR 参数
+        self._t_0 = int(config.get("sgdr_t_0", 1500))
+        self._t_mult = max(int(config.get("sgdr_t_mult", 2)), 1)
+        self._eta_min = float(config.get("sgdr_eta_min", 1e-6))
+
+        # ReduceLROnPlateau 参数
+        self._plateau_patience = int(config.get("plateau_patience", 500))
+        self._plateau_factor = float(config.get("plateau_factor", 0.5))
+        self._plateau_threshold = float(config.get("plateau_threshold", 0.01))
+        self._plateau_cooldown = int(config.get("plateau_cooldown", 300))
+        self._plateau_min_lr = float(config.get("plateau_min_lr", 1e-7))
+
+        # 内部状态
+        self.step_count = 0              # optimizer step 计数
+        self._best_loss = float('inf')
+        self._plateau_counter = 0
+        self._cooldown_counter = 0
+        self.current_base_lr = self._base_lr  # 可被 Plateau 动态下调
+
+        # SGDR 周期追踪（相对于 warmup 结束后）
+        self._cycle_start_step = 0       # 当前周期起始（相对于 warmup 后）
+        self._current_t_i = self._t_0    # 当前周期长度
+        self.cycle_number = 0            # 第几个 SGDR 周期
+
+        # 打印初始化信息
+        print(f"[Info] LR Scheduler: SGDR + ReduceLROnPlateau", flush=True)
+        print(f"       Warmup: {self._warmup_steps} steps "
+              f"({self._warmup_init_lr:.1e} → {self._base_lr:.1e})", flush=True)
+        print(f"       SGDR: T_0={self._t_0}, T_mult={self._t_mult}, "
+              f"eta_min={self._eta_min:.1e}", flush=True)
+        print(f"       Plateau: patience={self._plateau_patience}, "
+              f"factor={self._plateau_factor}, min_lr={self._plateau_min_lr:.1e}", flush=True)
+
+    def step(self, loss: float = None) -> float:
+        """更新学习率（每次 optimizer.step() 后调用）
+
+        Args:
+            loss: 原始 loss 值（用于 ReduceLROnPlateau 检测）。
+                  None 表示跳过 plateau 检测（如 NaN loss 时）。
+        Returns:
+            当前设置的学习率
+        """
+        self.step_count += 1
+
+        # Plateau 检测（在计算 LR 之前，因为它可能改变 current_base_lr）
+        if loss is not None and loss > 0 and not (loss == float('inf')):
+            self._check_plateau(loss)
+
+        lr = self._compute_lr()
+        self._apply_lr(lr)
+        return lr
+
+    def _compute_lr(self) -> float:
+        """计算当前步的学习率（warmup 或 SGDR）"""
+        # ── Warmup 阶段 ──
+        if self.step_count <= self._warmup_steps:
+            progress = self.step_count / max(self._warmup_steps, 1)
+            return self._warmup_init_lr + (self.current_base_lr - self._warmup_init_lr) * progress
+
+        # ── SGDR 阶段 ──
+        steps_since_warmup = self.step_count - self._warmup_steps
+        steps_in_cycle = steps_since_warmup - self._cycle_start_step
+
+        # 当前周期是否结束？
+        if steps_in_cycle >= self._current_t_i:
+            self._cycle_start_step = steps_since_warmup
+            self._current_t_i = max(self._current_t_i * self._t_mult, 1)
+            self.cycle_number += 1
+            steps_in_cycle = 0
+
+            if self.step_count % 100 == 0 or self.cycle_number <= 3:
+                print(f"[LR Scheduler] 🔄 SGDR 周期 #{self.cycle_number} 开始, "
+                      f"T_i={self._current_t_i}, peak_lr={self.current_base_lr:.2e}", flush=True)
+
+        # 余弦衰减计算
+        import math
+        progress = steps_in_cycle / max(self._current_t_i, 1)
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return self._eta_min + (self.current_base_lr - self._eta_min) * cosine_decay
+
+    def _apply_lr(self, lr: float):
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+
+    def _check_plateau(self, loss: float):
+        """检查 loss 是否进入平台期，若是则降低 current_base_lr"""
+        # 冷却期内不做检测
+        if self._cooldown_counter > 0:
+            self._cooldown_counter -= 1
+            return
+
+        # Warmup 阶段不检测
+        if self.step_count <= self._warmup_steps:
+            return
+
+        if loss < self._best_loss * (1.0 - self._plateau_threshold):
+            # Loss 有改善，重置计数器
+            self._best_loss = loss
+            self._plateau_counter = 0
         else:
-            # Constant：保持base_lr不变
-            return base_lr
+            self._plateau_counter += 1
+            if self._plateau_counter >= self._plateau_patience:
+                old_base = self.current_base_lr
+                new_base = max(self.current_base_lr * self._plateau_factor,
+                              self._plateau_min_lr)
+                if new_base < old_base:
+                    self.current_base_lr = new_base
+                    self._plateau_counter = 0
+                    self._cooldown_counter = self._plateau_cooldown
+                    self._best_loss = float('inf')
+                    # 重置 SGDR 周期
+                    self._cycle_start_step = self.step_count - self._warmup_steps
+                    self._current_t_i = self._t_0
+                    self.cycle_number = 0
 
-def apply_learning_rate(step: int):
-    """应用学习率到优化器
-    
-    Args:
-        step: 当前训练步数
-    """
-    lr = get_learning_rate(step)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
-    return lr
+                    print(f"\n{'=' * 60}", flush=True)
+                    print(f"[LR Scheduler] ⚠️  Plateau 检测! Loss 停滞不前", flush=True)
+                    print(f"      基准 LR 降低: {old_base:.2e} → {new_base:.2e}", flush=True)
+                    print(f"      SGDR 周期已重置, 冷却 {self._plateau_cooldown} 步", flush=True)
+                    print(f"{'=' * 60}\n", flush=True)
 
-# 打印学习率调度器配置
-print(f"[Info] LR Scheduler: {lr_scheduler_type}, Warmup: {warmup_steps} steps, "
-      f"Total Steps: {total_training_steps}, Min LR: {min_learning_rate:.2e}", flush=True)
+
+# ── 初始化全局调度器 ──
+lr_scheduler = LRSchedulerManager(optimizer, CONFIG)
 
 # 初始化强化学习模块
 if device.type != "meta":
@@ -1171,6 +1283,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 else:
                     loss = torch.tensor(0.0, device=device)
 
+            raw_loss_val = loss.item()  # 保存原始 loss 用于 ReduceLROnPlateau
             loss = loss / GRADIENT_ACCUMULATION_STEPS
             
             # 【修复】标准训练路径必须显式调用 backward()
@@ -1196,6 +1309,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 return float('inf')
+            raw_loss_val = loss_val  # 保存原始 loss 用于 ReduceLROnPlateau
             loss = torch.tensor(loss_val, device=device)
 
         # ── 统一的梯度后处理 ──
@@ -1232,13 +1346,11 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
 
         training_rounds += 1
 
-        # 学习率调度 — 按 optimizer step 计数，而非样本数
+        # 学习率调度 — SGDR + ReduceLROnPlateau（动态 LR，适配无限训练）
         if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
             global optimizer_step_count
             optimizer_step_count += 1
-            current_lr = apply_learning_rate(optimizer_step_count)
-            if training_rounds % 100 == 0:
-                print(f"[Info] Step {training_rounds} (opt_step={optimizer_step_count}), LR: {current_lr:.2e}", flush=True)
+            current_lr = lr_scheduler.step(loss=raw_loss_val)
 
         # Preview 输出
         if show_preview:

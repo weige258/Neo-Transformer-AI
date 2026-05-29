@@ -65,18 +65,37 @@ CONFIG: Dict[str, Any] = {
     "repetition_stop_threshold": 5,  # 重复停止阈值：连续N个相同token或重复n-gram则停止
     
     # ═══════════════════════════════════════════════════════
-    # 7️⃣ 学习率调度配置 (Warmup + Cosine Decay)
+    # 7️⃣ 学习率调度配置 (SGDR + ReduceLROnPlateau — 适用于无限循环训练)
     # ═══════════════════════════════════════════════════════
-    # 【优化】基于 2025-2026 最新研究调节 SFT 学习率参数
-    # 参考: MiniMind 调优指南、GRPO 实战技巧、PPO Epochs 研究
-    "gradient_accumulation_steps": 1,            # 【修复】梯度累积步数，1=每样本更新（测试/小数据推荐1）
-    "base_learning_rate": 3e-4,                  # 【修复】小模型可适当提高基础学习率
-    "min_learning_rate": 1e-6,                   # 最小学习率（衰减终点）
-    "warmup_steps": 300,                         # 【修复】总步数 3000 的 10%，平滑启动（原50仅1.6%）
-    "warmup_init_lr": 1e-6,                      # Warmup初始学习率
-    "cosine_decay_enabled": True,                # 是否启用余弦衰减
-    "total_training_steps": 3000,                # 总训练步数（按 optimizer step 计数）
-    "lr_scheduler_type": "cosine",               # 调度器类型: "cosine", "constant", "linear"
+    # 设计理念：抛弃固定步数的 Cosine Decay（旧系统3000步后永久平躺的严重缺陷）
+    # 改用两大工业级机制协同工作，天然适配 while True 无限训练：
+    #
+    # ① SGDR (Cosine Annealing with Warm Restarts)
+    #    论文: Loshchilov & Hutter, ICLR 2017
+    #    核心: LR 在每 T_0 步周期性余弦振荡 → 定期"重启"赋予模型探索能量
+    #    每个后续周期的长度 = 前一个周期 × T_mult（逐渐变长，越来越精细）
+    #    业界采用: fast.ai, HuggingFace Transformers, PyTorch 官方推荐
+    #
+    # ② ReduceLROnPlateau（安全网）
+    #    核心: 监控 loss，当 loss 不再下降时自动将基准 LR 减半
+    #    防止 SGDR 在高 LR 区间无意义地震荡
+    #    业界采用: PyTorch 原生调度器，被广泛用于在线/持续学习
+    #
+    # ── 基础参数 ──
+    "gradient_accumulation_steps": 1,            # 梯度累积步数，1=每样本更新
+    "base_learning_rate": 3e-4,                  # 初始基准学习率（SGDR 周期峰值）
+    "warmup_steps": 300,                         # 预热步数（线性从 init → base_lr）
+    "warmup_init_lr": 1e-6,                      # 预热初始学习率
+    # ── SGDR 参数 ──
+    "sgdr_t_0": 1500,                            # 第一个余弦周期的步数（optimizer steps）
+    "sgdr_t_mult": 2,                            # 周期倍增因子（周期逐渐变长: T0, T0×2, T0×4, ...）
+    "sgdr_eta_min": 1e-6,                        # 每个周期内的最小学习率
+    # ── ReduceLROnPlateau 参数 ──
+    "plateau_patience": 500,                     # Loss 不下降的容忍步数（optimizer steps）
+    "plateau_factor": 0.5,                       # 触发时 LR 乘以此因子（减半）
+    "plateau_threshold": 0.01,                   # 判断 loss 改善的最小相对变化（1%）
+    "plateau_cooldown": 300,                     # 降低 LR 后的冷却步数
+    "plateau_min_lr": 1e-7,                      # 最低学习率（永不跌破此值）
     
     # ═══════════════════════════════════════════════════════
     # 8️⃣ 强化学习学习率配置
