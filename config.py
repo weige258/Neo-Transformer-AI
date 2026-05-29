@@ -36,7 +36,7 @@ CONFIG: Dict[str, Any] = {
     "use_gradient_checkpointing": True,       # 是否在Transformer block上启用梯度检查点
     "gpu_cache_clear_threshold_gb": 4.0,      # 当 reserved 显存超过此值（GB）时定期清理 cache（6GB显卡推荐4GB）
     # 在前向时对超长序列进行分块处理，避免一次性分配过大显存
-    "max_forward_chunk": 512,                 # 前向时每个子序列的最大长度（token数，6GB推荐512）
+    "max_forward_chunk": 512,                 # 前向分段时每块最大 token 数（6GB推荐512）
     
     # ═══════════════════════════════════════════════════════
     # 4️⃣ 序列长度与显存管理（零截断策略）
@@ -46,7 +46,6 @@ CONFIG: Dict[str, Any] = {
     #   ② 历史上下文向量压缩 → 高显存时自动压缩历史并卸载到 CPU
     #   ③ 动态分块大小 → 根据实时空闲显存自适应调整 chunk_size
     "max_generation_len": 512,       # 最大生成长度限制
-    "max_forward_chunk": 512,        # 分段训练时每块最大 token 数
     "dynamic_segment_overlap": 32,   # 分段训练时块之间的重叠 token 数
     # 显存安全阈值
     "gpu_memory_safe_ratio": 0.85,   # 安全显存比例（6GB显卡推荐0.80-0.85）
@@ -71,7 +70,7 @@ CONFIG: Dict[str, Any] = {
     # 【优化】基于 2025-2026 最新研究调节 SFT 学习率参数
     # 参考: MiniMind 调优指南、GRPO 实战技巧、PPO Epochs 研究
     "gradient_accumulation_steps": 1,            # 【修复】梯度累积步数，1=每样本更新（测试/小数据推荐1）
-    "base_learning_rate": 5e-4,                  # 【修复】小模型可适当提高基础学习率
+    "base_learning_rate": 3e-4,                  # 【修复】小模型可适当提高基础学习率
     "min_learning_rate": 1e-6,                   # 最小学习率（衰减终点）
     "warmup_steps": 300,                         # 【修复】总步数 3000 的 10%，平滑启动（原50仅1.6%）
     "warmup_init_lr": 1e-6,                      # Warmup初始学习率

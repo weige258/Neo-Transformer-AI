@@ -182,15 +182,15 @@ class CompressedSparseDynamicAttention(nn.Module):
         q_len = q.size(-2)
         mem_len = mem_k.size(-2)
 
-        # 构建 causal mask：(q_len, mem_len)，True = 屏蔽
+        # 构建 causal mask：(q_len, mem_len)，True = 参与注意力（保留）
+        # mem_pos <= q_pos 意味着记忆位置在 query 之前 → 可以关注
         q_pos = torch.arange(q_start_pos, q_start_pos + q_len, device=q.device, dtype=torch.float32)
-        # mem_pos[None, :] > q_pos[:, None] 意味着 key 在 query 之后 → 屏蔽
-        causal_mask = mem_pos.float()[None, :] > q_pos[:, None]  # (q_len, mem_len)
+        causal_mask = mem_pos.float()[None, :] <= q_pos[:, None]  # (q_len, mem_len), True=保留
 
         try:
             return F.scaled_dot_product_attention(
                 q, mem_k, mem_v,
-                attn_mask=causal_mask,
+                attn_mask=causal_mask,  # 【修复】True=参与注意力
                 dropout_p=0.0,
                 is_causal=False,
             )
@@ -278,7 +278,7 @@ class CompressedSparseDynamicAttention(nn.Module):
                     q_chunk,
                     k_local,
                     v_local,
-                    attn_mask=attn_mask.logical_not(),  # True = 屏蔽
+                    attn_mask=attn_mask,  # 【修复】SDPA bool mask: True=参与注意力，不需要 logical_not
                     dropout_p=self.dropout if self.training else 0.0,
                     is_causal=False,
                 )
@@ -286,6 +286,7 @@ class CompressedSparseDynamicAttention(nn.Module):
             except RuntimeError:
                 # 回退：如果 sdpa 不支持（极少数情况），使用手动计算
                 scores = torch.matmul(q_chunk, k_local.transpose(-2, -1)) / math.sqrt(dim)
+                # attn_mask: True=保留, ~attn_mask=True=屏蔽
                 scores = scores.masked_fill(~attn_mask.view(1, 1, chunk_len, local_k_len), float("-inf"))
                 weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
                 weights = torch.nan_to_num(weights, nan=0.0)
