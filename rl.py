@@ -463,7 +463,8 @@ class LightweightPPO:
         entropy_coef: float = 0.02,            # 【优化】熵系数从0.01增加到0.02，增强探索
         gamma: float = 0.99,                   # 保持标准折扣因子
         ppo_epochs: int = 2,                   # 【新增】PPO epoch数（基于研究推荐）
-        mini_batch_num: int = 4                # 【新增】mini-batch数量（基于研究推荐）
+        mini_batch_num: int = 4,               # 【新增】mini-batch数量（基于研究推荐）
+        external_optimizer=None,               # 【修复】外部共享优化器，避免双优化器动量冲突
     ):
         self.model = model
         self.reward_model = reward_model
@@ -483,11 +484,17 @@ class LightweightPPO:
         self.total_training_steps = total_training_steps
         self.ppo_training_steps = 0  # PPO训练步数计数器
         
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=learning_rate,
-            foreach=torch.cuda.is_available(),
-        )
+        # 【修复】统一优化器：使用外部共享优化器避免动量冲突
+        if external_optimizer is not None:
+            self.optimizer = external_optimizer
+            self.using_shared_optimizer = True
+        else:
+            self.optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=learning_rate,
+                foreach=torch.cuda.is_available(),
+            )
+            self.using_shared_optimizer = False
         
         self.episode_data = {
             'log_probs': [],
@@ -700,7 +707,9 @@ class LightweightPPO:
         
         # ── 多轮次 PPO（核心） ──
         for epoch in range(self.ppo_epochs):
-            self.optimizer.zero_grad(set_to_none=True)
+            # 【修复】共享优化器时不调用 zero_grad，避免清零 SFT 累积的梯度
+            if not self.using_shared_optimizer:
+                self.optimizer.zero_grad(set_to_none=True)
             epoch_policy_loss = 0.0
             epoch_entropy_loss = 0.0
             epoch_update_count = 0
@@ -773,9 +782,13 @@ class LightweightPPO:
                 # 梯度裁剪（标准 PPO 做法）
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 
-                current_lr = self.apply_ppo_learning_rate()
+                # 【修复】共享优化器时，学习率由主训练流调度器统一管理，PPO不覆盖
+                if not self.using_shared_optimizer:
+                    current_lr = self.apply_ppo_learning_rate()
+                    self.optimizer.step()
+                else:
+                    current_lr = self.optimizer.param_groups[0]['lr']
                 self.ppo_training_steps += 1
-                self.optimizer.step()
                 
                 total_policy_loss += epoch_policy_loss
                 total_entropy_loss += epoch_entropy_loss

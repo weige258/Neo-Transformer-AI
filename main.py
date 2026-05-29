@@ -263,8 +263,9 @@ else:
 print(f"[Info] Optimizer: {optimizer_type.upper()}, LR: {base_lr:.2e}, Weight Decay: {weight_decay:.2e}", flush=True)
 
 # 【学习率调度器】实现Warmup + Cosine Decay
-GRADIENT_ACCUMULATION_STEPS = 4
+GRADIENT_ACCUMULATION_STEPS = int(CONFIG.get("gradient_accumulation_steps", 4))
 training_rounds = 0
+optimizer_step_count = 0  # 【修复】真实优化器步数，调度器按此计数而非每样本计数
 
 # 学习率调度器配置
 warmup_steps = int(CONFIG.get("warmup_steps", 300))
@@ -337,6 +338,7 @@ if device.type != "meta":
         gamma=0.99,
         ppo_epochs=int(CONFIG.get("ppo_epochs", 2)),
         mini_batch_num=int(CONFIG.get("ppo_mini_batch_num", 4)),
+        external_optimizer=optimizer,  # 【修复】共享主优化器，避免双优化器动量冲突
     )
     print("[Info] Self-reward model and RL modules initialized.", flush=True)
 
@@ -562,42 +564,49 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         _run_train_step(train_tensor, target_mask, preview, show_preview=False)
     
     # 自奖励评估 —— 智能 RL 切换（基于 SuperRL Adaptive Switch 设计）
-    try:
-        # 计算奖励（自动记录到历史）
-        total_reward, reward_breakdown = reward_model.compute_total_reward(
-            think_text=think,
-            answer_text=answer,
-            context=history_context
-        )
-        
-        # 智能决策是否启用 RL 训练
-        should_enable_rl, rl_decision_reason = reward_model.should_enable_rl()
-        
-        if should_enable_rl:
-            # 启用 RL 训练：收集 episode 并更新策略
-            ppo_trainer.collect_episode(
-                prompt=ask if ask else "",
-                think_text=think if think else "",
-                answer_text=answer if answer else "",
+    # 【修复】先检查 SFT 最低训练轮数，未达标则完全跳过 PPO
+    rl_min_rounds = int(CONFIG.get("rl_min_training_rounds", 100000))
+    if training_rounds < rl_min_rounds:
+        # SFT 预热阶段：完全不运行 RL，避免干扰梯度累积
+        if training_rounds % 100 == 0:
+            print(f"[RL Gate] ⏸️ SFT预热阶段 (round {training_rounds}/{rl_min_rounds})，RL 已禁用", flush=True)
+    else:
+        try:
+            # 计算奖励（自动记录到历史）
+            total_reward, reward_breakdown = reward_model.compute_total_reward(
+                think_text=think,
+                answer_text=answer,
                 context=history_context
             )
-            if training_rounds > 0 and (training_rounds % 4) == 0:
-                ppo_update_result = ppo_trainer.update_policy(batch_size=4)
-                
-                # 每100步打印一次 RL 状态
-                if training_rounds % 100 == 0:
-                    print(f"[RL Smart Switch] ✅ 启用RL训练 | "
+            
+            # 智能决策是否启用 RL 训练
+            should_enable_rl, rl_decision_reason = reward_model.should_enable_rl()
+            
+            if should_enable_rl:
+                # 启用 RL 训练：收集 episode 并更新策略
+                ppo_trainer.collect_episode(
+                    prompt=ask if ask else "",
+                    think_text=think if think else "",
+                    answer_text=answer if answer else "",
+                    context=history_context
+                )
+                if training_rounds > 0 and (training_rounds % 4) == 0:
+                    ppo_update_result = ppo_trainer.update_policy(batch_size=4)
+                    
+                    # 每100步打印一次 RL 状态
+                    if training_rounds % 100 == 0:
+                        print(f"[RL Smart Switch] ✅ 启用RL训练 | "
+                              f"奖励={total_reward:.3f} | "
+                              f"原因: {rl_decision_reason}", flush=True)
+            else:
+                # 暂停 RL 训练：仅执行 SFT，不收集 RL episode
+                # 每50步打印一次切换状态
+                if training_rounds % 50 == 0:
+                    print(f"[RL Smart Switch] ⏸️ 暂停RL训练 | "
                           f"奖励={total_reward:.3f} | "
                           f"原因: {rl_decision_reason}", flush=True)
-        else:
-            # 暂停 RL 训练：仅执行 SFT，不收集 RL episode
-            # 每50步打印一次切换状态
-            if training_rounds % 50 == 0:
-                print(f"[RL Smart Switch] ⏸️ 暂停RL训练 | "
-                      f"奖励={total_reward:.3f} | "
-                      f"原因: {rl_decision_reason}", flush=True)
-    except Exception as e:
-        print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
+        except Exception as e:
+            print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
 
 
 def _apply_top_k_top_p(logits: torch.Tensor, top_k: int, top_p: float) -> torch.Tensor:
@@ -837,7 +846,9 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         should_skip_output = True
 
                 # 2️⃣ 重复检测停止（业界标准方案）
-                if index not in (
+                # 【修复】思考阶段不启用重复检测，避免思维链中的合理重复被截断
+                # 只在回答阶段（thinking已结束）才启用重复检测
+                if not thinking_started and index not in (
                     TextTokenizer.THINK_START_TOKEN,
                     TextTokenizer.THINK_END_TOKEN,
                     TextTokenizer.START_GENERATION_TOKEN,
@@ -996,7 +1007,7 @@ def _chunked_forward_backward(
                     torch.cuda.synchronize()
                     # detach past_kv 后再传入，防止计算图冲突
                     safe_past = _detach_kv_cache(past_kv) if past_kv is not None else None
-                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller)
+                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller, num_chunks)
                     if sub is not None:
                         sub_loss, past_kv = sub
                         chunk_losses.append(sub_loss.detach())
@@ -1017,8 +1028,14 @@ def _chunked_forward_backward(
 
 def _chunk_one_segment(
     seg: torch.Tensor, seg_mask: torch.Tensor, past_kv, chunk_size: int,
+    num_chunks: int = 1,
 ):
-    """递归重试单个段，返回 (avg_loss, past_kv) 或 None。"""
+    """递归重试单个段，返回 (avg_loss, past_kv) 或 None。
+    
+    【修复】num_chunks 用于正确缩放梯度：
+    loss_scaled = loss_sub / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
+    确保递归细分后的梯度贡献与正常 chunk 一致，避免梯度被放大 num_chunks 倍。
+    """
     seg_len = seg.numel()
     step = max(1, chunk_size // 2)
     seg_losses = []
@@ -1052,7 +1069,8 @@ def _chunk_one_segment(
                         loss_sub = torch.tensor(0.0, device=device)
                 else:
                     loss_sub = torch.tensor(0.0, device=device)
-                loss_scaled = loss_sub / GRADIENT_ACCUMULATION_STEPS
+                # 【修复】除以 num_chunks，与正常 chunk 梯度缩放一致
+                loss_scaled = loss_sub / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
 
             if loss_scaled.requires_grad:
                 if scaler.is_enabled():
@@ -1183,29 +1201,30 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         # ── 统一的梯度后处理 ──
         if not torch.isnan(loss) and not torch.isinf(loss):
             if scaler.is_enabled():
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    optimizer.zero_grad(set_to_none=True)
-                    scaler.update()
-                    for param in model.parameters():
-                        if param.grad is not None and torch.isnan(param.grad).any():
-                            param.grad = None
-                    print(f"[Warning] NaN/Inf gradient, skipping optimizer step", flush=True)
-                    return float('inf')
+                # 【修复】unscale 和 clip 只在 step 前调用一次，避免梯度累积时重复除法
                 if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                        for param in model.parameters():
+                            if param.grad is not None and torch.isnan(param.grad).any():
+                                param.grad = None
+                        print(f"[Warning] NaN/Inf gradient, skipping optimizer step", flush=True)
+                        return float('inf')
                     scaler.step(optimizer)
                     scaler.update()
             else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    optimizer.zero_grad(set_to_none=True)
-                    for param in model.parameters():
-                        if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                            param.grad = None
-                    print(f"[Warning] NaN/Inf gradient, skipping optimizer step", flush=True)
-                    return float('inf')
                 if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        optimizer.zero_grad(set_to_none=True)
+                        for param in model.parameters():
+                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                                param.grad = None
+                        print(f"[Warning] NaN/Inf gradient, skipping optimizer step", flush=True)
+                        return float('inf')
                     optimizer.step()
         else:
             print(f"[Warning] Invalid loss: {loss}, skipping optimizer step", flush=True)
@@ -1213,11 +1232,13 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
 
         training_rounds += 1
 
-        # 学习率调度
+        # 学习率调度 — 按 optimizer step 计数，而非样本数
         if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
-            current_lr = apply_learning_rate(training_rounds)
+            global optimizer_step_count
+            optimizer_step_count += 1
+            current_lr = apply_learning_rate(optimizer_step_count)
             if training_rounds % 100 == 0:
-                print(f"[Info] Step {training_rounds}, LR: {current_lr:.2e}", flush=True)
+                print(f"[Info] Step {training_rounds} (opt_step={optimizer_step_count}), LR: {current_lr:.2e}", flush=True)
 
         # Preview 输出
         if show_preview:

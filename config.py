@@ -9,7 +9,7 @@ CONFIG: Dict[str, Any] = {
     "num_heads": 8,                  # 注意力头数
     "num_transformer_blocks": 8,     # Transformer层数
     "tie_token_embeddings": True,    # 绑定输入输出嵌入权重
-    "dropout": 0.2,                 # Dropout比率
+    "dropout": 0.05,                # 【修复】小模型 0.2 会欠拟合，降至 0.05
     
     # ═══════════════════════════════════════════════════════
     # 2️⃣ 注意力机制配置
@@ -62,7 +62,7 @@ CONFIG: Dict[str, Any] = {
     # ═══════════════════════════════════════════════════════
     # 6️⃣ 生成质量控制 (重复惩罚 + 重复检测停止)
     # ═══════════════════════════════════════════════════════
-    "repetition_penalty": 1.2,       # 重复惩罚系数：>1.0启用，防止复读机
+    "repetition_penalty": 1.05,      # 【修复】降低重复惩罚，避免常用中文字符被过度压制
     "repetition_stop_threshold": 5,  # 重复停止阈值：连续N个相同token或重复n-gram则停止
     
     # ═══════════════════════════════════════════════════════
@@ -70,12 +70,13 @@ CONFIG: Dict[str, Any] = {
     # ═══════════════════════════════════════════════════════
     # 【优化】基于 2025-2026 最新研究调节 SFT 学习率参数
     # 参考: MiniMind 调优指南、GRPO 实战技巧、PPO Epochs 研究
-    "base_learning_rate": 3e-4,                  # 基础学习率 — 正式训练（完整数据集）
+    "gradient_accumulation_steps": 1,            # 【修复】梯度累积步数，1=每样本更新（测试/小数据推荐1）
+    "base_learning_rate": 5e-4,                  # 【修复】小模型可适当提高基础学习率
     "min_learning_rate": 1e-6,                   # 最小学习率（衰减终点）
-    "warmup_steps": 50,                          # Warmup步数
+    "warmup_steps": 300,                         # 【修复】总步数 3000 的 10%，平滑启动（原50仅1.6%）
     "warmup_init_lr": 1e-6,                      # Warmup初始学习率
     "cosine_decay_enabled": True,                # 是否启用余弦衰减
-    "total_training_steps": 3000,                # 总训练步数
+    "total_training_steps": 3000,                # 总训练步数（按 optimizer step 计数）
     "lr_scheduler_type": "cosine",               # 调度器类型: "cosine", "constant", "linear"
     
     # ═══════════════════════════════════════════════════════
@@ -124,7 +125,7 @@ CONFIG: Dict[str, Any] = {
     "rl_loss_threshold": 1.5,                    # 【优化】Loss阈值从1.2提高到1.5，允许更早启用RL
     "rl_loss_stability_window": 10,              # 【优化】稳定性评估窗口从5增加到10，更准确
     "rl_loss_stability_std_threshold": 0.2,      # 【优化】Loss标准差阈值从0.15提高到0.2，更宽容
-    "rl_min_training_rounds": 2000,              # 【优化】最低训练轮数从3000降低到2000，更早启用RL
+    "rl_min_training_rounds": 100000,            # 【修复】先彻底禁用 PPO，等 SFT 收敛后再开
     "rl_check_interval": 100,                    # 【优化】RL就绪检查间隔从200降低到100，更及时
     
     # ═══════════════════════════════════════════════════════

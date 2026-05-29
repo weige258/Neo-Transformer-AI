@@ -422,7 +422,10 @@ class CompressedSparseDynamicAttention(nn.Module):
             raw_v = torch.cat((past_recent_v, v_new), dim=-2)
 
         if past_key_value is None and seq_len > 1:
-            mem_k, mem_v, mem_pos = self._compress_kv(raw_k, raw_v, raw_k_start_pos)
+            # 【修复】只在序列超出滑动窗口时才启用压缩记忆，避免训练/推理不一致
+            # 短序列全部用局部窗口注意力，与训练时“全窗口覆盖”行为一致
+            if raw_k.size(-2) > self.window_size:
+                mem_k, mem_v, mem_pos = self._compress_kv(raw_k, raw_v, raw_k_start_pos)
 
         # 【显存优化】预计算 mix 权重，然后顺序计算三种注意力并累加
         # 避免同时持有三种注意力的中间张量，大幅降低峰值显存
