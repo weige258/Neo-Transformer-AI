@@ -932,12 +932,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
         ])
 
-    # 【新增】检查prompt长度，防止输入过长
-    max_seq_len = int(CONFIG.get("max_seq_len", 1024))
-    if prompt.numel() > max_seq_len:
-        logging.warning(f"生成时prompt过长（seq_len={prompt.numel()}），截断到{max_seq_len}")
-        prompt = prompt[:max_seq_len]
-
     print("\n---Generated reply:", flush=True)
 
     min_new_tokens = 1
