@@ -11,13 +11,99 @@ from config import CONFIG
 
 
 CompressedKVCache = tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    int,
+    torch.Tensor,  # recent_k
+    torch.Tensor,  # recent_v
+    torch.Tensor,  # mem_k
+    torch.Tensor,  # mem_v
+    torch.Tensor,  # mem_pos
+    int,           # total_len
+    torch.Tensor,  # lin_mem_M  (linear attention associative matrix)
+    torch.Tensor,  # lin_mem_z  (linear attention normalization term)
 ]
+
+
+class LinearAttentionMemory(nn.Module):
+    """线性注意力压缩记忆（Infini-Attention风格）— 函数式版
+
+    基于 Katharopoulos et al. 2020 的线性注意力 + Delta规则更新。
+    【关键】不再持有 register_buffer 状态，M/z 完全通过 CompressedKVCache 传入传出。
+    这样一来推理和训练时记忆状态都能正确传递，不会变成"死记忆"。
+
+    Memory Retrieval:
+        A_mem = σ(Q) @ M / (σ(Q) @ z)
+
+    Memory Update (Linear):
+        M' = M + σ(K)^T @ V
+        z' = z + Σ σ(K_t)
+
+    Memory Update (Linear + Delta):
+        M' = M + σ(K)^T @ (V - σ(K) @ M / (σ(K) @ z))
+    """
+
+    def __init__(self, num_heads: int, head_dim: int, use_delta: bool = True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.use_delta = use_delta
+
+        # 可学习的门控标量（每个头一个）— 唯一有状态的参数
+        self.beta = nn.Parameter(torch.zeros(num_heads))
+        # 注意：mu/beta之外的权重在加载旧checkpoint时需兼容
+        # 旧模型有mem_M/mem_z buffer，加载时会自动忽略
+
+    @staticmethod
+    def _elu_plus_one(x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.elu(x, alpha=1.0) + 1.0
+
+    @staticmethod
+    def init_mem(batch: int, num_heads: int, head_dim: int, device: torch.device, dtype: torch.dtype
+                 ) -> tuple[torch.Tensor, torch.Tensor]:
+        """创建初始零状态记忆矩阵和归一化项"""
+        M = torch.zeros(1, num_heads, head_dim, head_dim, device=device, dtype=dtype)
+        z = torch.zeros(1, num_heads, head_dim, device=device, dtype=dtype)
+        return M, z
+
+    def retrieve(self, q: torch.Tensor, mem_M: torch.Tensor, mem_z: torch.Tensor) -> torch.Tensor:
+        """从压缩记忆中检索值。
+
+        Args:
+            q: Query张量 (batch, heads, seq_len, head_dim)，无位置编码
+            mem_M: 关联矩阵 (1, heads, head_dim, head_dim)
+            mem_z: 归一化项 (1, heads, head_dim)
+        Returns:
+            检索值 (batch, heads, seq_len, head_dim)
+        """
+        sigma_q = self._elu_plus_one(q)
+        numer = torch.matmul(sigma_q, mem_M)
+        denom = torch.matmul(sigma_q, mem_z.unsqueeze(-1)).clamp_min(1e-8)
+        return numer / denom
+
+    def update(self, k: torch.Tensor, v: torch.Tensor,
+               mem_M: torch.Tensor, mem_z: torch.Tensor
+               ) -> tuple[torch.Tensor, torch.Tensor]:
+        """用新KV更新记忆，返回新的M/z（不修改模块内部状态）。
+
+        Args:
+            k: Key (batch, heads, seq_len, head_dim)
+            v: Value (batch, heads, seq_len, head_dim)
+            mem_M: 旧关联矩阵 (1, heads, head_dim, head_dim)
+            mem_z: 旧归一化项 (1, heads, head_dim)
+        Returns:
+            (new_M, new_z) 形状同输入
+        """
+        sigma_k = self._elu_plus_one(k)
+
+        if self.use_delta:
+            sigma_k_z = torch.matmul(sigma_k, mem_z.unsqueeze(-1)).clamp_min(1e-8)
+            v_retrieved = torch.matmul(sigma_k, mem_M) / sigma_k_z
+            v_error = v - v_retrieved
+            delta_M = torch.matmul(sigma_k.transpose(-2, -1), v_error)
+        else:
+            delta_M = torch.matmul(sigma_k.transpose(-2, -1), v)
+
+        new_M = mem_M + delta_M.mean(dim=0, keepdim=True)
+        new_z = mem_z + sigma_k.sum(dim=-2).mean(dim=0, keepdim=True)
+        return new_M, new_z
 
 
 class RMSNorm(nn.Module):
@@ -87,6 +173,7 @@ def attention_mix_prior(device: torch.device, dtype: torch.dtype) -> torch.Tenso
             float(mix.get("compressed", 1.0)),
             float(mix.get("sparse", 1.0)),
             float(mix.get("dynamic", 1.0)),
+            float(mix.get("linear_memory", 1.5)),  # 【新增】线性记忆路径
         ],
         device=device,
         dtype=dtype,
@@ -108,16 +195,25 @@ class CompressedSparseDynamicAttention(nn.Module):
         self.compress_stride = max(2, int(CONFIG.get("compress_stride", 16)))
         self.dynamic_topk = max(2, int(CONFIG.get("dynamic_attention_topk", 16)))
         self.chunk_size = max(8, int(CONFIG.get("attention_chunk_size", 64)))
+        self.sink_count = max(1, int(CONFIG.get("attention_sink_count", 4)))  # StreamingLLM sink保护
 
         self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
         self.memory_gate = nn.Linear(self.head_dim, 1, bias=False)
         self.router = nn.Sequential(
             nn.Linear(emb_size, max(1, emb_size // 4), bias=False),
             nn.SiLU(),
-            nn.Linear(max(1, emb_size // 4), 3, bias=True),
+            nn.Linear(max(1, emb_size // 4), 4, bias=True),  # 【修改】4维路由：compressed/sparse/dynamic/linear_memory
         )
         self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
         self.rope = RotaryPositionEmbedding(self.head_dim)
+
+        # 【新增】线性注意力压缩记忆（Infini-Attention风格）
+        use_delta = bool(CONFIG.get("linear_memory_use_delta", True))
+        self.linear_memory = LinearAttentionMemory(num_heads, self.head_dim, use_delta=use_delta)
+
+        # 【新增】Learned Soft Pooling：可学习的门控压缩权重
+        if bool(CONFIG.get("use_learned_pooling", True)):
+            self.importance_pooler = nn.Linear(self.head_dim, 1, bias=False)
 
     def _split_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, seq_len, _ = x.shape
@@ -125,47 +221,114 @@ class CompressedSparseDynamicAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         return qkv[0], qkv[1], qkv[2]
 
-    def _compress_kv(
+    def _compress_kv_with_sink(
         self,
         k: torch.Tensor,
         v: torch.Tensor,
         start_pos: int,
+        sink_count: int = 4,
+        special_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """智能KV压缩：Attention Sink + Learned Soft Pooling + Special Token Anchoring
+
+        三层保护机制：
+        1. StreamingLLM Sink：前sink_count个token永远保留完整KV
+        2. Special Token Anchoring：special_mask标记的token以完整精度保留
+        3. Learned Soft Pooling：剩余token使用可学习的门控加权凝聚
+        """
         batch, heads, seq_len, dim = k.shape
         if seq_len <= 0:
             empty = k.new_zeros(batch, heads, 0, dim)
             pos = torch.empty(0, device=k.device, dtype=torch.long)
             return empty, empty, pos
 
-        chunks = (seq_len + self.compress_stride - 1) // self.compress_stride
-        padded_len = chunks * self.compress_stride
-        pad_len = padded_len - seq_len
-        if pad_len:
-            k_pad = k[:, :, -1:, :].expand(batch, heads, pad_len, dim)
-            v_pad = v[:, :, -1:, :].expand(batch, heads, pad_len, dim)
-            k = torch.cat((k, k_pad), dim=-2)
-            v = torch.cat((v, v_pad), dim=-2)
+        # ── 收集需要完整保留的锚点token索引 ──
+        anchor_mask = torch.zeros(seq_len, dtype=torch.bool, device=k.device)
+        # 1) Sink tokens
+        actual_sink = min(sink_count, seq_len)
+        anchor_mask[:actual_sink] = True
+        # 2) Special tokens（如果有传入掩码）
+        if special_mask is not None:
+            sm = special_mask.bool().squeeze()
+            if sm.dim() > 0:
+                anchor_mask[actual_sink:] = anchor_mask[actual_sink:] | sm[actual_sink:]
 
-        k_chunks = k.view(batch, heads, chunks, self.compress_stride, dim)
-        v_chunks = v.view(batch, heads, chunks, self.compress_stride, dim)
-        valid = torch.full(
-            (chunks, self.compress_stride),
-            1.0,
-            device=k.device,
-            dtype=k.dtype,
-        )
+        anchor_idx = anchor_mask.nonzero(as_tuple=True)[0]
+        is_anchor = anchor_idx.numel() > 0
+
+        # ── 提取锚点token（完整精度保留） ──
+        if is_anchor:
+            anchor_k = k[:, :, anchor_idx, :]
+            anchor_v = v[:, :, anchor_idx, :]
+            anchor_pos = start_pos + anchor_idx
+            # 生成非锚点token索引
+            non_anchor_mask = ~anchor_mask
+            non_anchor_idx = non_anchor_mask.nonzero(as_tuple=True)[0]
+            if non_anchor_idx.numel() == 0:
+                return anchor_k, anchor_v, anchor_pos
+            compress_k = k[:, :, non_anchor_idx, :]
+            compress_v = v[:, :, non_anchor_idx, :]
+            compress_start = start_pos + non_anchor_idx[0].item()
+        else:
+            # 没有锚点，全部压缩（退化到原始行为）
+            anchor_k, anchor_v, anchor_pos = None, None, None
+            compress_k = k
+            compress_v = v
+            compress_start = start_pos
+
+        # ── 对非锚点部分做Learned Soft Pooling ──
+        compress_len = compress_k.size(-2)
+        if compress_len <= 0:
+            if is_anchor:
+                return anchor_k, anchor_v, anchor_pos
+            return k[:0], v[:0], torch.empty(0, device=k.device, dtype=torch.long)
+
+        chunks = (compress_len + self.compress_stride - 1) // self.compress_stride
+        padded_len = chunks * self.compress_stride
+        pad_len = padded_len - compress_len
+        if pad_len:
+            kp = compress_k[:, :, -1:, :].expand(batch, heads, pad_len, dim)
+            vp = compress_v[:, :, -1:, :].expand(batch, heads, pad_len, dim)
+            compress_k = torch.cat((compress_k, kp), dim=-2)
+            compress_v = torch.cat((compress_v, vp), dim=-2)
+
+        ck = compress_k.view(batch, heads, chunks, self.compress_stride, dim)
+        cv = compress_v.view(batch, heads, chunks, self.compress_stride, dim)
+        valid = torch.full((chunks, self.compress_stride), 1.0, device=k.device, dtype=k.dtype)
         if pad_len:
             valid[-1, -pad_len:] = 0.0
-        denom = valid.sum(dim=-1).clamp_min(1.0).view(1, 1, chunks, 1)
-        mem_k = (k_chunks * valid.view(1, 1, chunks, self.compress_stride, 1)).sum(dim=-2) / denom
-        mem_v = (v_chunks * valid.view(1, 1, chunks, self.compress_stride, 1)).sum(dim=-2) / denom
 
-        ends = torch.arange(chunks, device=k.device, dtype=torch.long)
-        ends = start_pos + torch.minimum(
-            (ends + 1) * self.compress_stride - 1,
-            torch.tensor(seq_len - 1, device=k.device, dtype=torch.long),
+        # Learned Soft Pooling：用可学习线性层计算每个token的重要性权重
+        if hasattr(self, 'importance_pooler'):
+            importance_logits = self.importance_pooler(ck)  # (B,H,chunks,stride,1)
+            # 训练时注入噪声防止过拟合（Gumbel-Softmax风格扰动）
+            if self.training:
+                importance_logits = importance_logits + torch.randn_like(importance_logits) * 0.01
+            importance_logits = importance_logits.masked_fill(
+                valid.view(1, 1, chunks, self.compress_stride, 1) == 0, float('-inf'))
+            pool_w = torch.softmax(importance_logits.float(), dim=-2).to(ck.dtype)  # (B,H,chunks,stride,1)
+            ck_out = (ck * pool_w).sum(dim=-2)
+            cv_out = (cv * pool_w).sum(dim=-2)
+        else:
+            # 回退到均匀平均
+            denom = valid.sum(dim=-1).clamp_min(1.0).view(1, 1, chunks, 1)
+            ck_out = (ck * valid.view(1, 1, chunks, self.compress_stride, 1)).sum(dim=-2) / denom
+            cv_out = (cv * valid.view(1, 1, chunks, self.compress_stride, 1)).sum(dim=-2) / denom
+
+        c_ends = torch.arange(chunks, device=k.device, dtype=torch.long)
+        c_ends = compress_start + torch.minimum(
+            (c_ends + 1) * self.compress_stride - 1,
+            torch.tensor(compress_len - 1, device=k.device, dtype=torch.long),
         )
-        return mem_k, mem_v, ends
+
+        # ── 合并锚点 + 压缩结果 ──
+        if is_anchor:
+            mem_k = torch.cat([anchor_k, ck_out], dim=-2)
+            mem_v = torch.cat([anchor_v, cv_out], dim=-2)
+            mem_pos = torch.cat([anchor_pos, c_ends], dim=0)
+        else:
+            mem_k, mem_v, mem_pos = ck_out, cv_out, c_ends
+        return mem_k, mem_v, mem_pos
 
     def _attend_compressed(
         self,
@@ -356,32 +519,72 @@ class CompressedSparseDynamicAttention(nn.Module):
         old_mem_k: torch.Tensor | None = None,
         old_mem_v: torch.Tensor | None = None,
         old_mem_pos: torch.Tensor | None = None,
+        old_lin_M: torch.Tensor | None = None,
+        old_lin_z: torch.Tensor | None = None,
     ) -> CompressedKVCache:
+        """多级记忆流水线：构建带5级层次化压缩的KV Cache
+
+        Level 1 (工作记忆): recent_k/v — 最新sliding_window个token，全量保留
+        Level 2 (关键筛选): H2O风格 — 溢出token中保留Heavy Hitters
+        Level 3 (语义凝聚): Learned Pooling — 剩余token加权压缩
+        Level 4 (无限历史): Linear Memory — mem_k满时固化到关联矩阵
+        Level 5 (物理卸载): 量化后CPU offload（由调用方触发）
+        """
         total_len = start_pos + k_all.size(-2)
         keep = min(self.window_size, k_all.size(-2))
         compress_len = k_all.size(-2) - keep
 
+        # ── Level 1: 工作记忆区（最新token全量保留） ──
         recent_k = k_all[:, :, -keep:, :].contiguous()
         recent_v = v_all[:, :, -keep:, :].contiguous()
 
+        # ── Level 2+3: 对溢出部分做多级压缩 ──
         mem_parts_k = []
         mem_parts_v = []
         mem_parts_pos = []
+
+        # 先保留上一轮的压缩记忆
         if old_mem_k is not None and old_mem_k.size(-2) > 0:
             mem_parts_k.append(old_mem_k)
             mem_parts_v.append(old_mem_v)
             mem_parts_pos.append(old_mem_pos)
 
+        # 本轮溢出token
         if compress_len > 0:
-            new_mem_k, new_mem_v, new_mem_pos = self._compress_kv(
-                k_all[:, :, :compress_len, :],
-                v_all[:, :, :compress_len, :],
-                start_pos,
-            )
-            mem_parts_k.append(new_mem_k)
-            mem_parts_v.append(new_mem_v)
-            mem_parts_pos.append(new_mem_pos)
+            overflow_k = k_all[:, :, :compress_len, :]
+            overflow_v = v_all[:, :, :compress_len, :]
 
+            # ── Level 2: H2O关键筛选（按key范数保留Heavy Hitters） ──
+            # 使用key L2范数作为重要性代理（与注意力累积分数高度相关）
+            importance = overflow_k.norm(dim=-1).mean(dim=(0, 1))  # (seq_len,)
+            h2_ratio = 0.3  # 保留30%的高价值token
+            h2_count = max(4, int(compress_len * h2_ratio))
+            _, h2_idx = torch.topk(importance, k=min(h2_count, compress_len), sorted=False)
+            h2_idx = h2_idx.sort().values
+
+            h2_k = overflow_k[:, :, h2_idx, :]
+            h2_v = overflow_v[:, :, h2_idx, :]
+            h2_pos = start_pos + h2_idx
+
+            # ── Level 3: 剩余token做Learned Soft Pooling ──
+            remaining_mask = torch.ones(compress_len, dtype=torch.bool, device=k_all.device)
+            remaining_mask[h2_idx] = False
+            if remaining_mask.any():
+                rem_k = overflow_k[:, :, remaining_mask, :]
+                rem_v = overflow_v[:, :, remaining_mask, :]
+                rem_start = start_pos + remaining_mask.nonzero(as_tuple=True)[0][0].item()
+
+                pooled_k, pooled_v, pooled_pos = self._compress_kv_with_sink(
+                    rem_k, rem_v, rem_start, sink_count=0)
+                mem_parts_k.append(torch.cat([h2_k, pooled_k], dim=-2))
+                mem_parts_v.append(torch.cat([h2_v, pooled_v], dim=-2))
+                mem_parts_pos.append(torch.cat([h2_pos, pooled_pos], dim=0))
+            else:
+                mem_parts_k.append(h2_k)
+                mem_parts_v.append(h2_v)
+                mem_parts_pos.append(h2_pos)
+
+        # 合并所有压缩记忆
         if mem_parts_k:
             mem_k = torch.cat(mem_parts_k, dim=-2)
             mem_v = torch.cat(mem_parts_v, dim=-2)
@@ -391,7 +594,27 @@ class CompressedSparseDynamicAttention(nn.Module):
             mem_v = v_all.new_zeros(v_all.size(0), v_all.size(1), 0, v_all.size(-1))
             mem_pos = torch.empty(0, device=k_all.device, dtype=torch.long)
 
-        return recent_k, recent_v, mem_k, mem_v, mem_pos, total_len
+        # ── Level 4: 当mem_k超限时，固化最旧部分到线性记忆 ──
+        max_mem_capacity = int(CONFIG.get("max_mem_kv_capacity", 256))
+        if mem_k.size(-2) > max_mem_capacity:
+            overflow = mem_k.size(-2) - max_mem_capacity
+            to_linear_k = mem_k[:, :, :overflow, :]
+            to_linear_v = mem_v[:, :, :overflow, :]
+            # 固化到线性记忆（使用无位置编码的key）
+            lin_M, lin_z = self.linear_memory.update(
+                to_linear_k.detach(), to_linear_v.detach(),
+                old_lin_M, old_lin_z)
+            # 只保留最近的max_mem_capacity个压缩记忆
+            mem_k = mem_k[:, :, overflow:, :].contiguous()
+            mem_v = mem_v[:, :, overflow:, :].contiguous()
+            mem_pos = mem_pos[overflow:].contiguous()
+        else:
+            lin_M = old_lin_M if old_lin_M is not None else self.linear_memory.init_mem(
+                1, self.num_heads, self.head_dim, k_all.device, k_all.dtype)[0]
+            lin_z = old_lin_z if old_lin_z is not None else self.linear_memory.init_mem(
+                1, self.num_heads, self.head_dim, k_all.device, k_all.dtype)[1]
+
+        return recent_k, recent_v, mem_k, mem_v, mem_pos, total_len, lin_M, lin_z
 
     def forward(
         self,
@@ -409,9 +632,18 @@ class CompressedSparseDynamicAttention(nn.Module):
             mem_k = k_new.new_zeros(batch, self.num_heads, 0, self.head_dim)
             mem_v = v_new.new_zeros(batch, self.num_heads, 0, self.head_dim)
             mem_pos = torch.empty(0, device=x.device, dtype=torch.long)
+            # 初始化线性记忆为零状态
+            lin_M, lin_z = LinearAttentionMemory.init_mem(
+                1, self.num_heads, self.head_dim, x.device, x.dtype)
         else:
-            past_recent_k, past_recent_v, mem_k, mem_v, mem_pos, q_start_pos = past_key_value
+            # 解包8元素cache，包含线性记忆状态
+            (past_recent_k, past_recent_v, mem_k, mem_v, mem_pos,
+             q_start_pos, lin_M, lin_z) = past_key_value
             raw_k_start_pos = q_start_pos - past_recent_k.size(-2)
+
+        # 在RoPE之前保留一份q/k用于线性记忆（无位置编码）
+        q_for_memory = q.detach().clone()
+        k_for_memory = k_new.detach().clone()
 
         q, k_new = apply_rope(q, k_new, self.rope, q_start_pos)
 
@@ -423,29 +655,33 @@ class CompressedSparseDynamicAttention(nn.Module):
             raw_v = torch.cat((past_recent_v, v_new), dim=-2)
 
         if past_key_value is None and seq_len > 1:
-            # 【修复】只在序列超出滑动窗口时才启用压缩记忆，避免训练/推理不一致
-            # 短序列全部用局部窗口注意力，与训练时“全窗口覆盖”行为一致
-            if raw_k.size(-2) > self.window_size:
-                mem_k, mem_v, mem_pos = self._compress_kv(raw_k, raw_v, raw_k_start_pos)
+            # 统一由末尾_build_cache处理压缩（此处不再重复压缩，避免不一致）
+            pass
 
-        # 【显存优化】预计算 mix 权重，然后顺序计算三种注意力并累加
-        # 避免同时持有三种注意力的中间张量，大幅降低峰值显存
         prior = attention_mix_prior(x.device, torch.float32)
         mix = torch.softmax(self.router(x).float() + prior, dim=-1).to(x.dtype)
-        # mix: (batch, seq_len, 3), 分别对应 compressed, sparse, dynamic 权重
+        # mix: (batch, seq_len, 4), 分别对应 compressed, sparse, dynamic, linear_memory
+
+        # 【Attention Sink保护】短序列增强局部注意力权重
+        # 防止特殊token（THINK_START/END等）在压缩路径中注意力消失
+        if seq_len <= self.window_size:
+            # 局部窗口能覆盖全序列时，增强sparse路径权重
+            mix[..., 1] = mix[..., 1] * 1.5  # sparse boost
+            mix[..., 3] = mix[..., 3] * 0.7  # linear_memory reduce
+            mix = mix / mix.sum(dim=-1, keepdim=True)  # 重新归一化
 
         # 初始化累积输出为零
         out_accum = None  # (batch, seq_len, emb_size)
 
-        # ── 路径1: 压缩注意力 ──
-        if mix[..., 0:1].abs().max().item() > 1e-8:
+        # ── 路径1: 压缩注意力（权重>1%才计算，避免4条路径全部执行）──
+        if mix[..., 0:1].max().item() > 0.01:
             compressed_out = self._attend_compressed(q, mem_k, mem_v, mem_pos, q_start_pos)
             compressed_out = compressed_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
             out_accum = compressed_out * mix[..., 0:1]
             del compressed_out
 
         # ── 路径2: 局部稀疏窗口注意力 ──
-        if mix[..., 1:2].abs().max().item() > 1e-8:
+        if mix[..., 1:2].max().item() > 0.01:
             sparse_out = self._attend_local_window(q, raw_k, raw_v, q_start_pos, raw_k_start_pos)
             sparse_out = sparse_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
             if out_accum is None:
@@ -455,7 +691,7 @@ class CompressedSparseDynamicAttention(nn.Module):
             del sparse_out
 
         # ── 路径3: 动态Top-K记忆注意力 ──
-        if mix[..., 2:3].abs().max().item() > 1e-8:
+        if mix[..., 2:3].max().item() > 0.01:
             dynamic_out = self._attend_dynamic_memory(q, mem_k, mem_v, mem_pos, q_start_pos)
             dynamic_out = dynamic_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
             if out_accum is None:
@@ -464,12 +700,26 @@ class CompressedSparseDynamicAttention(nn.Module):
                 out_accum = out_accum + dynamic_out * mix[..., 2:3]
             del dynamic_out
 
+        # ── 🌟 路径4: 线性注意力压缩记忆检索（Infini-Attention） ──
+        if mix[..., 3:4].abs().max().item() > 1e-8:
+            lin_out = self.linear_memory.retrieve(q_for_memory, lin_M, lin_z)
+            lin_out = lin_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
+            if out_accum is None:
+                out_accum = lin_out * mix[..., 3:4]
+            else:
+                out_accum = out_accum + lin_out * mix[..., 3:4]
+            del lin_out
+
         # 极端情况：所有权重都为零，返回零张量
         if out_accum is None:
             out_accum = torch.zeros(batch, seq_len, self.emb_size, device=x.device, dtype=x.dtype)
 
-        # 释放 q 引用（raw_k/raw_v 在 use_cache 时仍需保留）
+        # 释放 q 引用
         del q
+
+        # 用当前KV更新线性记忆（训练和推理都更新！删除self.training限制）
+        new_lin_M, new_lin_z = self.linear_memory.update(
+            k_for_memory, v_new, lin_M, lin_z)
 
         out = self.out_proj(out_accum)
         del out_accum
@@ -482,6 +732,8 @@ class CompressedSparseDynamicAttention(nn.Module):
                 old_mem_k=mem_k if past_key_value is not None else None,
                 old_mem_v=mem_v if past_key_value is not None else None,
                 old_mem_pos=mem_pos if past_key_value is not None else None,
+                old_lin_M=new_lin_M,
+                old_lin_z=new_lin_z,
             )
             return out, cache
         return out

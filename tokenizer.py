@@ -55,20 +55,18 @@ class TextTokenizer(Tokenizer):
         dict_size = int(CONFIG["dict_size"])
         
         # 保留前10个特殊Token ID（0-9），其余用于字符映射
-        # 特殊Token: UNKNOWN=0, START_GENERATION=1, END_GENERATION=2, etc.
         SPECIAL_TOKEN_COUNT = 10
         
         for letter in text:
             idx = ord(letter)
             if TextTokenizer._is_valid_token(idx):
                 if idx < dict_size:
-                    # 正常范围内的字符直接映射
                     tensor.append(idx)
                 else:
-                    # 【修复】高码点字符（如Emoji、生僻汉字）通过哈希桶映射到词表高位
-                    # 避免全部降级为UNKNOWN_TOKEN导致语义丢失
                     hashed_idx = SPECIAL_TOKEN_COUNT + (idx % (dict_size - SPECIAL_TOKEN_COUNT))
                     tensor.append(hashed_idx)
+                    # 维护逆向映射表，确保解码能还原
+                    TextTokenizer._reverse_map[hashed_idx] = idx
             else:
                 tensor.append(TextTokenizer.UNKNOWN_TOKEN)
         
@@ -77,11 +75,14 @@ class TextTokenizer(Tokenizer):
         
         return torch.tensor(tensor, dtype=torch.long)
 
+    # 逆向映射表：hashed_idx → 原始Unicode码点
+    _reverse_map: dict[int, int] = {}
+
     @staticmethod
     def decode(tokens: torch.Tensor) -> str:
+        tokens_cpu = tokens.cpu().tolist()  # 先移出GPU
         text: list[str] = []
-        for idx in tokens:
-            idx_int = int(idx)
+        for idx_int in tokens_cpu:
             if idx_int in (
                 TextTokenizer.UNKNOWN_TOKEN,
                 TextTokenizer.START_GENERATION_TOKEN,
@@ -94,7 +95,11 @@ class TextTokenizer(Tokenizer):
                 continue
             if not TextTokenizer._is_valid_token(idx_int):
                 continue
-            text.append(chr(idx_int))
+            # 检查逆向映射表，还原被哈希的高码点字符
+            if idx_int in TextTokenizer._reverse_map:
+                text.append(chr(TextTokenizer._reverse_map[idx_int]))
+            else:
+                text.append(chr(idx_int))
         return "".join(text)
 
 
