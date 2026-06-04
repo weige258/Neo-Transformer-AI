@@ -19,15 +19,15 @@ CONFIG: Dict[str, Any] = {
         "sparse": 1.3,               # 稀疏注意力权重
         "dynamic": 1,                # 动态注意力权重
     },
-    "sliding_window": 64,            # 滑动窗口大小（6GB显存推荐64，降低显存占用）
-    "attention_chunk_size": 32,      # 注意力块大小（6GB显存推荐32，减小中间张量）
+    "sliding_window": 128,           # 【修复】从64→128，增大滑动窗口使生成长文本时能关注更多上下文
+    "attention_chunk_size": 64,      # 【修复】从32→64，增大注意力块减少分块次数提升长序列质量
     "dynamic_attention_topk": 8,     # 动态注意力Top-K数量（6GB显存推荐8）
     
     # ═══════════════════════════════════════════════════════
     # 3️⃣ 历史上下文压缩
     # ═══════════════════════════════════════════════════════
-    "compress_trigger_len": 1200,    # 触发压缩的长度阈值
-    "compress_trigger_entropy": 0.7, # 触发压缩的熵阈值
+    "compress_trigger_len": 99999999,# 【删除限制】设为极大值，取消压缩触发长度阈值
+    "compress_trigger_entropy": 1.0, # 【删除限制】设为1.0，实际上取消熵触发压缩
     "compress_stride": 16,           # 压缩步长
     "compress_ratio": 0.25,          # 压缩比例（6GB显存推荐0.25，更激进的压缩）
     "compress_on_memory_ratio": 0.80, # 当 GPU 显存占用超过该比例时触发压缩并卸载（0-1）
@@ -36,7 +36,7 @@ CONFIG: Dict[str, Any] = {
     "use_gradient_checkpointing": True,       # 是否在Transformer block上启用梯度检查点
     "gpu_cache_clear_threshold_gb": 4.0,      # 当 reserved 显存超过此值（GB）时定期清理 cache（6GB显卡推荐4GB）
     # 在前向时对超长序列进行分块处理，避免一次性分配过大显存
-    "max_forward_chunk": 512,                 # 前向分段时每块最大 token 数（6GB推荐512）
+    "max_forward_chunk": 99999999,           # 【删除限制】设为极大值，取消前向分段块大小限制
     
     # ═══════════════════════════════════════════════════════
     # 4️⃣ 序列长度与显存管理（零截断策略）
@@ -45,7 +45,7 @@ CONFIG: Dict[str, Any] = {
     #   ① KV Cache 分段训练 → 完整上下文传递，梯度跨块累积
     #   ② 历史上下文向量压缩 → 高显存时自动压缩历史并卸载到 CPU
     #   ③ 动态分块大小 → 根据实时空闲显存自适应调整 chunk_size
-    "max_generation_len": 512,       # 最大生成长度限制
+    "max_generation_len": 99999999,  # 【删除限制】设为极大值，取消生成长度上限
     "dynamic_segment_overlap": 32,   # 分段训练时块之间的重叠 token 数
     # 显存安全阈值
     "gpu_memory_safe_ratio": 0.85,   # 安全显存比例（6GB显卡推荐0.80-0.85）
@@ -66,9 +66,9 @@ CONFIG: Dict[str, Any] = {
     # 6️⃣ 生成质量控制
     # ═══════════════════════════════════════════════════════
     "repetition_penalty": 1.02,      # 【修复】进一步降低，避免中文常用字被惩罚
-    "repetition_stop_threshold": 8,  # 重复停止阈值
+    "repetition_stop_threshold": 16, # 【修复】从8→16，字符级生成容易重复，提高阈值避免误停
     # ── CoT 与输出完整性保护 ──
-    "force_answer_min_steps": 16,    # 【修复】THINK_END后最少强制的回答步数
+    "force_answer_min_steps": 0,     # 【删除限制】设为0，取消强制回答步数限制
     "max_consecutive_garbage": 3,    # 【新增】连续垃圾token数阈值（触发重采样/停止）
     
     # ═══════════════════════════════════════════════════════

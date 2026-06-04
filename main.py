@@ -197,15 +197,8 @@ def _get_gpu_memory_ratio(device=None) -> float:
 
 
 def auto_compress_trigger(history_tensor) -> bool:
-    """仅在 GPU 内存占用接近配置阈值时返回 True，否则返回 False。
-    该函数不会直接执行压缩；调用点应决定何时真正压缩并卸载。
-    """
-    try:
-        ratio = _get_gpu_memory_ratio(history_tensor.device if history_tensor is not None else None)
-        thresh = float(CONFIG.get("compress_on_memory_ratio", 0.9))
-        return ratio >= thresh
-    except Exception:
-        return False
+    """【已禁用】不再自动触发压缩，始终返回False"""
+    return False
 
 # 【显存优化】关闭torch.compile，避免额外显存占用
 print("[Info] Running without torch.compile optimization (disabled for memory efficiency).", flush=True)
@@ -457,19 +450,7 @@ if device.type != "meta":
 
 
 def auto_compress_trigger(history_tensor: torch.Tensor, attn_weights: torch.Tensor = None) -> bool:
-    """无标记自动触发压缩：长度/注意力熵双判断"""
-    seq_len = history_tensor.numel()
-    compress_trigger_len = int(CONFIG.get("compress_trigger_len", 512))
-    compress_trigger_entropy = float(CONFIG.get("compress_trigger_entropy", 0.8))
-    
-    if seq_len > compress_trigger_len:
-        return True
-    
-    if attn_weights is not None:
-        attn_soft = torch.softmax(attn_weights, dim=-1)
-        entropy = -torch.sum(attn_soft * torch.log(attn_soft + 1e-8), dim=-1).mean()
-        return entropy > compress_trigger_entropy
-    
+    """【已禁用】不再自动触发压缩，始终返回False"""
     return False
 
 
@@ -484,60 +465,13 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
     if answer_tensor.numel() == 0:
         return None, None, None
 
-    # 【新增】检查序列长度，防止长文本显存爆炸
-    # 现在优先使用检索/向量索引处理超长历史，避免直接截断或跳过样本
-    estimated_total_len = ask_tensor.numel() + answer_tensor.numel() + 10  # +10为特殊token
-    if hist_context:
-        estimated_total_len += TextTokenizer.encode(hist_context).numel() + 10
-
-    if estimated_total_len > 4096:
-        # 当序列非常长时：仅在 GPU 显存占用接近阈值时才进行向量压缩并卸载到CPU/磁盘，
-        # 否则保留原始历史（避免不必要的压缩开销）
-        logging.debug(f"样本估算过长（estimated_len={estimated_total_len}），评估是否需要压缩")
-        try:
-            # 仅在显存占用足够高时触发压缩
-            mem_ratio = _get_gpu_memory_ratio(device)
-            mem_thresh = float(CONFIG.get("compress_on_memory_ratio", 0.9))
-            logging.debug(f"当前GPU显存占用比={mem_ratio:.3f}, 阈值={mem_thresh}")
-            if mem_ratio >= mem_thresh and hist_context and hist_context.strip():
-                # 在 CPU 上编码 tokens，避免一次性把大张量移到 GPU 导致 OOM
-                history_tokens = TextTokenizer.encode(hist_context)
-                # 计算压缩向量（在模型当前device上计算），然后卸载到CPU并保存到磁盘临时文件
-                with torch.no_grad():
-                    comp = model.compress_history_vectors(history_tokens)
-                # 保持压缩向量在 model.embedding 权重设备（通常为 GPU），避免把压缩结果迁移到 CPU
-                try:
-                    comp_on_device = comp.to(device)
-                except Exception:
-                    comp_on_device = comp
-                # 将压缩向量缓存到模型内部，供后续推理/训练使用，避免写入磁盘或保持在 CPU
-                setattr(model, "_compressed_history", comp_on_device)
-                logging.info(f"历史上下文已压缩并缓存至模型（device={comp_on_device.device}, shape={tuple(comp_on_device.shape)})")
-                # 释放临时 history_tokens 引用以减少内存峰值
-                try:
-                    del history_tokens
-                except Exception:
-                    pass
-                # 不把完整历史放回训练序列；使用空历史占位符
-                hist_context = ""
-            else:
-                logging.debug("未达到显存压缩阈值，保留原始历史（暂不压缩）")
-        except Exception as e:
-            logging.warning(f"历史压缩或卸载失败，继续使用原始历史（可能风险OOM）: {e}")
+    # 【删除限制】不再根据序列长度触发压缩，保留完整上下文
 
     segments: list = []
 
     if hist_context is not None and hist_context.strip():
         history_tensor = TextTokenizer.encode(hist_context)
-
-        # 如果当前 GPU 显存已经接近阈值，则上游应已在 estimated_total_len 分支
-        # 触发压缩并卸载；此处仅检查是否仍需清理历史以避免混合输入问题
-        if auto_compress_trigger(history_tensor):
-            logging.debug(
-                f"检测到高显存占用（seq_len={history_tensor.numel()}），假定已在上游执行压缩并卸载，忽略原始历史"
-            )
-            # 清除历史以避免在训练序列中混合连续向量
-            history_tensor = torch.tensor([], dtype=torch.long, device=device)
+        # 【删除限制】不再检查压缩触发，保留完整历史上下文
 
         segments = [
             (TextTokenizer.START_GENERATION_TOKEN, False),
@@ -897,24 +831,16 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     if not text or not isinstance(text, str):
         return "无效输入"
     
-    # 【新增】如果未指定max_generate_tokens，使用配置中的默认值
+    # 【删除限制】不限制最大生成长度，让模型自然输出END_TOKEN终止
     if max_generate_tokens is None:
-        max_generate_tokens = int(CONFIG.get("max_generation_len", 512))
+        max_generate_tokens = 99999999  # 设为极大值
     
     model.eval()
     output_text = ""
 
     if history_context and history_context.strip():
         history_tensor = TextTokenizer.encode(history_context).to(device)
-        
-        # 【修复】与_prepare_training_data保持一致：跳过压缩触发的样本
-        # 原因：compress_history_vectors返回2维连续向量，与1维token序列不兼容
-        # 直接拼接会导致"Tensors must have same number of dimensions: got 1 and 2"错误
-        if auto_compress_trigger(history_tensor):
-            logging.warning(f"生成时历史上下文过长（seq_len={history_tensor.numel()}），"
-                           f"跳过压缩，使用原始序列")
-            # 不压缩，直接使用原始token序列（可能会被模型的最大长度限制截断）
-        
+        # 【删除限制】不再检查压缩触发，直接使用完整历史
         text_tensor = TextTokenizer.encode(text).to(device)
         
         # 统一处理：始终使用1维token序列
@@ -934,7 +860,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
     print("\n---Generated reply:", flush=True)
 
-    min_new_tokens = 1
     max_generate_tokens = max(1, int(max_generate_tokens))
     
     # 读取采样参数 — Min-p + 温度 (ICLR 2025 方案)
@@ -972,12 +897,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         # 【修复】使用Counter记录已生成token的频率，实现基于频率的重复惩罚
         generated_tokens = Counter()
         
-        while step < max_generate_tokens:
+        while step < max_generate_tokens:  # 【删除限制】max_generate_tokens已设为极大值，实际由END_TOKEN控制结束
             try:
                 next_logits = logits[-1].clone()  # 【修复】始终clone，避免修改原始logits
-                
-                if step < min_new_tokens:
-                    next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
+                # 【删除限制】不再设置最小生成token数
                 
                 # ── ① Token 质量过滤 ──
                 next_logits = _apply_token_quality_filter(
@@ -1040,9 +963,9 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         break
 
                 elif index == TextTokenizer.END_GENERATION_TOKEN:
-                    if force_answer_steps > 0:
+                    if force_answer_steps > 0 or thinking_started:
                         next_logits[index] = float("-inf")
-                        continue  # 强制回答期内拒绝结束，重采样
+                        continue  # 【修复】思考阶段也禁止END_TOKEN，防止模型还在思考就提前结束
                     else:
                         break
 
@@ -1118,9 +1041,8 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
             force_answer_steps = force_answer_min_steps
             step += 1
             
-            # 继续生成回答（最多额外 generate 步）
-            forced_max = min(step + max_generate_tokens // 2, max_generate_tokens * 2)
-            while step < forced_max:
+            # 【删除限制】不再限制强制回答步数，直到END_TOKEN自然出现
+            while True:
                 try:
                     next_logits = logits[-1].clone()
                     
