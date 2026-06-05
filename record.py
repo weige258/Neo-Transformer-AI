@@ -14,6 +14,8 @@ data_lock = threading.Lock()
 
 # 【修复】异步写入队列和后台线程
 write_queue = queue.Queue(maxsize=100)  # 限制队列大小防止内存溢出
+# 【修复MED-5】模块级锁，用于队列溢出保护（无法被外部意外覆盖）
+_queue_overflow_lock = threading.Lock()
 
 
 def _write_worker():
@@ -145,17 +147,24 @@ def record_loss(loss: float):
                         'avg_loss': avg_loss
                     })
                 except queue.Full:
-                    # 队列满了，丢弃最旧的记录并警告
-                    print(f"[Warning] 记录队列已满，丢弃一条记录", flush=True)
-                    try:
-                        write_queue.get_nowait()  # 移除最旧的
-                        write_queue.put_nowait({
-                            'time_str': time_str,
-                            'system_time': system_time,
-                            'avg_loss': avg_loss
-                        })
-                    except:
-                        pass
+                    # 【修复Bug #13】使用锁保护"移除最旧+添加新"的原子性
+                    # 防止多线程竞态条件导致数据丢失
+                    # 使用模块级锁，避免函数属性锁的脆弱模式（Bug #10）
+                    # 【修复MED-5】使用模块级锁（无法被外部意外覆盖）
+                    with _queue_overflow_lock:
+                        try:
+                            write_queue.get_nowait()  # 移除最旧的
+                            write_queue.put_nowait({
+                                'time_str': time_str,
+                                'system_time': system_time,
+                                'avg_loss': avg_loss
+                            })
+                        except queue.Empty:
+                            # 另一个线程已取走，放弃本次
+                            pass
+                        except Exception:
+                            # 所有其他异常，静默处理
+                            pass
                 
                 # Reset counters
                 total_loss = 0

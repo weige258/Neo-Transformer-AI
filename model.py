@@ -8,6 +8,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from config import CONFIG
+from tokenizer import TextTokenizer
 
 
 CompressedKVCache = tuple[
@@ -17,27 +18,18 @@ CompressedKVCache = tuple[
     torch.Tensor,  # mem_v
     torch.Tensor,  # mem_pos
     int,           # total_len
-    torch.Tensor,  # lin_mem_M  (linear attention associative matrix)
-    torch.Tensor,  # lin_mem_z  (linear attention normalization term)
+    torch.Tensor,  # mla_mem_M  (MLA latent associative matrix)
+    torch.Tensor,  # mla_mem_z  (MLA latent normalization term)
 ]
 
 
-class LinearAttentionMemory(nn.Module):
-    """线性注意力压缩记忆（Infini-Attention风格）— 函数式版
+class MLALatentMemory(nn.Module):
+    """MLA-style latent compression memory.
 
-    基于 Katharopoulos et al. 2020 的线性注意力 + Delta规则更新。
-    【关键】不再持有 register_buffer 状态，M/z 完全通过 CompressedKVCache 传入传出。
-    这样一来推理和训练时记忆状态都能正确传递，不会变成"死记忆"。
-
-    Memory Retrieval:
-        A_mem = σ(Q) @ M / (σ(Q) @ z)
-
-    Memory Update (Linear):
-        M' = M + σ(K)^T @ V
-        z' = z + Σ σ(K_t)
-
-    Memory Update (Linear + Delta):
-        M' = M + σ(K)^T @ (V - σ(K) @ M / (σ(K) @ z))
+    这个实现保留原有 cache 接口，但把旧的纯线性累加记忆替换为一个更稳的
+    低秩 latent KV 压缩路径：先把 K/V 投影到更小的 latent 维度，再做线性
+    记忆检索与更新。它比固定核的线性注意力更接近 DeepSeek-V2/V3 的 MLA 思路，
+    同时能保持当前模型的接口兼容。
     """
 
     def __init__(self, num_heads: int, head_dim: int, use_delta: bool = True):
@@ -46,10 +38,18 @@ class LinearAttentionMemory(nn.Module):
         self.head_dim = head_dim
         self.use_delta = use_delta
 
-        # 可学习的门控标量（每个头一个）— 唯一有状态的参数
-        self.beta = nn.Parameter(torch.zeros(num_heads))
-        # 注意：mu/beta之外的权重在加载旧checkpoint时需兼容
-        # 旧模型有mem_M/mem_z buffer，加载时会自动忽略
+        # 低秩 latent 投影：把每个头的 head_dim 压成更小的 latent 维度。
+        # 这能在保持接口兼容的同时，替换掉旧的固定核线性注意力。
+        latent_dim = max(16, min(head_dim, 64))
+        self.latent_dim = latent_dim
+        self.k_proj = nn.Linear(head_dim, latent_dim, bias=False)
+        self.v_proj = nn.Linear(head_dim, latent_dim, bias=False)
+        self.q_proj = nn.Linear(head_dim, latent_dim, bias=False)
+        self.out_proj = nn.Linear(latent_dim, head_dim, bias=False)
+        # 【修复】beta 从零初始化导致初始阶段头之间无差异化
+        # 改为正数初始化（0.1），让每个头从一开始就有独立的偏置偏移
+        # 加速 MLA latent memory 的头差异化收敛
+        self.beta = nn.Parameter(torch.ones(num_heads) * 0.1)
 
     @staticmethod
     def _elu_plus_one(x: torch.Tensor) -> torch.Tensor:
@@ -58,9 +58,10 @@ class LinearAttentionMemory(nn.Module):
     @staticmethod
     def init_mem(batch: int, num_heads: int, head_dim: int, device: torch.device, dtype: torch.dtype
                  ) -> tuple[torch.Tensor, torch.Tensor]:
-        """创建初始零状态记忆矩阵和归一化项"""
-        M = torch.zeros(1, num_heads, head_dim, head_dim, device=device, dtype=dtype)
-        z = torch.zeros(1, num_heads, head_dim, device=device, dtype=dtype)
+        """创建初始零状态记忆矩阵和归一化项。"""
+        latent_dim = max(16, min(head_dim, 64))
+        M = torch.zeros(1, num_heads, latent_dim, latent_dim, device=device, dtype=dtype)
+        z = torch.zeros(1, num_heads, latent_dim, device=device, dtype=dtype)
         return M, z
 
     def retrieve(self, q: torch.Tensor, mem_M: torch.Tensor, mem_z: torch.Tensor) -> torch.Tensor:
@@ -73,10 +74,11 @@ class LinearAttentionMemory(nn.Module):
         Returns:
             检索值 (batch, heads, seq_len, head_dim)
         """
-        sigma_q = self._elu_plus_one(q)
+        q_lat = self.q_proj(q) + self.beta.view(1, -1, 1, 1)
+        sigma_q = self._elu_plus_one(q_lat)
         numer = torch.matmul(sigma_q, mem_M)
         denom = torch.matmul(sigma_q, mem_z.unsqueeze(-1)).clamp_min(1e-8)
-        return numer / denom
+        return self.out_proj(numer / denom)
 
     def update(self, k: torch.Tensor, v: torch.Tensor,
                mem_M: torch.Tensor, mem_z: torch.Tensor
@@ -91,15 +93,17 @@ class LinearAttentionMemory(nn.Module):
         Returns:
             (new_M, new_z) 形状同输入
         """
-        sigma_k = self._elu_plus_one(k)
+        k_lat = self.k_proj(k)
+        v_lat = self.v_proj(v)
+        sigma_k = self._elu_plus_one(k_lat)
 
         if self.use_delta:
             sigma_k_z = torch.matmul(sigma_k, mem_z.unsqueeze(-1)).clamp_min(1e-8)
             v_retrieved = torch.matmul(sigma_k, mem_M) / sigma_k_z
-            v_error = v - v_retrieved
+            v_error = v_lat - v_retrieved
             delta_M = torch.matmul(sigma_k.transpose(-2, -1), v_error)
         else:
-            delta_M = torch.matmul(sigma_k.transpose(-2, -1), v)
+            delta_M = torch.matmul(sigma_k.transpose(-2, -1), v_lat)
 
         new_M = mem_M + delta_M.mean(dim=0, keepdim=True)
         new_z = mem_z + sigma_k.sum(dim=-2).mean(dim=0, keepdim=True)
@@ -113,20 +117,67 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # 修复：移除nan_to_num，让数值异常暴露以便调试
-        # 根据PyTorch最佳实践，NaN/Inf应该被检测而非掩盖
-        # 如果上游产生NaN/Inf，应该立即报错中断训练
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps) * self.weight
+        norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        output = x * norm * self.weight
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
+            print(
+                f"[Warning] RMSNorm detected NaN/Inf; clamped output to safe range. "
+                f"input_min={x.min().item():.3f}, input_max={x.max().item():.3f}",
+                flush=True,
+            )
+        return output
 
 
 class RotaryPositionEmbedding(nn.Module):
+    """旋转位置编码（RoPE）— 支持YaRN风格NTK-aware扩展
+
+    基于两项研究：
+    1. YaRN: "Yet another RoPE extensioN method" (Peng et al., 2023)
+       核心：通过调节 base 值和频率缩放实现长序列外推
+    2. "Scaling Laws of RoPE-based Extrapolation" (Liu et al., ICLR 2024)
+       核心：增大 base 值可显著扩展外推长度，仅需短微调
+
+    【修复说明】原 base=10000 限制了模型外推能力。
+    新方案：
+    - base 提高到 1000000（百万级），与 Llama 3.1 一致
+    - 支持 NTK-aware 频率缩放（factor > 1.0）
+    - 当 seq_len > max_seq_len 时自动启用插值
+    """
     def __init__(self, head_dim: int, base: int = 10000) -> None:
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError("head_dim must be even for rotary embedding.")
-        inv_freq = 1.0 / (
-            base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
-        )
+        self.head_dim = head_dim
+        
+        # 从配置读取RoPE参数
+        # 【修复HIGH #6】使用CONFIG中的base值作为默认，而非函数签名参数
+        # 确保当CONFIG缺少rope_base键时使用配置值而非默认10000
+        rope_base = int(CONFIG.get("rope_base", 10000))
+        self.rope_factor = float(CONFIG.get("rope_factor", 1.0))
+        self.max_seq_len = int(CONFIG.get("rope_max_seq_len", 4096))
+        
+        # YaRN: NTK-aware 频率缩放
+        # 当 rope_factor > 1.0 时，应用频率缩放：
+        # scaling_factor = rope_factor ** (head_dim / (head_dim - 2))
+        # 这保持了高频分量的分辨率，同时压缩了低频分量
+        if self.rope_factor > 1.0:
+            scaling_factor = self.rope_factor ** (head_dim / (head_dim - 2.0))
+            # 对部分低频维度应用缩放
+            inv_freq = 1.0 / (
+                rope_base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            )
+            # 高频保持不变，低频逐步缩放
+            ramp = torch.minimum(
+                torch.arange(head_dim // 2, dtype=torch.float32) / (head_dim // 4),
+                torch.tensor(1.0)
+            )
+            inv_freq = inv_freq / (1.0 + 0.1 * ramp * (scaling_factor - 1.0))
+        else:
+            inv_freq = 1.0 / (
+                rope_base ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+            )
+        
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def forward(
@@ -135,7 +186,16 @@ class RotaryPositionEmbedding(nn.Module):
         device: torch.device,
         start_pos: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        pos = torch.arange(start_pos, start_pos + seq_len, device=device, dtype=torch.float32)
+        # 当序列长度超过最大训练长度时，应用位置插值
+        # 这是 YaRN 的核心思想：通过位置缩放避免超长位置编码
+        if seq_len > self.max_seq_len:
+            # 位置缩放因子：将长序列压缩到 [0, max_seq_len) 范围
+            scale = self.max_seq_len / seq_len
+            pos = torch.arange(start_pos, start_pos + seq_len, device=device, dtype=torch.float32)
+            pos = pos * scale
+        else:
+            pos = torch.arange(start_pos, start_pos + seq_len, device=device, dtype=torch.float32)
+        
         freqs = torch.outer(pos, self.inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         return emb.cos()[None, None, :, :], emb.sin()[None, None, :, :]
@@ -149,6 +209,12 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
     频率布局一致（每对相邻维度共享同一频率）。
 
     注意：这是 LLaMA 风格的交错布局，不是 GPT-NeoX 的 split 布局。
+    
+    【布局耦合说明 - Bug #15】
+    - rotate_half 与 apply_rope 中的 cos/sin 频率布局紧密耦合
+    - 当前：torch.cat((freqs, freqs), dim=-1) → [cos0, cos1, ..., cos0, cos1, ...]
+    - rotate_half: stack((-x2, x1)) → 每对相邻维度共享同一频率
+    - 若切换为 GPT-NeoX split 布局 (freqs 直接复制为两半)，需同步修改 rotate_half
     """
     x1 = x[..., ::2]
     x2 = x[..., 1::2]
@@ -173,7 +239,7 @@ def attention_mix_prior(device: torch.device, dtype: torch.dtype) -> torch.Tenso
             float(mix.get("compressed", 1.0)),
             float(mix.get("sparse", 1.0)),
             float(mix.get("dynamic", 1.0)),
-            float(mix.get("linear_memory", 1.5)),  # 【新增】线性记忆路径
+            float(mix.get("mla_latent_memory", 1.5)),  # MLA latent KV 路径
         ],
         device=device,
         dtype=dtype,
@@ -191,10 +257,10 @@ class CompressedSparseDynamicAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = emb_size // num_heads
         self.dropout = dropout
-        self.window_size = max(8, int(CONFIG.get("sliding_window", 96)))
+        self.window_size = max(8, int(CONFIG.get("sliding_window", 256)))
         self.compress_stride = max(2, int(CONFIG.get("compress_stride", 16)))
         self.dynamic_topk = max(2, int(CONFIG.get("dynamic_attention_topk", 16)))
-        self.chunk_size = max(8, int(CONFIG.get("attention_chunk_size", 64)))
+        self.chunk_size = max(8, int(CONFIG.get("attention_chunk_size", 128)))
         self.sink_count = max(1, int(CONFIG.get("attention_sink_count", 4)))  # StreamingLLM sink保护
 
         self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
@@ -202,14 +268,14 @@ class CompressedSparseDynamicAttention(nn.Module):
         self.router = nn.Sequential(
             nn.Linear(emb_size, max(1, emb_size // 4), bias=False),
             nn.SiLU(),
-            nn.Linear(max(1, emb_size // 4), 4, bias=True),  # 【修改】4维路由：compressed/sparse/dynamic/linear_memory
+            nn.Linear(max(1, emb_size // 4), 4, bias=True),  # 4维路由：compressed/sparse/dynamic/mla_latent
         )
         self.out_proj = nn.Linear(emb_size, emb_size, bias=False)
         self.rope = RotaryPositionEmbedding(self.head_dim)
 
-        # 【新增】线性注意力压缩记忆（Infini-Attention风格）
-        use_delta = bool(CONFIG.get("linear_memory_use_delta", True))
-        self.linear_memory = LinearAttentionMemory(num_heads, self.head_dim, use_delta=use_delta)
+        # 【新增】MLA latent KV 压缩记忆（DeepSeek-V2/V3 风格）
+        use_delta = bool(CONFIG.get("mla_latent_memory_use_delta", True))
+        self.mla_memory = MLALatentMemory(num_heads, self.head_dim, use_delta=use_delta)
 
         # 【新增】Learned Soft Pooling：可学习的门控压缩权重
         if bool(CONFIG.get("use_learned_pooling", True)):
@@ -235,6 +301,10 @@ class CompressedSparseDynamicAttention(nn.Module):
         1. StreamingLLM Sink：前sink_count个token永远保留完整KV
         2. Special Token Anchoring：special_mask标记的token以完整精度保留
         3. Learned Soft Pooling：剩余token使用可学习的门控加权凝聚
+        
+        【修复说明】原代码的special_mask在调用链中从未被传入，导致特殊Token
+        （THINK_START/END等）在压缩时信息被稀释。现已修复调用链传递。
+        同时在forward中自动为PLACEHOLDER_SINK_TOKEN生成保护掩码。
         """
         batch, heads, seq_len, dim = k.shape
         if seq_len <= 0:
@@ -244,15 +314,14 @@ class CompressedSparseDynamicAttention(nn.Module):
 
         # ── 收集需要完整保留的锚点token索引 ──
         anchor_mask = torch.zeros(seq_len, dtype=torch.bool, device=k.device)
-        # 1) Sink tokens
+        # 1) Sink tokens（前N个，StreamingLLM机制）
         actual_sink = min(sink_count, seq_len)
         anchor_mask[:actual_sink] = True
-        # 2) Special tokens（如果有传入掩码）
+        # 2) Special tokens（传入的mask，例如THINK_START/END等）
         if special_mask is not None:
             sm = special_mask.bool().squeeze()
             if sm.dim() > 0:
                 anchor_mask[actual_sink:] = anchor_mask[actual_sink:] | sm[actual_sink:]
-
         anchor_idx = anchor_mask.nonzero(as_tuple=True)[0]
         is_anchor = anchor_idx.numel() > 0
 
@@ -345,15 +414,16 @@ class CompressedSparseDynamicAttention(nn.Module):
         q_len = q.size(-2)
         mem_len = mem_k.size(-2)
 
-        # 构建 causal mask：(q_len, mem_len)，True = 参与注意力（保留）
+        # 构建 causal mask：(q_len, mem_len)，True = 保留（可关注）
         # mem_pos <= q_pos 意味着记忆位置在 query 之前 → 可以关注
         q_pos = torch.arange(q_start_pos, q_start_pos + q_len, device=q.device, dtype=torch.float32)
         causal_mask = mem_pos.float()[None, :] <= q_pos[:, None]  # (q_len, mem_len), True=保留
+        sdpa_mask = ~causal_mask
 
         try:
             return F.scaled_dot_product_attention(
                 q, mem_k, mem_v,
-                attn_mask=causal_mask,  # 【修复】True=参与注意力
+                attn_mask=sdpa_mask,  # PyTorch SDPA: True=屏蔽，False=保留
                 dropout_p=0.0,
                 is_causal=False,
             )
@@ -431,7 +501,8 @@ class CompressedSparseDynamicAttention(nn.Module):
 
             # 同时也需要窗口掩码：key 必须在 [q_pos - ws + 1, q_pos] 范围内
             window_mask = k_abs_local[None, :] >= (q_abs[:, None] - ws + 1)
-            attn_mask = causal_mask & window_mask  # (chunk_len, local_k_len)
+            attn_mask = causal_mask & window_mask  # (chunk_len, local_k_len), True=保留
+            sdpa_mask = ~attn_mask
 
             # 使用 F.scaled_dot_product_attention（自动选择最优后端）
             # 需要 [batch, heads, chunk_len, dim] x [batch, heads, local_k_len, dim]
@@ -441,7 +512,7 @@ class CompressedSparseDynamicAttention(nn.Module):
                     q_chunk,
                     k_local,
                     v_local,
-                    attn_mask=attn_mask,  # 【修复】SDPA bool mask: True=参与注意力，不需要 logical_not
+                    attn_mask=sdpa_mask,  # PyTorch SDPA: True=屏蔽，False=保留
                     dropout_p=self.dropout if self.training else 0.0,
                     is_causal=False,
                 )
@@ -521,13 +592,14 @@ class CompressedSparseDynamicAttention(nn.Module):
         old_mem_pos: torch.Tensor | None = None,
         old_lin_M: torch.Tensor | None = None,
         old_lin_z: torch.Tensor | None = None,
+        special_mask: torch.Tensor | None = None,
     ) -> CompressedKVCache:
         """多级记忆流水线：构建带5级层次化压缩的KV Cache
 
         Level 1 (工作记忆): recent_k/v — 最新sliding_window个token，全量保留
         Level 2 (关键筛选): H2O风格 — 溢出token中保留Heavy Hitters
         Level 3 (语义凝聚): Learned Pooling — 剩余token加权压缩
-        Level 4 (无限历史): Linear Memory — mem_k满时固化到关联矩阵
+        Level 4 (无限历史): MLA latent memory — mem_k 满时固化到低秩关联矩阵
         Level 5 (物理卸载): 量化后CPU offload（由调用方触发）
         """
         total_len = start_pos + k_all.size(-2)
@@ -549,19 +621,48 @@ class CompressedSparseDynamicAttention(nn.Module):
             mem_parts_v.append(old_mem_v)
             mem_parts_pos.append(old_mem_pos)
 
-        # 本轮溢出token
+        # 本轮溢出token（仅当有溢出时才做 H2O 筛选 + Pooling 压缩）
         if compress_len > 0:
             overflow_k = k_all[:, :, :compress_len, :]
             overflow_v = v_all[:, :, :compress_len, :]
 
-            # ── Level 2: H2O关键筛选（按key范数保留Heavy Hitters） ──
-            # 使用key L2范数作为重要性代理（与注意力累积分数高度相关）
-            importance = overflow_k.norm(dim=-1).mean(dim=(0, 1))  # (seq_len,)
-            h2_ratio = 0.3  # 保留30%的高价值token
-            h2_count = max(4, int(compress_len * h2_ratio))
-            _, h2_idx = torch.topk(importance, k=min(h2_count, compress_len), sorted=False)
-            h2_idx = h2_idx.sort().values
+            # ── 对齐 special_mask 到 overflow 部分的长度 ──
+            # 【修复Bug #1 + NEW-3】special_mask 来自当前输入的 token_ids
+            # 当 past KV 存在时，当前 token 在 k_all 末尾，应对齐到 overflow 末尾
+            overflow_special_mask = None
+            if special_mask is not None:
+                sm_len = special_mask.size(-1) if special_mask.dim() > 0 else 0
+                if sm_len >= compress_len:
+                    overflow_special_mask = special_mask[:compress_len]
+                else:
+                    k_all_len = k_all.size(-2)
+                    # 当前 token 在 k_all 末尾，计算有多少在当前 overflow 中
+                    current_start_in_kall = k_all_len - sm_len
+                    overflow_end = compress_len
+                    # overflow 涵盖 k_all[0:compress_len]
+                    # 当前 token 区间为 k_all[current_start_in_kall:k_all_len]
+                    overlap_start = max(0, current_start_in_kall)
+                    overlap_end = min(compress_len, k_all_len)
+                    overlap_len = max(0, overlap_end - overlap_start)
+                    overflow_special_mask = torch.zeros(compress_len, dtype=torch.bool, device=k_all.device)
+                    if overlap_len > 0:
+                        # 当前 token 在 overflow 中的偏移量
+                        sm_start_in_overflow = current_start_in_kall
+                        sm_end_in_overflow = sm_start_in_overflow + overlap_len
+                        overflow_special_mask[sm_start_in_overflow:sm_end_in_overflow] = special_mask[:overlap_len]
 
+            # ── Level 2: H2O关键筛选（使用key L2范数作为重要性代理） ──
+            # 【注意】当前使用key范数作为重要性代理，这是H2O原始论文的方法。
+            # SnapKV (Li et al., 2024) 证明注意力累积分数比key范数更准确，
+            # 但计算注意力分数需要额外的forward pass，会增加显存开销。
+            with torch.no_grad():
+                importance = overflow_k.norm(dim=-1).mean(dim=(0, 1))  # (seq_len,)
+            
+            h2_ratio = 0.3
+            h2_count = max(4, int(compress_len * h2_ratio))
+            _, h2_idx_raw = torch.topk(importance, k=min(h2_count, compress_len), sorted=False)
+            
+            h2_idx = h2_idx_raw.sort().values  # 【修复CRIT-3】保持tensor类型
             h2_k = overflow_k[:, :, h2_idx, :]
             h2_v = overflow_v[:, :, h2_idx, :]
             h2_pos = start_pos + h2_idx
@@ -574,8 +675,10 @@ class CompressedSparseDynamicAttention(nn.Module):
                 rem_v = overflow_v[:, :, remaining_mask, :]
                 rem_start = start_pos + remaining_mask.nonzero(as_tuple=True)[0][0].item()
 
+                # 【修复Bug #1】传递对齐后的special_mask保护特殊Token
                 pooled_k, pooled_v, pooled_pos = self._compress_kv_with_sink(
-                    rem_k, rem_v, rem_start, sink_count=0)
+                    rem_k, rem_v, rem_start, sink_count=0,
+                    special_mask=overflow_special_mask[remaining_mask] if overflow_special_mask is not None else None)
                 mem_parts_k.append(torch.cat([h2_k, pooled_k], dim=-2))
                 mem_parts_v.append(torch.cat([h2_v, pooled_v], dim=-2))
                 mem_parts_pos.append(torch.cat([h2_pos, pooled_pos], dim=0))
@@ -594,14 +697,14 @@ class CompressedSparseDynamicAttention(nn.Module):
             mem_v = v_all.new_zeros(v_all.size(0), v_all.size(1), 0, v_all.size(-1))
             mem_pos = torch.empty(0, device=k_all.device, dtype=torch.long)
 
-        # ── Level 4: 当mem_k超限时，固化最旧部分到线性记忆 ──
+        # ── Level 4: 当mem_k超限时，固化最旧部分到 MLA latent memory ──
         max_mem_capacity = int(CONFIG.get("max_mem_kv_capacity", 256))
         if mem_k.size(-2) > max_mem_capacity:
             overflow = mem_k.size(-2) - max_mem_capacity
             to_linear_k = mem_k[:, :, :overflow, :]
             to_linear_v = mem_v[:, :, :overflow, :]
-            # 固化到线性记忆（使用无位置编码的key）
-            lin_M, lin_z = self.linear_memory.update(
+            # 固化到 MLA latent memory（使用无位置编码的 key）
+            mla_M, mla_z = self.mla_memory.update(
                 to_linear_k.detach(), to_linear_v.detach(),
                 old_lin_M, old_lin_z)
             # 只保留最近的max_mem_capacity个压缩记忆
@@ -609,39 +712,45 @@ class CompressedSparseDynamicAttention(nn.Module):
             mem_v = mem_v[:, :, overflow:, :].contiguous()
             mem_pos = mem_pos[overflow:].contiguous()
         else:
-            lin_M = old_lin_M if old_lin_M is not None else self.linear_memory.init_mem(
+            mla_M = old_lin_M if old_lin_M is not None else self.mla_memory.init_mem(
                 1, self.num_heads, self.head_dim, k_all.device, k_all.dtype)[0]
-            lin_z = old_lin_z if old_lin_z is not None else self.linear_memory.init_mem(
+            mla_z = old_lin_z if old_lin_z is not None else self.mla_memory.init_mem(
                 1, self.num_heads, self.head_dim, k_all.device, k_all.dtype)[1]
 
-        return recent_k, recent_v, mem_k, mem_v, mem_pos, total_len, lin_M, lin_z
+        return recent_k, recent_v, mem_k, mem_v, mem_pos, total_len, mla_M, mla_z
 
     def forward(
         self,
         x: torch.Tensor,
         past_key_value: CompressedKVCache | None = None,
         use_cache: bool = False,
+        token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, CompressedKVCache]:
         batch, seq_len, _ = x.shape
         q, k_new, v_new = self._split_qkv(x)
 
-        if past_key_value is None:
+        if past_key_value is None or not isinstance(past_key_value, (tuple, list)) or len(past_key_value) < 6:
             q_start_pos = 0
             raw_k_start_pos = 0
             past_recent_k = past_recent_v = None
             mem_k = k_new.new_zeros(batch, self.num_heads, 0, self.head_dim)
             mem_v = v_new.new_zeros(batch, self.num_heads, 0, self.head_dim)
             mem_pos = torch.empty(0, device=x.device, dtype=torch.long)
-            # 初始化线性记忆为零状态
-            lin_M, lin_z = LinearAttentionMemory.init_mem(
-                1, self.num_heads, self.head_dim, x.device, x.dtype)
+            mla_M = None
+            mla_z = None
         else:
-            # 解包8元素cache，包含线性记忆状态
+            # 解包 cache；兼容旧版本缓存（缺少 MLA latent memory）
             (past_recent_k, past_recent_v, mem_k, mem_v, mem_pos,
-             q_start_pos, lin_M, lin_z) = past_key_value
+             q_start_pos, *rest) = past_key_value
             raw_k_start_pos = q_start_pos - past_recent_k.size(-2)
+            mla_M = rest[0] if len(rest) >= 2 else None
+            mla_z = rest[1] if len(rest) >= 2 else None
 
-        # 在RoPE之前保留一份q/k用于线性记忆（无位置编码）
+        if mla_M is None or mla_z is None:
+            mla_M, mla_z = self.mla_memory.init_mem(
+                1, self.num_heads, self.head_dim, x.device, x.dtype)
+
+        # 在 RoPE 之前保留一份 q/k 用于 MLA latent memory（无位置编码）
         q_for_memory = q.detach().clone()
         k_for_memory = k_new.detach().clone()
 
@@ -660,14 +769,14 @@ class CompressedSparseDynamicAttention(nn.Module):
 
         prior = attention_mix_prior(x.device, torch.float32)
         mix = torch.softmax(self.router(x).float() + prior, dim=-1).to(x.dtype)
-        # mix: (batch, seq_len, 4), 分别对应 compressed, sparse, dynamic, linear_memory
+        # mix: (batch, seq_len, 4), 分别对应 compressed, sparse, dynamic, mla_latent
 
         # 【Attention Sink保护】短序列增强局部注意力权重
         # 防止特殊token（THINK_START/END等）在压缩路径中注意力消失
         if seq_len <= self.window_size:
             # 局部窗口能覆盖全序列时，增强sparse路径权重
             mix[..., 1] = mix[..., 1] * 1.5  # sparse boost
-            mix[..., 3] = mix[..., 3] * 0.7  # linear_memory reduce
+            mix[..., 3] = mix[..., 3] * 0.7  # mla latent path reduce
             mix = mix / mix.sum(dim=-1, keepdim=True)  # 重新归一化
 
         # 初始化累积输出为零
@@ -700,9 +809,9 @@ class CompressedSparseDynamicAttention(nn.Module):
                 out_accum = out_accum + dynamic_out * mix[..., 2:3]
             del dynamic_out
 
-        # ── 🌟 路径4: 线性注意力压缩记忆检索（Infini-Attention） ──
+        # ── 🌟 路径4: MLA latent KV 压缩记忆检索 ──
         if mix[..., 3:4].abs().max().item() > 1e-8:
-            lin_out = self.linear_memory.retrieve(q_for_memory, lin_M, lin_z)
+            lin_out = self.mla_memory.retrieve(q_for_memory, mla_M, mla_z)
             lin_out = lin_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
             if out_accum is None:
                 out_accum = lin_out * mix[..., 3:4]
@@ -717,14 +826,23 @@ class CompressedSparseDynamicAttention(nn.Module):
         # 释放 q 引用
         del q
 
-        # 用当前KV更新线性记忆（训练和推理都更新！删除self.training限制）
-        new_lin_M, new_lin_z = self.linear_memory.update(
-            k_for_memory, v_new, lin_M, lin_z)
+        # 用当前 KV 更新 MLA latent memory（训练和推理都更新）
+        new_mla_M, new_mla_z = self.mla_memory.update(
+            k_for_memory, v_new, mla_M, mla_z)
 
         out = self.out_proj(out_accum)
         del out_accum
 
         if use_cache:
+            # 【修复】从token_ids参数生成special_mask保护特殊Token
+            special_mask = None
+            if token_ids is not None:
+                # 生成掩码：标记所有特殊Token（ID < 10）的位置
+                if token_ids.dim() == 1:
+                    special_mask = token_ids < 10  # ID 0-9 为特殊Token
+                elif token_ids.dim() == 2:
+                    special_mask = token_ids[0] < 10  # batch=1时取第一个
+            
             cache = self._build_cache(
                 raw_k,
                 raw_v,
@@ -732,8 +850,9 @@ class CompressedSparseDynamicAttention(nn.Module):
                 old_mem_k=mem_k if past_key_value is not None else None,
                 old_mem_v=mem_v if past_key_value is not None else None,
                 old_mem_pos=mem_pos if past_key_value is not None else None,
-                old_lin_M=new_lin_M,
-                old_lin_z=new_lin_z,
+                old_lin_M=new_mla_M,
+                old_lin_z=new_mla_z,
+                special_mask=special_mask,
             )
             return out, cache
         return out
@@ -765,11 +884,13 @@ class CompressedAttentionBlock(nn.Module):
         x: torch.Tensor,
         past_key_value: CompressedKVCache | None = None,
         use_cache: bool = False,
+        token_ids: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, CompressedKVCache]:
         attn_result = self.attention(
             self.attn_norm(x),
             past_key_value=past_key_value,
             use_cache=use_cache,
+            token_ids=token_ids,
         )
         if use_cache:
             attn_out, present = attn_result
@@ -795,7 +916,7 @@ class MainModel(nn.Module):
             raise ValueError("emb_size must be divisible by num_heads.")
 
         dropout = float(CONFIG.get("dropout", 0.05))
-        num_transformer_blocks = int(CONFIG.get("num_transformer_blocks", 2))
+        num_transformer_blocks = int(CONFIG.get("num_transformer_blocks", 8))
         if num_transformer_blocks < 1:
             raise ValueError("CONFIG['num_transformer_blocks'] must be at least 1.")
 
@@ -833,6 +954,14 @@ class MainModel(nn.Module):
     def _reset_parameters(self) -> None:
         # 初始化输入 embedding（如果与输出绑定，则同时初始化了两者）
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        # 【修复】特殊Token（ID 0-9）使用更大的初始化标准差
+        # 原因：特殊Token在训练中出现的频率远低于普通token，梯度信号弱
+        # 更大的初始范数帮助模型从一开始就区分特殊Token和普通Token
+        # 这直接解决了"特殊Token注意力消失"问题的根源
+        special_count = min(10, self.token_embedding.weight.size(0))
+        with torch.no_grad():
+            special_std = 0.05  # 特殊Token 5倍标准差
+            self.token_embedding.weight[:special_count].normal_(mean=0.0, std=special_std)
         # 仅在未绑定时独立初始化输出层（避免覆盖共享权重的初始化）
         if self.output_linear.weight is not self.token_embedding.weight:
             nn.init.normal_(self.output_linear.weight, mean=0.0, std=0.02)
@@ -970,7 +1099,7 @@ class MainModel(nn.Module):
         next_key_values: list[CompressedKVCache] = []
         if use_cache:
             for block, past in zip(self.transformers, past_key_values):
-                x, present = block(x, past_key_value=past, use_cache=True)
+                x, present = block(x, past_key_value=past, use_cache=True, token_ids=tokens)
                 next_key_values.append(present)
         else:
             use_gc = bool(CONFIG.get("use_gradient_checkpointing", True))

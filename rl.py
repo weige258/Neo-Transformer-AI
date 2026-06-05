@@ -498,6 +498,7 @@ class LightweightPPO:
         
         self.episode_data = {
             'log_probs': [],
+            'entropies': [],  # 【修复HIGH #4】逐token分布熵
             'rewards': [],
             'values': [],
             'actions': [],
@@ -578,59 +579,66 @@ class LightweightPPO:
         self.episode_data['prompts'].append(prompt)
         self.episode_data['generated_texts'].append(generated_text)
 
-        # 【核心修复】在 no_grad 下记录旧策略的逐 token log_prob
-        # 关键：必须在 torch.no_grad() 内计算，否则：
-        # 1. 前向传播的计算图会污染 SFT 训练的梯度状态
-        # 2. 在 train() 调用链中，optimizer.zero_grad 可能尚未执行
-        # 3. 额外计算图占用显存且无意义（我们只需记录值，不需要梯度）
+        # 【核心修复】在 no_grad + eval 下记录旧策略的逐 token log_prob + 熵
+        # 关键：
+        # 1. 必须切换到 eval() 模式确保 dropout 被禁用，得到确定性 log_prob
+        # 2. no_grad 确保不构建计算图，不污染 SFT 训练的梯度状态
+        # 3. 之后恢复 train() 模式
         if prompt and generated_text:
+            self.model.eval()
             with torch.no_grad():
-                old_token_lps = self._compute_token_log_probs(prompt, generated_text)
+                old_token_lps, old_entropies = self._compute_token_log_probs_and_entropy(prompt, generated_text)
+            self.model.train()  # 恢复训练模式
             if old_token_lps is not None:
                 self.episode_data['log_probs'].append(old_token_lps.detach())
+                self.episode_data['entropies'].append(old_entropies.detach() if old_entropies is not None else torch.tensor([0.0], device=self.device))
             else:
                 self.episode_data['log_probs'].append(
+                    torch.tensor([0.0], device=self.device)
+                )
+                self.episode_data['entropies'].append(
                     torch.tensor([0.0], device=self.device)
                 )
         else:
             self.episode_data['log_probs'].append(
                 torch.tensor([0.0], device=self.device)
             )
+            self.episode_data['entropies'].append(
+                torch.tensor([0.0], device=self.device)
+            )
 
         return total_reward, reward_breakdown
     
-    def _compute_token_log_probs(
+    def _compute_token_log_probs_and_entropy(
         self, prompt: str, generated_text: str
-    ) -> torch.Tensor | None:
-        """计算当前策略下每个生成 token 的对数概率（逐 token，非均值）。
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """计算当前策略下每个生成 token 的对数概率和分布熵。
         
-        这是标准 PPO 所要求的：ratio 必须在每个 token 级别计算和裁剪，
-        而非先在序列维度取均值再计算单一 ratio。
+        这是标准 PPO 所要求的：
+        - ratio 必须在每个 token 级别计算和裁剪（逐 token log_prob）
+        - 熵必须基于完整的 token 分布计算，而非仅采样 token 的 log_prob
         
         Args:
             prompt: 输入提示文本
             generated_text: 生成的文本
             
         Returns:
-            (G,) 形状的逐 token log_prob 张量，或 None（无法计算时）
+            (token_log_probs, entropies):
+            - token_log_probs: (G,) 逐 token log_prob
+            - entropies: (G,) 逐 token 分布熵
+            无法计算时返回 (None, None)
         """
         if not generated_text or not generated_text.strip():
-            return None
+            return None, None
         
         prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
         generated_tokens = TextTokenizer.encode(generated_text).to(self.device)
         
         if generated_tokens.numel() == 0:
-            return None
+            return None, None
         
         full_sequence = torch.cat([prompt_tokens, generated_tokens])
         
-        # 注意：不使用 torch.set_grad_enabled(True)！
-        # set_grad_enabled 会穿透外层的 torch.no_grad() 上下文，
-        # 导致 collect_episode 中意外构建计算图、污染 SFT 训练的梯度。
-        # 让调用方控制梯度状态即可：
-        #   collect_episode → torch.no_grad() → 不构建计算图
-        #   update_policy → 默认 grad 开启 → 正常构建计算图
         result = self.model(full_sequence, use_cache=False)
         if isinstance(result, tuple):
             logits = result[0]
@@ -641,18 +649,29 @@ class LightweightPPO:
         gen_len = len(generated_tokens)
         
         if len(logits) < gen_len + 1:
-            return None
+            return None, None
         
-        # logits[p:p+g] 预测 generated_tokens
         generated_logits = logits[prompt_len:prompt_len + gen_len]
         log_probs = F.log_softmax(generated_logits, dim=-1)
+        probs = F.softmax(generated_logits, dim=-1)
         
-        # 逐 token 提取 log_prob → (G,) 形状
+        # 逐 token log_prob
         token_log_probs = log_probs.gather(
             dim=-1, index=generated_tokens.unsqueeze(-1)
         ).squeeze(-1)
         
-        return token_log_probs  # (G,)
+        # 【修复HIGH #4】正确的熵计算：H(p) = -Σ p(x) log p(x)
+        # 使用完整分布而非仅采样 token
+        entropies = -(probs * log_probs).sum(dim=-1)  # (G,)
+        
+        return token_log_probs, entropies  # (G,), (G,)
+
+    def _compute_token_log_probs(
+        self, prompt: str, generated_text: str
+    ) -> torch.Tensor | None:
+        """【保留兼容】返回 token log_probs，旧接口。"""
+        lps, _ = self._compute_token_log_probs_and_entropy(prompt, generated_text)
+        return lps
     
     def _compute_current_log_prob(self, prompt: str, generated_text: str) -> torch.Tensor:
         """【保留兼容】返回平均对数概率（标量），旧接口。"""
@@ -729,8 +748,11 @@ class LightweightPPO:
                 if not prompt or not generated_text:
                     continue
                 
-                # 【关键】每轮 epoch 重新计算当前策略的逐 token log_prob
-                current_token_lps = self._compute_token_log_probs(prompt, generated_text)
+                # 【关键】每轮 epoch 重新计算当前策略的逐 token log_prob和熵
+                # 【修复MED-6】一次前向同时获取两者，避免2x计算浪费
+                current_token_lps, current_entropies = self._compute_token_log_probs_and_entropy(
+                    prompt, generated_text
+                )
                 if current_token_lps is None:
                     continue
                 
@@ -760,8 +782,12 @@ class LightweightPPO:
                 policy_loss = -torch.min(surr1, surr2).mean()
                 
                 # ── 熵奖励（鼓励探索） ──
-                entropy = -new_lps.mean()
-                entropy_loss = -self.entropy_coef * entropy
+                # 【修复CRIT-2+MED-6】使用当前策略的分布熵（已从上方一次前向获取）
+                if current_entropies is not None:
+                    entropy_val = current_entropies[:min_len].mean()
+                else:
+                    entropy_val = -new_lps.mean()
+                entropy_loss = -self.entropy_coef * entropy_val
                 
                 # ── 近似 KL 散度（监控指标） ──
                 # KL(π_old || π_new) ≈ mean(log π_old - log π_new)
@@ -788,6 +814,8 @@ class LightweightPPO:
                     self.optimizer.step()
                 else:
                     current_lr = self.optimizer.param_groups[0]['lr']
+                    # 【修复Bug #2】PPO步后必须清零梯度，防止SFT残余+PPO梯度混合
+                    self.optimizer.zero_grad(set_to_none=True)
                 self.ppo_training_steps += 1
                 
                 total_policy_loss += epoch_policy_loss
@@ -804,6 +832,7 @@ class LightweightPPO:
         # ── 清空 episode 数据 ──
         self.episode_data = {
             'log_probs': [],
+            'entropies': [],  # 【修复CRIT-1】遗漏导致内存泄漏
             'rewards': [],
             'values': [],
             'actions': [],
@@ -824,6 +853,7 @@ class LightweightPPO:
         """清空episode数据"""
         self.episode_data = {
             'log_probs': [],
+            'entropies': [],  # 【修复CRIT-1】遗漏导致内存泄漏
             'rewards': [],
             'values': [],
             'actions': [],

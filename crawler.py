@@ -9,7 +9,6 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import logging
 from datetime import datetime
-import string
 
 # 配置日志 - 只输出关键信息
 logging.basicConfig(
@@ -66,8 +65,11 @@ class WebCrawler:
         
         # URL队列和已爬取URL集合
         self.url_queue = queue.Queue()
-        self.visited_urls = set()
-        self.failed_urls = set()
+        from collections import OrderedDict
+        # 【修复MED-3】使用OrderedDict实现LRU语义的URL集合
+        self.visited_urls: OrderedDict = OrderedDict()
+        self.failed_urls: OrderedDict = OrderedDict()
+        self._MAX_URL_SET_SIZE = 100000
         
         # 数据缓存（FIFO）
         self.cache = deque(maxlen=max_cache_size)
@@ -81,7 +83,7 @@ class WebCrawler:
         # 线程池
         self.executor = ThreadPoolExecutor(max_workers=max_workers)
         
-        # 初始化种子URL或随机生成
+        # 初始化种子URL
         if seed_urls:
             # 如果seed_urls是字符串，转换为列表
             if isinstance(seed_urls, str):
@@ -94,10 +96,12 @@ class WebCrawler:
                     url = 'https://' + url
                 self.url_queue.put(url)
         else:
-            # 如果没有提供种子URL，自动生成随机URL初始化队列
-            initial_urls = self._generate_random_urls(max(5, queue_threshold))
-            for url in initial_urls:
-                self.url_queue.put(url)
+            # 【安全修复 HIGH-5】不再生成随机URL（存在安全与法律风险）
+            # 改为使用一个安全的默认种子URL
+            safe_default = "https://en.wikipedia.org/wiki/Main_Page"
+            self.url_queue.put(safe_default)
+            print(f"[Crawler] 未提供种子URL，使用默认: {safe_default}", flush=True)
+            print(f"[Crawler] 可通过 add_seed_url() 添加更多种子URL", flush=True)
         
         # 启动各个后台线程
         self._start_threads()
@@ -116,17 +120,6 @@ class WebCrawler:
         # 启动内存清理线程（每10分钟清理一次）
         threading.Thread(target=self._memory_cleaner, daemon=True).start()
     
-    def _generate_random_urls(self, num=5):
-        """生成随机URL"""
-        result = []
-        for _ in range(num):
-            chars = string.ascii_letters + string.digits
-            middle = ''.join(random.choices(chars, k=random.randint(3, 30)))
-            back = random.choice(['com', 'org', 'net', 'io'])
-            url = 'http://' + middle + '.' + back
-            result.append(url)
-        return result
-    
     def _crawler_worker(self):
         """爬虫工作线程"""
         while self.is_running and not self.stop_event.is_set():
@@ -142,17 +135,27 @@ class WebCrawler:
                     if url in self.visited_urls or url in self.failed_urls:
                         self.url_queue.task_done()
                         continue
-                    self.visited_urls.add(url)
+                    self.visited_urls[url] = True  # 【修复CRIT-5】OrderedDict无add方法
                 
                 # 爬取网页
                 success = self._fetch_and_parse(url)
                 
                 if success:
                     print(f"爬取成功: {url}", flush=True)
-                else:
-                    # 【修复】使用锁保护 failed_urls 的写入
                     with self.url_lock:
-                        self.failed_urls.add(url)
+                        self.visited_urls[url] = True  # OrderedDict记录插入顺序
+                        # 【修复MED-3】LRU式清理：移除最早的50%记录
+                        if len(self.visited_urls) > self._MAX_URL_SET_SIZE:
+                            old_count = len(self.visited_urls)
+                            while len(self.visited_urls) > self._MAX_URL_SET_SIZE // 2:
+                                self.visited_urls.popitem(last=False)  # FIFO
+                            print(f"[Crawler] 清理URL集合: {old_count} → {len(self.visited_urls)}", flush=True)
+                else:
+                    with self.url_lock:
+                        self.failed_urls[url] = True
+                        if len(self.failed_urls) > self._MAX_URL_SET_SIZE:
+                            while len(self.failed_urls) > self._MAX_URL_SET_SIZE // 2:
+                                self.failed_urls.popitem(last=False)
                     print(f"失败url: {url}", flush=True)
                 
                 self.url_queue.task_done()
