@@ -15,9 +15,9 @@ CONFIG: Dict[str, Any] = {
     # 2️⃣ 注意力机制配置
     # ═══════════════════════════════════════════════════════
     "attention_mix": {               # 注意力混合权重
-        "compressed": 2,             # 压缩注意力权重
-        "sparse": 1.3,               # 稀疏注意力权重
-        "dynamic": 1,                # 动态注意力权重
+        "csa": 2,                    # CSA压缩稀疏注意力权重
+        "sliding_window": 1.3,       # SlidingWindow精确注意力权重
+        "mla": 1,                    # MLA低秩压缩注意力权重
     },
     "sliding_window": 128,           # 【修复】从64→128，增大滑动窗口使生成长文本时能关注更多上下文
     "attention_chunk_size": 64,      # 【修复】从32→64，增大注意力块减少分块次数提升长序列质量

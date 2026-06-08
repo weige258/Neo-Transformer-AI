@@ -229,18 +229,17 @@ class RotaryPositionEmbedding(nn.Module):
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """交错式 (interleaved) RoPE 半旋转变换。
+    """配对式 (half-split) RoPE 半旋转变换。
 
-    对于输入 [x0, x1, x2, x3, ...]，返回 [-x1, x0, -x3, x2, ...]。
+    对于输入 [x0, x1, x2, x3, ...]，返回 [-x2, -x3, x0, x1]。
     这与 RotaryPositionEmbedding 中 torch.cat((freqs, freqs), dim=-1) 的
-    频率布局一致（每对相邻维度共享同一频率）。
+    频率布局一致（前半维和后半维共享同一组频率）。
 
-    注意：这是 LLaMA 风格的交错布局，与 emb 的生成方式匹配。
+    注意：这是标准 LLaMA 风格的实现，与 emb 的生成方式匹配。
     """
-    x1 = x[..., ::2]
-    x2 = x[..., 1::2]
-    # stack + flatten 保持最后一维长度不变
-    return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
 def apply_rope(
@@ -760,19 +759,24 @@ class HyperAttention(nn.Module):
         # mix: (batch, seq_len, 3), 对应 csa(0)/sliding_window(1)/mla(2)
 
         # 【动态权重调整】根据序列长度自动调整注意力策略
-        if seq_len <= 128:  # 短序列：主要依赖SlidingWindow
-            mix[..., 0] = mix[..., 0] * 0.1  # 禁用CSA
-            mix[..., 1] = mix[..., 1] * 2.0  # SlidingWindow主导
-            mix[..., 2] = mix[..., 2] * 0.1  # 禁用MLA
-        elif seq_len <= 1024:  # 中序列：平衡SlidingWindow和MLA
-            mix[..., 0] = mix[..., 0] * 0.5  # CSA辅助
-            mix[..., 1] = mix[..., 1] * 1.5  # SlidingWindow主导
-            mix[..., 2] = mix[..., 2] * 1.0  # MLA正常
-        else:  # 长序列：主要依赖CSA和MLA
-            mix[..., 0] = mix[..., 0] * 1.5  # CSA主导
-            mix[..., 1] = mix[..., 1] * 0.8  # SlidingWindow辅助
-            mix[..., 2] = mix[..., 2] * 1.2  # MLA增强
+        # 【修复】使用非原地乘法，避免 gradient checkpointing 时的 inplace operation 错误
+        # 原代码 mix[..., i] = mix[..., i] * scale 是原地操作，在 checkpoint 重计算时
+        # SoftmaxBackward0 的输出版本号被修改，导致梯度计算失败
+        adjust = torch.ones_like(mix)
+        if seq_len <= 128:
+            adjust[..., 0] = 0.1   # 禁用CSA
+            adjust[..., 1] = 2.0   # SlidingWindow主导
+            adjust[..., 2] = 0.1   # 禁用MLA
+        elif seq_len <= 1024:
+            adjust[..., 0] = 0.5   # CSA辅助
+            adjust[..., 1] = 1.5   # SlidingWindow主导
+            adjust[..., 2] = 1.0   # MLA正常
+        else:
+            adjust[..., 0] = 1.5   # CSA主导
+            adjust[..., 1] = 0.8   # SlidingWindow辅助
+            adjust[..., 2] = 1.2   # MLA增强
 
+        mix = mix * adjust  # 非原地乘法，创建新张量，不破坏 softmax 计算图
         mix = mix / mix.sum(dim=-1, keepdim=True)
 
         # 初始化累积输出为零
@@ -827,6 +831,13 @@ class HyperAttention(nn.Module):
 
         out = self.out_proj(out_accum)
         del out_accum
+
+        # 【修复】对 MLA memory 进行 detach().clone()，防止梯度计算图被原地操作破坏
+        # 这是 PyTorch inplace operation error 的根本修复
+        if new_mla_M is not None:
+            new_mla_M = new_mla_M.detach().clone()
+        if new_mla_z is not None:
+            new_mla_z = new_mla_z.detach().clone()
 
         if use_cache:
             # 【修复】从token_ids参数生成special_mask保护特殊Token
