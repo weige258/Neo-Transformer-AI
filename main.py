@@ -1,16 +1,15 @@
 from typing import List, Tuple, Optional
 import sys
 import os
-import pickle
 import torch
 import time
 import logging
 from collections import Counter
 from config import CONFIG
 from model import MainModel
+from record import record_loss, evaluate_rl_readiness
 from tokenizer import TextTokenizer
 from rl import SelfRewardModel, LightweightPPO
-from record import record_loss
 
 
 # 【显存优化】设置 PyTorch CUDA 内存分配策略，避免显存碎片化
@@ -26,177 +25,6 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-# P2: CPU KV缓存卸载池
-_cpu_kv_bank: dict[int, tuple] = {}
-_CPU_KV_MAX_LAYERS = 32  # 最多保留32层的卸载KV，超出则淘汰最旧层
-
-# ════════════════════════════════════════════════════════════
-# KIVI风格的异构KV量化（Key per-channel 4-bit, Value per-token 2-bit）
-# ════════════════════════════════════════════════════════════
-_KIVI_KEY_BITS = int(CONFIG.get("kivi_key_bits", 4))
-_KIVI_VALUE_BITS = int(CONFIG.get("kivi_value_bits", 2))
-
-def _kivi_quantize_key(k: torch.Tensor) -> tuple[torch.Tensor, ...]:
-    """KIVI Key量化 + 离群值保护（Outlier Preservation）
-
-    Key对离群值敏感，使用4-bit + per-channel，但检测离群通道保留fp16。
-    修复：防止异常激活值把正常token的缩放刻度压碎。
-    """
-    if not CONFIG.get("use_kivi_quantization", False):
-        return k, torch.tensor(0.0), torch.tensor(1.0)
-    bits = _KIVI_KEY_BITS
-    q_max = (1 << bits) - 1
-
-    # 检测离群通道：绝对值 > 3.5*std 的通道保留fp16
-    k_std = k.std(dim=-2, keepdim=True, unbiased=False)
-    k_mean = k.mean(dim=-2, keepdim=True)
-    outlier_mask = (k.abs() > (k_mean.abs() + 3.5 * k_std))
-    has_outlier = outlier_mask.any()
-
-    if has_outlier:
-        # 离群通道保留fp16，其余走4-bit量化
-        k_regular = k.masked_fill(outlier_mask, 0.0)
-        min_k = k_regular.amin(dim=-2, keepdim=True)
-        max_k = k_regular.amax(dim=-2, keepdim=True)
-        scale_k = (max_k - min_k) / q_max
-        scale_k = scale_k.clamp_min(1e-8)
-        qk = torch.round((k_regular - min_k) / scale_k).clamp(0, q_max).to(torch.uint8)
-        # 将离群值信息打包进返回元组（用scale保存离群掩码位置）
-        return qk, min_k, scale_k, outlier_mask.to(torch.uint8), k
-    else:
-        min_k = k.amin(dim=-2, keepdim=True)
-        max_k = k.amax(dim=-2, keepdim=True)
-        scale_k = (max_k - min_k) / q_max
-        scale_k = scale_k.clamp_min(1e-8)
-        qk = torch.round((k - min_k) / scale_k).clamp(0, q_max).to(torch.uint8)
-        return qk, min_k, scale_k, None, None
-
-def _kivi_dequantize_key(qk: torch.Tensor, min_k: torch.Tensor, scale_k: torch.Tensor,
-                          outlier_mask=None, outlier_vals=None) -> torch.Tensor:
-    if not CONFIG.get("use_kivi_quantization", False):
-        return qk
-    restored = qk.to(scale_k.dtype) * scale_k + min_k
-    if outlier_mask is not None and outlier_vals is not None:
-        restored = restored.masked_scatter(outlier_mask.bool(), outlier_vals[outlier_mask.bool()])
-    return restored
-
-def _kivi_quantize_value(v: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """KIVI Value量化：per-token（每个token独立量化，2-bit激进压缩）
-
-    Value对量化不敏感，使用2-bit即可。
-    """
-    if not CONFIG.get("use_kivi_quantization", False):
-        return v, torch.tensor(0.0), torch.tensor(1.0)
-    bits = _KIVI_VALUE_BITS
-    q_max = (1 << bits) - 1
-    min_v = v.amin(dim=-1, keepdim=True)  # (B, H, seq, 1)
-    max_v = v.amax(dim=-1, keepdim=True)
-    scale_v = (max_v - min_v) / q_max
-    scale_v = scale_v.clamp_min(1e-8)
-    qv = torch.round((v - min_v) / scale_v).clamp(0, q_max).to(torch.uint8)
-    return qv, min_v, scale_v
-
-def _kivi_dequantize_value(qv: torch.Tensor, min_v: torch.Tensor, scale_v: torch.Tensor) -> torch.Tensor:
-    if not CONFIG.get("use_kivi_quantization", False):
-        return qv
-    return qv.to(scale_v.dtype) * scale_v + min_v
-
-
-# 预分配CPU锁页内存池，用于异步卸载时的零拷贝传输
-_offload_pin_pool: dict[int, torch.Tensor] = {}
-
-def _ensure_pinned(t: torch.Tensor) -> torch.Tensor:
-    """确保张量在锁页内存中（pin_memory），实现PCIe异步零拷贝"""
-    if t.is_pinned():
-        return t
-    return t.pin_memory()
-
-def _async_offload_to_cpu(layer_idx: int, cache_tuple) -> tuple | None:
-    """将压缩记忆卸载到CPU（KIVI量化 + non_blocking异步PCIe传输）
-    
-    注意：non_blocking传输后不会立即同步，调用方应在适当时机调用
-    torch.cuda.synchronize()确保数据到达CPU。参见NEW-2修复。
-    """
-    if cache_tuple is None or len(cache_tuple) < 6:
-        return cache_tuple
-    recent_k, recent_v, mem_k, mem_v, mem_pos, total_len, lin_M, lin_z = cache_tuple
-    if mem_k is not None and mem_k.numel() > 0:
-        # LRU淘汰：超过容量上限时删除最旧的层
-        if len(_cpu_kv_bank) >= _CPU_KV_MAX_LAYERS:
-            oldest_id = min(_cpu_kv_bank.keys())
-            del _cpu_kv_bank[oldest_id]
-        # KIVI量化
-        qk, mk, sk, om, ov = _kivi_quantize_key(mem_k)
-        qv, mv, sv = _kivi_quantize_value(mem_v)
-        # 【修复MED-7】先完成所有non_blocking CPU传输，再同步确保DMA完成
-        # 顺序：启动所有传输 → synchronize() → 确保数据到达后存入bank
-        _offload_data = (
-            qk.cpu(non_blocking=True),
-            mk.cpu(non_blocking=True),
-            sk.cpu(non_blocking=True),
-            qv.cpu(non_blocking=True),
-            mv.cpu(non_blocking=True),
-            sv.cpu(non_blocking=True),
-            mem_pos.cpu(non_blocking=True),
-            lin_M.cpu(non_blocking=True),
-            lin_z.cpu(non_blocking=True),
-        )
-        # 确保所有DMA传输完成后再存入bank（防止GPU内存被重用）
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        _cpu_kv_bank[layer_idx] = (
-            _ensure_pinned(_offload_data[0]),
-            _ensure_pinned(_offload_data[1]),
-            _ensure_pinned(_offload_data[2]),
-            _ensure_pinned(_offload_data[3]),
-            _ensure_pinned(_offload_data[4]),
-            _ensure_pinned(_offload_data[5]),
-            _ensure_pinned(_offload_data[6]),
-            _ensure_pinned(_offload_data[7]),
-            _ensure_pinned(_offload_data[8]),
-            total_len,
-            None if om is None else om.cpu(non_blocking=True),
-            None if ov is None else ov.cpu(non_blocking=True),
-        )
-        empty = recent_k.new_zeros(1, 1, 0, mem_k.size(-1))
-        empty_v = recent_v.new_zeros(1, 1, 0, mem_v.size(-1))
-        empty_pos = torch.empty(0, device=mem_k.device, dtype=torch.long)
-        return (recent_k, recent_v, empty, empty_v, empty_pos, total_len, lin_M, lin_z)
-    return cache_tuple
-
-
-def _load_from_cpu(layer_idx: int, device: torch.device) -> tuple | None:
-    """从CPU锁页内存加载并反量化（non_blocking预取）"""
-    if layer_idx not in _cpu_kv_bank:
-        return None
-    data = _cpu_kv_bank[layer_idx]
-    if len(data) >= 12:
-        qk, mk, sk, qv, mv, sv, mpos, linM, linZ, tl, om, ov = data
-        # 反量化
-        mk_gpu = mk.to(device, non_blocking=True)
-        sk_gpu = sk.to(device, non_blocking=True)
-        qk_gpu = qk.to(device, non_blocking=True)
-        if om is not None:
-            om_gpu = om.to(device, non_blocking=True)
-            ov_gpu = ov.to(device, non_blocking=True)
-            mem_k = _kivi_dequantize_key(qk_gpu, mk_gpu, sk_gpu, om_gpu, ov_gpu)
-        else:
-            mem_k = _kivi_dequantize_key(qk_gpu, mk_gpu, sk_gpu)
-        mv_gpu = mv.to(device, non_blocking=True)
-        sv_gpu = sv.to(device, non_blocking=True)
-        qv_gpu = qv.to(device, non_blocking=True)
-        mem_v = _kivi_dequantize_value(qv_gpu, mv_gpu, sv_gpu)
-        mem_pos = mpos.to(device, non_blocking=True)
-        linM_gpu = linM.to(device, non_blocking=True)
-        linZ_gpu = linZ.to(device, non_blocking=True)
-        # 【修复NEW-1】严格按 CompressedKVCache 的8个字段顺序返回
-        # 格式: (recent_k, recent_v, mem_k, mem_v, mem_pos, total_len, mla_M, mla_z)
-        empty_k = torch.empty(1, 1, 0, mem_k.size(-1), device=device)
-        empty_v = torch.empty(1, 1, 0, mem_v.size(-1), device=device)
-        return empty_k, empty_v, mem_k, mem_v, mem_pos, tl, linM_gpu, linZ_gpu
-    return None
 
 
 # ──────────────────────────────────────────────────────────
@@ -241,8 +69,7 @@ def _build_train_sequence(
         masks.append(torch.full((t.numel(),), is_target, device=device, dtype=torch.bool))
 
     if not tensors:
-        # 返回空序列（全False mask → 无梯度）
-        # 【修复Bug #7】调用方在_run_train_step中检查target_mask.any()后跳过
+        # 返回一个最小的哑元序列
         dummy = torch.tensor([TextTokenizer.UNKNOWN_TOKEN], device=device, dtype=torch.long)
         return dummy, torch.tensor([False], device=device, dtype=torch.bool)
 
@@ -299,20 +126,14 @@ def _load_model() -> MainModel:
         print(f"\n{'='*60}", flush=True)
         print(f"[ERROR] {e}", flush=True)
         print(f"{'='*60}\n", flush=True)
-        raise  # 【修复】改用raise而非sys.exit(1)，让调用方决定是否终止
-    except (EOFError, pickle.UnpicklingError, RuntimeError) as e:
-        print(f"[Warning] Failed to load model weights (corrupted file?): {e}", flush=True)
-        print("[Warning] Creating new model with random initialization.", flush=True)
+        print("程序已终止。请修正配置或权重文件后重新运行。", flush=True)
+        import sys
+        sys.exit(1)
+    except Exception as e:
+        print(f"Failed to load model: {e}", flush=True)
         model = MainModel().to(device)
         print("Created new model.", flush=True)
         return model
-    except Exception as e:
-        # 磁盘I/O错误、内存不足等严重异常应传播，不静默创建新模型
-        print(f"\n{'='*60}", flush=True)
-        print(f"[FATAL] 加载模型时发生严重错误: {e}", flush=True)
-        print(f"[FATAL] 这不是权重文件损坏问题，请检查系统状态。", flush=True)
-        print(f"{'='*60}\n", flush=True)
-        raise
 
 
 # 【性能优化】启用TensorFloat32加速矩阵运算(消除UserWarning)
@@ -374,6 +195,10 @@ def _get_gpu_memory_ratio(device=None) -> float:
     except Exception:
         return 0.0
 
+
+def auto_compress_trigger(history_tensor) -> bool:
+    """【已禁用】不再自动触发压缩，始终返回False"""
+    return False
 
 # 【显存优化】关闭torch.compile，避免额外显存占用
 print("[Info] Running without torch.compile optimization (disabled for memory efficiency).", flush=True)
@@ -624,6 +449,11 @@ if device.type != "meta":
 
 
 
+def auto_compress_trigger(history_tensor: torch.Tensor, attn_weights: torch.Tensor = None) -> bool:
+    """【已禁用】不再自动触发压缩，始终返回False"""
+    return False
+
+
 def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = None):
     """准备单个样本的训练数据（使用安全的段构建方式）"""
     if ask_text is None or answer_text is None:
@@ -637,9 +467,6 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
 
     # 【删除限制】不再根据序列长度触发压缩，保留完整上下文
 
-    # 【StreamingLLM】可选：训练序列前缀sink token（默认关闭）
-    sink_enabled = bool(CONFIG.get("use_sink_token", False))
-
     segments: list = []
 
     if hist_context is not None and hist_context.strip():
@@ -647,7 +474,6 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
         # 【删除限制】不再检查压缩触发，保留完整历史上下文
 
         segments = [
-            *([(TextTokenizer.PLACEHOLDER_SINK_TOKEN, False)] if sink_enabled else []),
             (TextTokenizer.START_GENERATION_TOKEN, False),
             (history_tensor, False),
             (TextTokenizer.END_GENERATION_TOKEN, False),
@@ -661,7 +487,6 @@ def _prepare_training_data(ask_text: str, answer_text: str, hist_context: str = 
         preview = torch.cat([answer_tensor, torch.tensor([TextTokenizer.END_GENERATION_TOKEN])])
     else:
         segments = [
-            *([(TextTokenizer.PLACEHOLDER_SINK_TOKEN, False)] if sink_enabled else []),
             (ask_tensor, False),
             (TextTokenizer.START_GENERATION_TOKEN, False),
             (answer_tensor, True),
@@ -718,7 +543,6 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             return
 
         train_tensor, target_mask = _build_train_sequence([
-            *([(TextTokenizer.PLACEHOLDER_SINK_TOKEN, False)] if bool(CONFIG.get("use_sink_token", False)) else []),
             (TextTokenizer.START_GENERATION_TOKEN, True),
             (text_tensor, True),
             (TextTokenizer.END_GENERATION_TOKEN, True),
@@ -748,7 +572,6 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                 #       answer 首token 的 mask=True 确保 THINK_END 位置的logit学习输出回答首字符
                 #       这保证了"思维链→回答"的过渡被正确训练，防止模型在THINK_END后直接结束
                 train_tensor, target_mask = _build_train_sequence([
-                    *([(TextTokenizer.PLACEHOLDER_SINK_TOKEN, False)] if bool(CONFIG.get("use_sink_token", False)) else []),
                     (TextTokenizer.START_GENERATION_TOKEN, False),
                     (history_tensor, False),
                     (TextTokenizer.END_GENERATION_TOKEN, False),
@@ -768,7 +591,6 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                 # CoT 训练序列 Loss Mask（无历史上下文版本）
                 # 同上：THINK_END→answer 的过渡是关键，两者 mask 皆为 True
                 train_tensor, target_mask = _build_train_sequence([
-                    *([(TextTokenizer.PLACEHOLDER_SINK_TOKEN, False)] if bool(CONFIG.get("use_sink_token", False)) else []),
                     (ask_tensor, False),                         # 问题不参与loss
                     (TextTokenizer.START_GENERATION_TOKEN, False), # 分隔符不参与loss
                     (TextTokenizer.THINK_START_TOKEN, False),    # 不预测思考开始标记
@@ -841,13 +663,9 @@ def _min_p_sampling(logits: torch.Tensor, min_p: float) -> torch.Tensor:
       - 高置信度时（p_max 大）→ 自动收紧候选集，避免噪声
       - 低置信度时（p_max 小）→ 自动放宽，保留多样性
     无需手动调节 k 或 p，一个参数适配所有场景。
-
-    【修复NEW-2】调用方传入的 logits 已应用温度缩放，此函数不再做 softmax。
-    改为直接使用 logits 计算概率分布，避免双重 softmax 导致的阈值不一致。
     """
     if min_p <= 0.0:
         return logits
-    # 使用 logits 直接计算概率（不再内部做 softmax，因调用方已做 temperature 缩放）
     probs = torch.softmax(logits, dim=-1)
     p_max = probs.max().item()
     threshold = p_max * min_p
@@ -944,12 +762,12 @@ def _apply_token_quality_filter(
     _init_quality_masks(vocab_size)
     
     # 垃圾token → -inf（矢量化，单条指令）
-    mask_slice = _GARBAGE_MASK[:vocab_size].to(logits.device)
+    mask_slice = _GARBAGE_MASK[:vocab_size]
     logits[mask_slice] = float("-inf")
     
     # 强制回答阶段：非语言字符降权
     if force_answer:
-        force_slice = _GARBAGE_FORCE_MASK[:vocab_size].to(logits.device)
+        force_slice = _GARBAGE_FORCE_MASK[:vocab_size]
         logits[force_slice] -= 5.0
     
     return logits
@@ -1015,20 +833,18 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     
     # 【删除限制】不限制最大生成长度，让模型自然输出END_TOKEN终止
     if max_generate_tokens is None:
-        max_generate_tokens = 2048  # 【修复MEDIUM #7】设安全上限，防止无限生成OOM
+        max_generate_tokens = 99999999  # 设为极大值
     
     model.eval()
     output_text = ""
 
-    # 【StreamingLLM】可选sink token（默认关闭，配置 use_sink_token=True 启用）
-    sink_token_seg = [torch.tensor([TextTokenizer.PLACEHOLDER_SINK_TOKEN], device=device)] if bool(CONFIG.get("use_sink_token", False)) else []
-    
     if history_context and history_context.strip():
         history_tensor = TextTokenizer.encode(history_context).to(device)
+        # 【删除限制】不再检查压缩触发，直接使用完整历史
         text_tensor = TextTokenizer.encode(text).to(device)
         
+        # 统一处理：始终使用1维token序列
         prompt = torch.cat([
-            *sink_token_seg,
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
             history_tensor,
             torch.tensor([TextTokenizer.END_GENERATION_TOKEN], device=device),
@@ -1038,11 +854,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         ])
     else:
         prompt = torch.cat([
-            *sink_token_seg,
             TextTokenizer.encode(text).to(device),
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
         ])
-    
+
     print("\n---Generated reply:", flush=True)
 
     max_generate_tokens = max(1, int(max_generate_tokens))
@@ -1052,7 +867,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     min_p = float(CONFIG.get("min_p", 0.05))
     repetition_penalty = float(CONFIG.get("repetition_penalty", 1.02))
     repetition_stop_threshold = int(CONFIG.get("repetition_stop_threshold", 8))
-    force_answer_min_steps = int(CONFIG.get("force_answer_min_steps", 32))
+    force_answer_min_steps = int(CONFIG.get("force_answer_min_steps", 16))
     max_consecutive_garbage = int(CONFIG.get("max_consecutive_garbage", 3))
 
     with torch.inference_mode():
@@ -1079,11 +894,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
         step = 0
         
-        # 有序ID列表（用于时间顺序检测）+ Counter（用于频率惩罚）
-        generated_ids: list[int] = []
+        # 【修复】使用Counter记录已生成token的频率，实现基于频率的重复惩罚
         generated_tokens = Counter()
         
-        while step < max_generate_tokens:  # 总生成步数限制（思维链+回答一起）
+        while step < max_generate_tokens:  # 【删除限制】max_generate_tokens已设为极大值，实际由END_TOKEN控制结束
             try:
                 next_logits = logits[-1].clone()  # 【修复】始终clone，避免修改原始logits
                 # 【删除限制】不再设置最小生成token数
@@ -1103,31 +917,21 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     force_answer_steps -= 1
 
-                # ── ③ Repetition penalty (滑动窗口优化版) ──
-                # 【修复Bug #14】只对最近N个token应用惩罚，避免遍历全部vocab
-                if repetition_penalty > 1.0 and len(generated_ids) > 0:
-                    recent_ids = set(generated_ids[-128:])  # 滑动窗口：最近128个
-                    for token_id in recent_ids:
+                # ── ③ Repetition penalty (温和版) ──
+                if repetition_penalty > 1.0 and len(generated_tokens) > 0:
+                    for token_id, count in generated_tokens.items():
                         if token_id < next_logits.size(0):
-                            count = generated_tokens.get(token_id, 1)
-                            penalty = repetition_penalty ** min(count, 5)
-                            if token_id in set(generated_ids[-10:]):
-                                penalty *= 1.1
+                            penalty = repetition_penalty ** min(count, 3)  # 封顶 count=3
                             if next_logits[token_id] > 0:
                                 next_logits[token_id] /= penalty
                             else:
                                 next_logits[token_id] *= penalty
 
-                # ── ④ 先应用温度，再 Min-p 采样 (ICLR 2025) ──
-                # 【修复Bug #11】确保min-p的阈值计算在温度缩放后的概率上进行
-                # 原顺序：min-p(未缩放logits) → softmax(已缩放logits) → 阈值温度不一致
-                # 新顺序：temperature缩放 → min-p → softmax
-                if temperature > 0 and temperature != 1.0:
-                    next_logits = next_logits / temperature
+                # ── ④ Min-p 采样 (ICLR 2025) ──
                 if min_p > 0.0:
                     next_logits = _min_p_sampling(next_logits, min_p)
 
-                probs = torch.softmax(next_logits, dim=-1)
+                probs = torch.softmax(next_logits / temperature, dim=-1)
                 index = int(torch.multinomial(probs, 1).item())
 
                 # ── ⑤ 垃圾token检测与重采样 ──
@@ -1172,15 +976,15 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     elif not thinking_available:
                         should_skip_output = True
 
-                # 重复检测停止（仅回答阶段启用）
+                # 重复检测停止
                 if not thinking_started and index not in (
                     TextTokenizer.THINK_START_TOKEN,
                     TextTokenizer.THINK_END_TOKEN,
                     TextTokenizer.START_GENERATION_TOKEN,
                     TextTokenizer.END_GENERATION_TOKEN,
                 ):
-                    if step >= 5:
-                        should_stop, pattern = _check_repetition_stop(generated_ids + [index], repetition_stop_threshold)
+                    if step >= 5:  # 至少生成5个token后启用检测
+                        should_stop, pattern = _check_repetition_stop(list(generated_tokens) + [index], repetition_stop_threshold)
                         if should_stop:
                             print(f"\n[Stop] 检测到重复模式({pattern})，提前结束", flush=True)
                             break
@@ -1204,7 +1008,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     TextTokenizer.END_GENERATION_TOKEN,
                 ):
                     generated_tokens[index] += 1
-                    generated_ids.append(index)
 
                 next_token = torch.tensor([index], device=device)
                 result = model(
@@ -1238,9 +1041,8 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
             force_answer_steps = force_answer_min_steps
             step += 1
             
-            # 继续生成回答（最多额外 generate 步）
-            forced_max = min(step + max_generate_tokens // 2, max_generate_tokens * 2)
-            while step < forced_max:
+            # 【删除限制】不再限制强制回答步数，直到END_TOKEN自然出现
+            while True:
                 try:
                     next_logits = logits[-1].clone()
                     
@@ -1256,27 +1058,21 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     if force_answer_steps > 0:
                         force_answer_steps -= 1
                     
-                    # Repetition penalty（滑动窗口优化版）
-                    if repetition_penalty > 1.0 and len(generated_ids) > 0:
-                        recent_ids = set(generated_ids[-128:])
-                        for token_id in recent_ids:
+                    # Repetition penalty
+                    if repetition_penalty > 1.0 and len(generated_tokens) > 0:
+                        for token_id, count in generated_tokens.items():
                             if token_id < next_logits.size(0):
-                                count = generated_tokens.get(token_id, 1)
-                                penalty = repetition_penalty ** min(count, 5)
-                                if token_id in set(generated_ids[-10:]):
-                                    penalty *= 1.1
+                                penalty = repetition_penalty ** min(count, 3)
                                 if next_logits[token_id] > 0:
                                     next_logits[token_id] /= penalty
                                 else:
                                     next_logits[token_id] *= penalty
                     
-                    # 温度 + Min-p
-                    if temperature > 0 and temperature != 1.0:
-                        next_logits = next_logits / temperature
+                    # Min-p
                     if min_p > 0.0:
                         next_logits = _min_p_sampling(next_logits, min_p)
                     
-                    probs = torch.softmax(next_logits, dim=-1)
+                    probs = torch.softmax(next_logits / temperature, dim=-1)
                     index = int(torch.multinomial(probs, 1).item())
                     
                     # 垃圾检测
@@ -1300,7 +1096,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     if index not in (TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN,
                                      TextTokenizer.START_GENERATION_TOKEN, TextTokenizer.END_GENERATION_TOKEN):
                         generated_tokens[index] += 1
-                        generated_ids.append(index)
                     
                     next_token = torch.tensor([index], device=device)
                     result = model(next_token, past_key_values=past_key_values, use_cache=True)
@@ -1320,54 +1115,208 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         return output_text
 
 
-def _estimate_safe_chunk_size_v2(free_bytes: float, safety_factor: float = 0.6) -> int:
-    """精确显存预算模型（6GB专用），分项计算KV Cache+激活值+系统保留"""
-    cfg = CONFIG
-    d = int(cfg["emb_size"])
-    L = int(cfg["num_transformer_blocks"])
-    bytes_per = 2 if (use_amp and amp_dtype == torch.bfloat16) else (2 if use_amp else 4)
+def _detach_kv_cache(past_kv):
+    """递归 detach KV Cache 中的所有张量，切断计算图。
 
-    # 1. KV Cache: 2(K+V) * L * d * bytes_per
-    kv_per_token = 2 * L * d * bytes_per
-
-    # 2. 注意力激活峰值: heads * window * 4 (softmax buffer)
-    h = int(cfg["num_heads"])
-    window = int(cfg.get("sliding_window", 128))
-    act_peak = h * window * 4
-
-    # 3. 系统保留 512MB
-    system_reserve = 512 * 1024 * 1024
-
-    usable = max(1.0, (free_bytes - system_reserve)) * safety_factor
-    bytes_per_token = max(1, kv_per_token + act_peak)
-
-    chunk_size = max(64, int(usable / bytes_per_token))
-    return min(chunk_size, 4096)
+    past_kv 是 list[CompressedKVCache]，其中 CompressedKVCache 是
+    tuple[6个Tensor + 1个int]。必须 detach 后才能跨 chunk 复用，
+    否则 backward 后中间值被释放会导致 "backward a second time" 错误。
+    """
+    if past_kv is None:
+        return None
+    detached = []
+    for cache_tuple in past_kv:
+        # cache_tuple: (recent_k, recent_v, mem_k, mem_v, mem_pos, total_len)
+        # 前5个是 Tensor，第6个是 int
+        detached_tuple = tuple(
+            t.detach() if isinstance(t, torch.Tensor) else t
+            for t in cache_tuple
+        )
+        detached.append(detached_tuple)
+    return detached
 
 
-# P2: 四级显存触发器
-def _memory_trigger_policy(mem_ratio: float) -> str:
-    """返回当前应采取的记忆管理策略"""
-    if mem_ratio < 0.70:
-        return "normal"
-    elif mem_ratio < 0.82:
-        return "compress"
-    elif mem_ratio < 0.90:
-        return "aggressive"
-    else:
-        return "skip"
+def _estimate_safe_chunk_size(free_bytes: float, safety_factor: float = 0.7) -> int:
+    """根据当前空闲显存动态估算安全的分块大小（token数）。"""
+    emb_size = int(CONFIG.get("emb_size", 512))
+    num_layers = int(CONFIG.get("num_transformer_blocks", 8))
+    bytes_per_token = emb_size * num_layers * 8  # 含注意力开销
+    safe_bytes = free_bytes * safety_factor
+    chunk_size = max(128, int(safe_bytes / bytes_per_token))
+    return min(chunk_size, 2048)
+
+
+def _chunked_forward_backward(
+    train_tensor: torch.Tensor,
+    target_mask: torch.Tensor,
+    chunk_size: int,
+    overlap: int = 64,
+) -> float | None:
+    """KV Cache 分段训练：完整上下文传递，梯度跨块累积，零截断。
+    返回平均 loss，None 表示全部 OOM 跳过。
+    """
+    seq_len = train_tensor.numel()
+    step = max(1, chunk_size - overlap)
+
+    chunk_losses = []
+    past_kv = None
+
+    for seg_start in range(0, seq_len, step):
+        seg_end = min(seg_start + chunk_size, seq_len)
+        seg = train_tensor[seg_start:seg_end].to(device)
+        seg_mask = target_mask[seg_start:seg_end]
+
+        try:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                result = model(seg.unsqueeze(0) if seg.dim() == 1 else seg,
+                               past_key_values=past_kv, use_cache=True)
+                if isinstance(result, tuple):
+                    logits, past_kv = result
+                else:
+                    logits = result
+                    past_kv = None
+
+                if seg.numel() > 1 and seg_mask.any():
+                    if logits.dim() == 3:
+                        logits_2d = logits.squeeze(0)
+                    else:
+                        logits_2d = logits
+                    mask_bool = seg_mask[1:].to(device)
+                    if mask_bool.any():
+                        pred = logits_2d[:-1][mask_bool]
+                        tgt = seg[1:].to(device)[mask_bool]
+                        loss_chunk = loss_func(pred, tgt)
+                    else:
+                        loss_chunk = torch.tensor(0.0, device=device)
+                else:
+                    loss_chunk = torch.tensor(0.0, device=device)
+
+                num_chunks = max(1, (seq_len + step - 1) // step)
+                loss_scaled = loss_chunk / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
+
+            # 【修复】零 loss（无 grad_fn）时跳过 backward，避免崩溃
+            if loss_scaled.requires_grad:
+                if scaler.is_enabled():
+                    scaler.scale(loss_scaled).backward()
+                else:
+                    loss_scaled.backward()
+
+            chunk_losses.append(loss_chunk.detach())
+            del seg, logits, loss_chunk, loss_scaled
+
+            # 【关键】detach past_kv，切断上一chunk的计算图
+            # 否则下一个 chunk 的 forward 复用 past_kv 时，
+            # backward 会报 "backward a second time" 错误
+            if past_kv is not None:
+                past_kv = _detach_kv_cache(past_kv)
+
+        except RuntimeError as e_oom:
+            if "out of memory" in str(e_oom).lower():
+                smaller = max(128, chunk_size // 2)
+                if smaller < chunk_size:
+                    print(f"[Memory] Chunk OOM at [{seg_start}:{seg_end}], 缩半到{smaller}重试", flush=True)
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    # detach past_kv 后再传入，防止计算图冲突
+                    safe_past = _detach_kv_cache(past_kv) if past_kv is not None else None
+                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller, num_chunks)
+                    if sub is not None:
+                        sub_loss, past_kv = sub
+                        chunk_losses.append(sub_loss.detach())
+                        del sub_loss
+                    else:
+                        continue
+                else:
+                    print(f"[Memory] 最小chunk仍OOM，跳过此段", flush=True)
+                    continue
+            else:
+                raise
+
+    if not chunk_losses:
+        return None
+    avg_loss = torch.stack([l.to(device) for l in chunk_losses]).mean()
+    return avg_loss.item()
+
+
+def _chunk_one_segment(
+    seg: torch.Tensor, seg_mask: torch.Tensor, past_kv, chunk_size: int,
+    num_chunks: int = 1,
+):
+    """递归重试单个段，返回 (avg_loss, past_kv) 或 None。
+    
+    【修复】num_chunks 用于正确缩放梯度：
+    loss_scaled = loss_sub / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
+    确保递归细分后的梯度贡献与正常 chunk 一致，避免梯度被放大 num_chunks 倍。
+    """
+    seg_len = seg.numel()
+    step = max(1, chunk_size // 2)
+    seg_losses = []
+    local_past = past_kv
+
+    for s in range(0, seg_len, step):
+        e = min(s + chunk_size, seg_len)
+        sub = seg[s:e].to(device)
+        sub_mask = seg_mask[s:e]
+
+        try:
+            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                result = model(sub.unsqueeze(0) if sub.dim() == 1 else sub,
+                               past_key_values=local_past, use_cache=True)
+                if isinstance(result, tuple):
+                    logits, local_past = result
+                else:
+                    logits = result
+                    local_past = None
+                if sub.numel() > 1 and sub_mask.any():
+                    if logits.dim() == 3:
+                        logits_2d = logits.squeeze(0)
+                    else:
+                        logits_2d = logits
+                    mask_bool = sub_mask[1:].to(device)
+                    if mask_bool.any():
+                        pred = logits_2d[:-1][mask_bool]
+                        tgt = sub[1:].to(device)[mask_bool]
+                        loss_sub = loss_func(pred, tgt)
+                    else:
+                        loss_sub = torch.tensor(0.0, device=device)
+                else:
+                    loss_sub = torch.tensor(0.0, device=device)
+                # 【修复】除以 num_chunks，与正常 chunk 梯度缩放一致
+                loss_scaled = loss_sub / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
+
+            if loss_scaled.requires_grad:
+                if scaler.is_enabled():
+                    scaler.scale(loss_scaled).backward()
+                else:
+                    loss_scaled.backward()
+            seg_losses.append(loss_sub.detach())
+            del sub, logits, loss_sub, loss_scaled
+
+            # detach local_past，切断计算图（与主函数一致）
+            if local_past is not None:
+                local_past = _detach_kv_cache(local_past)
+
+        except RuntimeError:
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            continue
+
+    if seg_losses:
+        avg = torch.stack(seg_losses).mean()
+        return avg, local_past
+    return None
 
 
 def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, preview: torch.Tensor, show_preview: bool = True, preview_color: str = None) -> float:
-    """执行单步训练（显存感知 + MLA latent KV 压缩）
+    """执行单步训练（显存感知自适应分段，零截断）
 
     核心策略（按优先级）：
-    1. 序列能放入显存 → 标准前向+反向
-    2. 序列过长 → 分段处理，每段独立 forward，MLA latent memory 自动累积历史
-    3. 显存接近阈值 → 自动触发 MLA latent 压缩，释放 KV Cache
+    1. 序列能放入显存 → 标准前向+反向（含梯度累积）
+    2. 序列过长但可分块 → KV Cache 分段训练，梯度跨块累积，完整保留上下文
+    3. 显存极端紧张 → 启用历史上下文压缩 + 分段训练
+    4. 所有方法都失败 → 才跳过（不做截断！）
     """
     global training_rounds
-    _step_t0 = time.time()  # 【修复Bug #1】在函数内部计时，而非依赖外部的t0
 
     model.train()
     seq_len = train_tensor.numel()
@@ -1401,41 +1350,16 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
     if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
         optimizer.zero_grad(set_to_none=True)
 
-    # ── 🧠 四级显存触发器 + MLA latent 压缩触发 ──
-    policy = _memory_trigger_policy(mem_ratio)
-
-    if policy == "aggressive":
-        print(f"\n{'='*60}", flush=True)
-        print(f"[🧠 Memory Policy] 🟠 激进模式: 显存{mem_ratio:.1%}", flush=True)
-        print(f"[🧠 Memory Policy] 压缩比例从25%→6%, 释放GPU缓存", flush=True)
-        print(f"{'='*60}\n", flush=True)
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-    elif policy == "compress" and seq_len > 256:
-        print(f"\n{'='*60}", flush=True)
-        print(f"[🧠 MLA Memory] 🟡 压缩触发: 显存{mem_ratio:.1%}", flush=True)
-        print(f"[🧠 MLA Memory] 序列长度={seq_len} token, 压缩到 MLA latent KV 层", flush=True)
-        print(f"[🧠 MLA Memory] MLALatentMemory 已累积历史上下文", flush=True)
-        print(f"{'='*60}\n", flush=True)
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
+    # ── 显存安全网关 ──
     skip_thresh = float(CONFIG.get("gpu_memory_skip_ratio", 0.92))
-    if mem_ratio >= skip_thresh or policy == "skip":
+    if mem_ratio >= skip_thresh:
         print(f"[Memory] 显存占用过高 ({mem_ratio:.1%}), 主动清理后跳过本样本", flush=True)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         return float('inf')
 
-    # ── 检查target_mask ──
-    # 【修复Bug #7】如果target_mask全为False，前向传播无梯度，直接跳过
-    if not target_mask.any():
-        print(f"[Warning] target_mask全为False，跳过本样本", flush=True)
-        return float('inf')
-
     # ── 策略选择：估算此序列所需显存 ──
-    safe_chunk = _estimate_safe_chunk_size_v2(free_bytes, safety_factor=0.65)
+    safe_chunk = _estimate_safe_chunk_size(free_bytes, safety_factor=0.65)
 
     try:
         if seq_len <= safe_chunk:
@@ -1459,24 +1383,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 else:
                     loss = torch.tensor(0.0, device=device)
 
-            # ── 【新增】Special Token Anchor Loss ──
-            # 防止特殊Token（ID < 10）的hidden state被普通Token淹没
-            # 通过额外的自预测损失，确保特殊Token位置保持可区分性
-            # 这是解决"特殊Token注意力消失"问题的最后一道防线
-            anchor_loss_coef = float(CONFIG.get("special_token_anchor_loss_coef", 0.05))
-            if anchor_loss_coef > 0 and seq_len > 1:
-                special_positions = (train_tensor_gpu < 10)
-                if special_positions.any():
-                    # 从logits中提取特殊Token位置的输出分布
-                    special_logits = logits[:-1][special_positions[1:]]
-                    special_targets = train_tensor_gpu[1:][special_positions[1:]]
-                    if special_logits.numel() > 0:
-                        anchor_loss = loss_func(special_logits, special_targets)
-                        loss = loss + anchor_loss_coef * anchor_loss
-
             raw_loss_val = loss.item()  # 保存原始 loss 用于 ReduceLROnPlateau
-            # 记录loss到record.txt（异步写入，不阻塞训练）
-            record_loss(raw_loss_val)
             loss = loss / GRADIENT_ACCUMULATION_STEPS
             
             # 【修复】标准训练路径必须显式调用 backward()
@@ -1489,99 +1396,21 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                     loss.backward()
 
         else:
-            # ✅ 策略 2: 🧠 MLA latent 分段训练（长文本→压缩到 MLA latent KV 层）
-            # 【修复Bug #3】使用 past_key_values 传递跨段 MLA latent memory 状态
-            # 注意：MLALatentMemory.update() 内部使用 .detach()，梯度不会跨段传播
-            # 但前向传播时 MLA 状态可跨段累积，使后续段可访问历史压缩记忆
-            seg_size = min(safe_chunk, 2048)
-            seg_losses = []
-            seg_past_kv = [None] * len(model.transformers)  # 跨段传递的 KV cache
-            seg_loss_value_accum = []  # 【修复CRIT-3】收集每段loss值用于记录
+            # ✅ 策略 2: KV Cache 分段训练（完整上下文，零截断）
+            chunk_size = min(safe_chunk, int(CONFIG.get("max_forward_chunk", 512)))
+            overlap = int(CONFIG.get("dynamic_segment_overlap", 32))
 
-            print(f"[🧠 Memory] 长序列触发 MLA latent 压缩: seq_len={seq_len}, "
-                  f"seg_size={seg_size}, free={free_bytes/1024**3:.2f}GB", flush=True)
+            print(f"[Memory] 启用 KV-Cache 分段训练: seq_len={seq_len}, chunk={chunk_size}, "
+                  f"overlap={overlap}, free={free_bytes/1024**3:.2f}GB", flush=True)
 
-            num_segments = max(1, (seq_len + seg_size - 1) // seg_size)
-
-            for seg_start in range(0, seq_len, seg_size):
-                seg_end = min(seg_start + seg_size, seq_len)
-                seg_tensor = train_tensor[seg_start:seg_end].to(device)
-                seg_mask = target_mask[seg_start:seg_end]
-
-                # 【修复Bug #3 v2】使用use_cache=True使MLA跨段累积，之后detach防OOM
-                with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-                    result = model(seg_tensor, past_key_values=seg_past_kv, use_cache=True)
-                    if isinstance(result, tuple):
-                        logits, seg_past_kv = result
-                    else:
-                        logits = result
-
-                    if seg_tensor.numel() > 1 and seg_mask.any():
-                        mask_bool = seg_mask[1:].to(device)
-                        if mask_bool.any():
-                            pred = logits[:-1][mask_bool]
-                            tgt = seg_tensor[1:][mask_bool]
-                            loss_seg = loss_func(pred, tgt)
-                        else:
-                            loss_seg = torch.tensor(0.0, device=device)
-                    else:
-                        loss_seg = torch.tensor(0.0, device=device)
-
-                    # ── 分段路径的Special Token Anchor Loss ──
-                    anchor_loss_coef = float(CONFIG.get("special_token_anchor_loss_coef", 0.05))
-                    if anchor_loss_coef > 0 and seg_tensor.numel() > 1:
-                        special_positions = (seg_tensor < 10)
-                        if special_positions.any():
-                            special_logits = logits[:-1][special_positions[1:]]
-                            special_targets = seg_tensor[1:][special_positions[1:]]
-                            if special_logits.numel() > 0:
-                                anchor_loss = loss_func(special_logits, special_targets)
-                                loss_seg = loss_seg + anchor_loss_coef * anchor_loss
-
-                # autocast结束。detach KV cache防止计算图跨段连接
-                if seg_past_kv is not None:
-                    seg_past_kv = [
-                        None if layer_kv is None else tuple(
-                            t.detach() if isinstance(t, torch.Tensor) else t
-                            for t in layer_kv
-                        )
-                        for layer_kv in seg_past_kv
-                    ]
-
-                # 【修复CRIT-3】逐段反向传播，立即释放计算图
-                seg_loss_scaled = loss_seg / num_segments / GRADIENT_ACCUMULATION_STEPS
-                if seg_loss_scaled.requires_grad:
-                    if scaler.is_enabled():
-                        scaler.scale(seg_loss_scaled).backward()
-                    else:
-                        seg_loss_scaled.backward()
-                seg_loss_value_accum.append(loss_seg.detach().item())
-
-                # 每段后立即释放本段计算图
-                del seg_tensor, logits, loss_seg, seg_loss_scaled
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-                # 检查显存，如果仍高则打印提示
-                if torch.cuda.is_available() and seg_start % (seg_size * 2) == 0:
-                    ratio = _get_gpu_memory_ratio(device)
-                    if ratio > 0.8:
-                        print(f"[🧠 Memory] 段内显存{ratio:.1%}，MLA latent memory 已累积历史上下文", flush=True)
-
-            if not seg_loss_value_accum:
-                print(f"[Memory] 所有分段均OOM，跳过本样本", flush=True)
+            loss_val = _chunked_forward_backward(train_tensor, target_mask, chunk_size, overlap)
+            if loss_val is None:
+                print(f"[Memory] 所有分段均 OOM，跳过本样本", flush=True)
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
                 return float('inf')
-
-            raw_loss_val = sum(seg_loss_value_accum) / len(seg_loss_value_accum)
-            record_loss(raw_loss_val)
-            # 【修复CRIT-6】保留实际loss值供profiling和调度器使用
-            # 注意：此tensor无grad_fn，不影响梯度累积
-            loss = torch.tensor(raw_loss_val, device=device)
-
-            # ── 统一的梯度后处理 ──（接在分段循环后面）
-            # 注意：梯度已在每段backward中累积，这里只需执行optimizer.step
+            raw_loss_val = loss_val  # 保存原始 loss 用于 ReduceLROnPlateau
+            loss = torch.tensor(loss_val, device=device)
 
         # ── 统一的梯度后处理 ──
         if not torch.isnan(loss) and not torch.isinf(loss):
@@ -1655,7 +1484,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         return float('inf')
     finally:
         try:
-            elapsed = time.time() - _step_t0
+            elapsed = time.time() - t0
             if torch.cuda.is_available():
                 alloc = torch.cuda.memory_allocated() / 1024**3
                 resv = torch.cuda.memory_reserved() / 1024**3

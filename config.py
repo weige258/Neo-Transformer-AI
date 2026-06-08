@@ -14,51 +14,45 @@ CONFIG: Dict[str, Any] = {
     # ═══════════════════════════════════════════════════════
     # 2️⃣ 注意力机制配置
     # ═══════════════════════════════════════════════════════
-    "attention_mix": {               # 注意力混合权重（4路）
+    "attention_mix": {               # 注意力混合权重
         "compressed": 2,             # 压缩注意力权重
         "sparse": 1.3,               # 稀疏注意力权重
         "dynamic": 1,                # 动态注意力权重
-        "mla_latent_memory": 1.5,    # MLA latent KV 压缩权重
     },
-    "sliding_window": 256,           # 【修复】从128→256，增大滑动窗口改善长文本上下文覆盖
-    "attention_chunk_size": 128,      # 【修复】从64→128，增大注意力块减少分块次数提升长序列质量
+    "sliding_window": 128,           # 【修复】从64→128，增大滑动窗口使生成长文本时能关注更多上下文
+    "attention_chunk_size": 64,      # 【修复】从32→64，增大注意力块减少分块次数提升长序列质量
     "dynamic_attention_topk": 8,     # 动态注意力Top-K数量（6GB显存推荐8）
-    "attention_sink_count": 4,       # 【StreamingLLM】Attention Sink保护数量，前N个token永不压缩
-    
-    # ═══════════════════════════════════════════════════════
-    # 🔟 RoPE 位置编码扩展配置
-    # ═══════════════════════════════════════════════════════
-    # 基于 YaRN (Yet another RoPE extensioN method, Peng et al., 2023)
-    # 和 "Scaling Laws of RoPE-based Extrapolation" (Liu et al., ICLR 2024)
-    # 提高 base 值可显著增强长序列外推能力
-    "rope_base": 10000,               # 【修复】恢复默认10000，仅训练后按需增大。Scaling Laws论文要求增大base后需微调
-    "rope_factor": 1.0,               # 【YaRN】RoPE缩放因子，>1.0时进行位置插值（NTK-aware）
-    "rope_max_seq_len": 4096,         # 【YaRN】模型训练时的最大序列长度
-    "use_sink_token": False,            # 【修复】StreamingLLM sink token开关，默认关闭（训练后再开）
     
     # ═══════════════════════════════════════════════════════
     # 3️⃣ 历史上下文压缩
     # ═══════════════════════════════════════════════════════
-    "compress_trigger_len": 2048,    # 【修复】压缩触发长度阈值，超过此值触发KV压缩（设为None禁用）
-    "compress_trigger_entropy": 0.8, # 【修复】熵触发压缩阈值（0-1），低熵=确定性强时可安全压缩
+    "compress_trigger_len": 99999999,# 【删除限制】设为极大值，取消压缩触发长度阈值
+    "compress_trigger_entropy": 1.0, # 【删除限制】设为1.0，实际上取消熵触发压缩
     "compress_stride": 16,           # 压缩步长
     "compress_ratio": 0.25,          # 压缩比例（6GB显存推荐0.25，更激进的压缩）
-    "special_token_anchor_count": 10, # 【新增】特殊Token锚定数量(0-9)，始终以完整精度保留
-    "special_token_anchor_loss_coef": 0.05,  # 【新增】特殊Token锚定损失权重
+    "compress_on_memory_ratio": 0.80, # 当 GPU 显存占用超过该比例时触发压缩并卸载（0-1）
     # 运行时显存优化开关
     "use_amp": True,                          # 是否启用自动混合精度（AMP）
     "use_gradient_checkpointing": True,       # 是否在Transformer block上启用梯度检查点
     "gpu_cache_clear_threshold_gb": 4.0,      # 当 reserved 显存超过此值（GB）时定期清理 cache（6GB显卡推荐4GB）
+    # 在前向时对超长序列进行分块处理，避免一次性分配过大显存
+    "max_forward_chunk": 99999999,           # 【删除限制】设为极大值，取消前向分段块大小限制
     
     # ═══════════════════════════════════════════════════════
-    # 6️⃣ 显存与序列长度管理
+    # 4️⃣ 序列长度与显存管理（零截断策略）
     # ═══════════════════════════════════════════════════════
+    # 不再使用硬截断！优先通过以下机制保障训练：
+    #   ① KV Cache 分段训练 → 完整上下文传递，梯度跨块累积
+    #   ② 历史上下文向量压缩 → 高显存时自动压缩历史并卸载到 CPU
+    #   ③ 动态分块大小 → 根据实时空闲显存自适应调整 chunk_size
+    "max_generation_len": 99999999,  # 【删除限制】设为极大值，取消生成长度上限
+    "dynamic_segment_overlap": 32,   # 分段训练时块之间的重叠 token 数
+    # 显存安全阈值
     "gpu_memory_safe_ratio": 0.85,   # 安全显存比例（6GB显卡推荐0.80-0.85）
     "gpu_memory_skip_ratio": 0.92,   # 跳过样本的显存比例阈值（高于此值跳过，不做截断）
-    "record_interval": 1000,          # 每N步记录一次loss到record.txt
     
     # ═══════════════════════════════════════════════════════
-    # 4️⃣ 生成采样策略 (Min-p Sampling — ICLR 2025 最新方案)
+    # 5️⃣ 生成采样策略 (Min-p Sampling — ICLR 2025 最新方案)
     # ═══════════════════════════════════════════════════════
     # Min-p 论文: "Turning Up the Heat" (Nguyen et al., ICLR 2025)
     # 核心: 动态截断阈值 = 最大概率 × min_p_ratio，天然过滤垃圾token
@@ -69,12 +63,12 @@ CONFIG: Dict[str, Any] = {
     "top_p": 1.0,                    # 【修复】关闭top-p，min-p替代
     
     # ═══════════════════════════════════════════════════════
-    # 5️⃣ 生成质量控制
+    # 6️⃣ 生成质量控制
     # ═══════════════════════════════════════════════════════
-    "repetition_penalty": 1.15,      # 提高惩罚强度，抑制中文高频重复
-    "repetition_stop_threshold": 8,  # 降低重复触发阈值，避免长串重复文本继续生成
+    "repetition_penalty": 1.02,      # 【修复】进一步降低，避免中文常用字被惩罚
+    "repetition_stop_threshold": 16, # 【修复】从8→16，字符级生成容易重复，提高阈值避免误停
     # ── CoT 与输出完整性保护 ──
-    "force_answer_min_steps": 32,    # 【修复】强制回答步数，THINK_END后至少32步禁止END_TOKEN
+    "force_answer_min_steps": 0,     # 【删除限制】设为0，取消强制回答步数限制
     "max_consecutive_garbage": 3,    # 【新增】连续垃圾token数阈值（触发重采样/停止）
     
     # ═══════════════════════════════════════════════════════
@@ -133,21 +127,6 @@ CONFIG: Dict[str, Any] = {
     "adam_epsilon": 1e-8,                        # Adam/AdamW epsilon参数
     "max_grad_norm": 1.0,                        # 梯度裁剪最大范数
 
-    # ═══════════════════════════════════════════════════════
-    # 🔟 MLA latent KV 压缩记忆（DeepSeek-V2/V3 风格）
-    # ═══════════════════════════════════════════════════════
-    "mla_latent_memory_use_delta": True,      # MLA latent KV 的 Delta 更新开关
-    "mla_latent_memory_compress_threshold": 0.85,  # GPU显存占用超过此比例时触发 MLA latent 压缩
-    
-    # ═══════════════════════════════════════════════════════
-    # 1️⃣1️⃣ 智能KV压缩配置
-    # ═══════════════════════════════════════════════════════
-    "use_learned_pooling": True,          # 启用Learned Soft Pooling（可学习门控压缩）
-    "use_kivi_quantization": True,        # 启用KIVI风格KV量化（CPU卸载时压缩）
-    "kivi_key_bits": 4,                   # Key量化位数（4-bit, 保留离群值精度）
-    "kivi_value_bits": 2,                 # Value量化位数（2-bit, 激进压缩）
-    "max_mem_kv_capacity": 256,           # 压缩记忆 mem_kv 最大容量，超限部分固化到 MLA latent memory
-    
     # ═══════════════════════════════════════════════════════
     # 【运行时】显存与推理优化开关（仅为配置项，实际需要库支持）
     # ═══════════════════════════════════════════════════════
