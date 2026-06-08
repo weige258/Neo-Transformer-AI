@@ -751,8 +751,15 @@ def _chunked_forward_backward(
     chunk_size: int,
     overlap: int = 64,
 ) -> float | None:
-    """KV Cache 分段训练：完整上下文传递，梯度跨块累积，零截断。
-    返回平均 loss，None 表示全部 OOM 跳过。
+    """MLA 压缩上下文分段训练：每个 chunk 通过 CSA+H2O+MLA 三路压缩上下文感知全量历史，
+    梯度跨块累积，零截断。返回平均 loss，None 表示全部 OOM 跳过。
+
+    原理：每次 model(seg, past_key_values=cache, use_cache=True) 返回的 cache
+    包含 HyperAttention._build_cache() 构建的三层压缩记忆：
+      - CSA (Compressed Sparse Attention): 压缩稀疏注意力KV
+      - H2O (Heavy Hitter Oracle): 高注意力分数token保留
+      - MLA (Multi-head Latent Attention): 低秩潜在注意力记忆
+    下一 chunk 的注意力计算自动使用此三路混合，实现长上下文感知。
     """
     seq_len = train_tensor.numel()
     step = max(1, chunk_size - overlap)
@@ -911,9 +918,10 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
 
     核心策略（按优先级）：
     1. 序列能放入显存 → 标准前向+反向（含梯度累积）
-    2. 序列过长但可分块 → KV Cache 分段训练，梯度跨块累积，完整保留上下文
-    3. 显存极端紧张 → 启用历史上下文压缩 + 分段训练
-    4. 所有方法都失败 → 才跳过（不做截断！）
+    2. 序列过长但可分块 → MLA压缩上下文分段训练
+        模型自动在 chunk 间传递 CSA+H2O+MLA 三路压缩上下文，
+        每个 chunk 能感知全量历史（非简单截断），梯度跨块累积。
+    3. 所有方法都失败 → 才跳过（不做截断！）
     """
     global training_rounds
 
@@ -1001,12 +1009,12 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                     loss.backward()
 
         else:
-            # ✅ 策略 2: KV Cache 分段训练（完整上下文，零截断）
+            # ✅ 策略 2: MLA压缩上下文分段训练（CSA+H2O+MLA三路压缩）
             chunk_size = min(safe_chunk, int(CONFIG.get("max_forward_chunk", 512)))
             overlap = int(CONFIG.get("dynamic_segment_overlap", 32))
 
-            print(f"[Memory] 启用 KV-Cache 分段训练: seq_len={seq_len}, chunk={chunk_size}, "
-                  f"overlap={overlap}, free={free_bytes/1024**3:.2f}GB", flush=True)
+            print(f"[Memory] MLA压缩上下文训练: seq={seq_len}, chunk={chunk_size}, overlap={overlap}, "
+                  f"free={free_bytes/1024**3:.2f}GB (CSA+H2O+MLA三路压缩)", flush=True)
 
             loss_val = _chunked_forward_backward(train_tensor, target_mask, chunk_size, overlap)
             if loss_val is None:
