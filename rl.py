@@ -651,7 +651,11 @@ class LightweightPPO:
         if len(logits) < gen_len + 1:
             return None, None
         
-        generated_logits = logits[prompt_len:prompt_len + gen_len]
+        # ── 修复：向前平移1位，使 logits[i-1] 对应 generated_tokens[i] ──
+        # 自回归模型中，预测第t个token的logit位于位置t-1
+        # 预测 generated_tokens[0] 的 logit 位于 logits[prompt_len - 1]
+        # 预测最后一个生成token的 logit 位于 logits[prompt_len + gen_len - 2]
+        generated_logits = logits[prompt_len - 1:prompt_len + gen_len - 1]
         log_probs = F.log_softmax(generated_logits, dim=-1)
         probs = F.softmax(generated_logits, dim=-1)
         

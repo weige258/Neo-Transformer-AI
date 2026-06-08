@@ -899,7 +899,11 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         
         while step < max_generate_tokens:  # 【删除限制】max_generate_tokens已设为极大值，实际由END_TOKEN控制结束
             try:
-                next_logits = logits[-1].clone()  # 【修复】始终clone，避免修改原始logits
+                # 【修复】logits 是3维 [batch, seq_len, vocab]，取最后一个token的logits
+                if logits.dim() == 3:
+                    next_logits = logits[0, -1].clone()
+                else:
+                    next_logits = logits[-1].clone()
                 # 【删除限制】不再设置最小生成token数
                 
                 # ── ① Token 质量过滤 ──
@@ -1041,10 +1045,16 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
             force_answer_steps = force_answer_min_steps
             step += 1
             
-            # 【删除限制】不再限制强制回答步数，直到END_TOKEN自然出现
-            while True:
+            # 【修复】强制回答阶段也必须遵守 max_generate_tokens 限制
+            max_force_answer_steps = max_generate_tokens - step
+            force_answer_count = 0
+            while step < max_generate_tokens and force_answer_count < max_force_answer_steps:
                 try:
-                    next_logits = logits[-1].clone()
+                    # 【修复】logits 是3维 [batch, seq_len, vocab]，取最后一个token的logits
+                    if logits.dim() == 3:
+                        next_logits = logits[0, -1].clone()
+                    else:
+                        next_logits = logits[-1].clone()
                     
                     # 质量过滤 + 强制回答期保护
                     next_logits = _apply_token_quality_filter(next_logits, force_answer=True)
@@ -1105,6 +1115,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         logits = result
                     
                     step += 1
+                    force_answer_count += 1
                 except Exception:
                     break
 
@@ -1375,7 +1386,12 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 if seq_len > 1:
                     mask_bool = target_mask[1:].to(device)
                     if mask_bool.any():
-                        pred = logits[:-1][mask_bool]
+                        # 【修复】logits 是3维 [batch, seq_len, vocab]，需要 squeeze 或按正确维度索引
+                        if logits.dim() == 3:
+                            logits_2d = logits.squeeze(0)  # [1, seq_len, vocab] -> [seq_len, vocab]
+                        else:
+                            logits_2d = logits
+                        pred = logits_2d[:-1][mask_bool]
                         tgt = train_tensor_gpu[1:][mask_bool]
                         loss = loss_func(pred, tgt)
                     else:
