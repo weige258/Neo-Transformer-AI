@@ -184,112 +184,10 @@ def _prepare_training_data(ask: str, answer: str, history_context: str = None) -
     return train_tensor, target_mask, preview
 
 
-def _is_garbage_token(token_id: int) -> bool:
-    """检测 token 解码后是否为垃圾/不可显示字符
-
-    垃圾类型包括:
-      - 控制字符 (0-31, 127) —— 但排除特殊功能token (1-9)
-      - 代理对 (0xD800-0xDFFF)
-      - 私用区 (0xE000-0xF8FF)
-      - 非主流 Unicode 块 (如加拿大音节文字 0x1400-0x167F)
-      - 特殊 Unicode 控制字符
-    """
-    # 特殊功能token (1-9) 不是垃圾，是模型需要学习输出的控制token
-    if 1 <= token_id <= 9:
-        return False
-    if not TextTokenizer._is_valid_token(token_id):
-        return True
-    # 控制字符（排除特殊token 1-9）
-    if token_id < 32 or token_id == 127:
-        return True
-    # 加拿大土著音节文字 (ᓀ ᓓ 等 — 训练数据中不应出现)
-    if 0x1400 <= token_id <= 0x167F:
-        return True
-    # 切罗基文字
-    if 0x13A0 <= token_id <= 0x13FF:
-        return True
-    # 高棉文符号
-    if 0x19E0 <= token_id <= 0x19FF:
-        return True
-    # 缅甸文扩展
-    if 0xAA60 <= token_id <= 0xAA7F:
-        return True
-    # 彝文音节
-    if 0xA000 <= token_id <= 0xA4CF:
-        return True
-    # 私用区
-    if 0xE000 <= token_id <= 0xF8FF:
-        return True
-    # 标记/组合字符块 
-    if 0x0300 <= token_id <= 0x036F:
-        return True
-    if 0x1AB0 <= token_id <= 0x1AFF:
-        return True
-    if 0xFE00 <= token_id <= 0xFE0F:
-        return True
-    return False
 
 
-# 预计算垃圾token掩码（避免每步Python循环）
-_GARBAGE_MASK = None
-_GARBAGE_FORCE_MASK = None  # 强制回答阶段的非CJK字符降权掩码
-
-def _init_quality_masks(vocab_size: int):
-    """初始化矢量化质量过滤掩码（仅调用一次）"""
-    global _GARBAGE_MASK, _GARBAGE_FORCE_MASK
-    if _GARBAGE_MASK is not None:
-        return
-    
-    import torch
-    _GARBAGE_MASK = torch.zeros(vocab_size, dtype=torch.bool)
-    _GARBAGE_FORCE_MASK = torch.zeros(vocab_size, dtype=torch.bool)
-    
-    limit = min(vocab_size, 0x2000)
-    for token_id in range(limit):
-        if _is_garbage_token(token_id):
-            _GARBAGE_MASK[token_id] = True
-    
-    # 强制回答阶段：标记非语言字符（用于降权，不封死）
-    for token_id in range(0x80, min(vocab_size, 0x10000)):
-        if _GARBAGE_MASK[token_id]:
-            continue
-        # ASCII 可打印、CJK、全角标点 → 允许
-        if 32 <= token_id < 127:
-            continue
-        if 0x4E00 <= token_id <= 0x9FFF:
-            continue
-        if 0x3400 <= token_id <= 0x4DBF:
-            continue
-        if 0xFF00 <= token_id <= 0xFFEF:
-            continue
-        if 0x3000 <= token_id <= 0x303F:
-            continue
-        _GARBAGE_FORCE_MASK[token_id] = True  # 非语言字符，需要降权
 
 
-def _apply_token_quality_filter(
-    logits: torch.Tensor,
-    force_answer: bool = False,
-) -> torch.Tensor:
-    """对 logits 应用 token 质量过滤（矢量化，O(1)每步）
-
-    将已知垃圾 token 的概率设为 -inf。
-    在强制回答阶段，非 CJK/ASCII 字符降权 5.0。
-    """
-    global _GARBAGE_MASK, _GARBAGE_FORCE_MASK
-    vocab_size = logits.size(-1)
-    _init_quality_masks(vocab_size)
-    
-    # 垃圾token → -inf（矢量化，单条指令）
-    mask_slice = _GARBAGE_MASK[:vocab_size]
-    logits[mask_slice] = float("-inf")
-    
-    # 强制回答阶段：非语言字符降权
-    if force_answer:
-        force_slice = _GARBAGE_FORCE_MASK[:vocab_size]
-        logits[force_slice] -= 5.0
-    
-    return logits
 
 
 def _check_repetition_stop(generated_tokens: list, threshold: int = 5) -> tuple[bool, str]:
@@ -314,20 +212,20 @@ def _check_repetition_stop(generated_tokens: list, threshold: int = 5) -> tuple[
         return True, f"连续{threshold}个相同token"
     
     # 策略2: 检测重复的n-gram序列（2-gram, 3-gram）
+    # 【BUG #6修复】只检查最近的 n-gram，不扫描全序列（O(1) 替代 O(n²)）
     for n in [2, 3]:
-        if len(generated_tokens) < n * 3:
+        if len(generated_tokens) < n * 4:
             continue
         
-        # 取最后3个n-gram
+        # 只取最近 4 个 n-gram，检查后3个是否相同
+        recent_seq = generated_tokens[-(n * 4):]
         ngrams = []
-        for i in range(len(generated_tokens) - n + 1):
-            ngram = tuple(generated_tokens[i:i+n])
-            ngrams.append(ngram)
+        for i in range(len(recent_seq) - n + 1):
+            ngrams.append(tuple(recent_seq[i:i+n]))
         
-        # 检查最后3个n-gram是否重复
-        if len(ngrams) >= 3:
-            last_ngrams = ngrams[-3:]
-            if len(set(last_ngrams)) == 1:
+        if len(ngrams) >= 4:
+            last_3 = ngrams[-3:]
+            if len(set(last_3)) == 1:
                 return True, f"重复{n}-gram模式"
     
     return False, ""
@@ -353,13 +251,13 @@ def _min_p_sampling(logits: torch.Tensor, min_p: float) -> torch.Tensor:
 
 
 def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
-    """生成函数 (Min-p采样 + Token质量过滤 + CoT完整性保护)
+    """生成函数 (Min-p采样 + Repetition Penalty + CoT完整性保护)
 
-    基于 ICLR 2025 Min-p 论文和大量实验优化的解码策略：
-    - Min-p 采样替代 top-k/top-p，天然过滤低概率垃圾token
-    - Token 质量过滤器阻止非语言字符（加拿大音节、私用区等）
+    解码策略：
+    - Min-p 采样替代 top-k/top-p
+    - Repetition Penalty 防止重复输出
     - 思考阶段长度限制 + 强制回答期确保 CoT→回复 完整过渡
-    - 垃圾token连胜检测：连续N个垃圾立即停止
+    - 重复模式检测：连续重复自动停止
     """
     BLUE = '\033[94m'
     GREEN = '\033[92m'
@@ -401,20 +299,15 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
     max_generate_tokens = max(1, int(max_generate_tokens))
     
-    # 读取采样参数
     temperature = float(CONFIG.get("temperature", 0.5))
     min_p = float(CONFIG.get("min_p", 0.05))
     repetition_penalty = float(CONFIG.get("repetition_penalty", 1.02))
     repetition_stop_threshold = int(CONFIG.get("repetition_stop_threshold", 8))
     force_answer_min_steps = int(CONFIG.get("force_answer_min_steps", 16))
-    max_consecutive_garbage = int(CONFIG.get("max_consecutive_garbage", 3))
-    # 【新增】最大重采样次数，防止死循环
-    max_resample_attempts = int(CONFIG.get("max_resample_attempts", 10))
 
     with torch.inference_mode():
         thinking_started = False
         force_answer_steps = 0
-        consecutive_garbage = 0
         
         # 注入THINK_START
         if thinking_available:
@@ -440,12 +333,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits = logits[0, -1].clone()
                 else:
                     next_logits = logits[-1].clone()
-                
-                # Token 质量过滤
-                next_logits = _apply_token_quality_filter(
-                    next_logits,
-                    force_answer=(force_answer_steps > 0),
-                )
 
                 # 强制回答阶段：禁止特殊token
                 if force_answer_steps > 0:
@@ -473,59 +360,14 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
                 probs = torch.softmax(next_logits / temperature, dim=-1)
                 
-                # 【修复】带重采样限制的token选择
-                resample_count = 0
                 index = int(torch.multinomial(probs, 1).item())
                 
-                while True:
-                    # 检查是否是垃圾token（但保留必要的特殊token）
-                    is_garbage = _is_garbage_token(index) and index not in (
-                        TextTokenizer.THINK_START_TOKEN,
-                        TextTokenizer.THINK_END_TOKEN,
-                        TextTokenizer.END_GENERATION_TOKEN,
-                        TextTokenizer.START_GENERATION_TOKEN,
-                    )
-                    
-                    # 检查是否是被禁止的token（思考阶段禁止END）
-                    is_forbidden = False
-                    if index == TextTokenizer.END_GENERATION_TOKEN:
-                        if force_answer_steps > 0 or thinking_started:
-                            is_forbidden = True
-                    
-                    if not is_garbage and not is_forbidden:
-                        break
-                    
-                    # 重采样
-                    resample_count += 1
-                    if resample_count >= max_resample_attempts:
-                        print(f"\n[Stop] 重采样次数超限({resample_count})，强制结束", flush=True)
-                        break
-                    
-                    if is_garbage:
-                        consecutive_garbage += 1
-                        if consecutive_garbage >= max_consecutive_garbage:
-                            print(f"\n[Stop] 连续{consecutive_garbage}个垃圾token，强制结束", flush=True)
-                            break
-                        next_logits[index] = float("-inf")
-                    elif is_forbidden:
-                        next_logits[index] = float("-inf")
-                    
-                    # 重新计算概率
+                # 思考阶段或强制回答阶段：禁止 END_TOKEN
+                if index == TextTokenizer.END_GENERATION_TOKEN and (force_answer_steps > 0 or thinking_started):
+                    next_logits[index] = float("-inf")
                     probs = torch.softmax(next_logits / temperature, dim=-1)
-                    # 检查是否所有token都被屏蔽
-                    if torch.isinf(next_logits).all() or probs.sum().item() < 1e-6:
-                        print(f"\n[Stop] 所有token被屏蔽，强制结束", flush=True)
-                        break
-                    index = int(torch.multinomial(probs, 1).item())
-                
-                # 检查是否因重采样超限而退出
-                if resample_count >= max_resample_attempts:
-                    break
-                if consecutive_garbage >= max_consecutive_garbage:
-                    break
-                
-                # 重置垃圾计数（有效token）
-                consecutive_garbage = 0
+                    if not torch.isinf(next_logits).all() and probs.sum().item() >= 1e-6:
+                        index = int(torch.multinomial(probs, 1).item())
                 
                 # 处理特殊token
                 should_skip_output = False
@@ -554,7 +396,20 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         should_skip_output = True
 
                 # 重复检测
-                if not thinking_started and index not in (
+                if thinking_started and index not in (
+                    TextTokenizer.THINK_START_TOKEN,
+                    TextTokenizer.THINK_END_TOKEN,
+                    TextTokenizer.START_GENERATION_TOKEN,
+                    TextTokenizer.END_GENERATION_TOKEN,
+                ):
+                    # 【BUG #5修复】思考阶段也检测重复，防止无限"思考循环"
+                    generated_sequence.append(index)
+                    if step >= 5:
+                        should_stop, pattern = _check_repetition_stop(generated_sequence, repetition_stop_threshold)
+                        if should_stop:
+                            print(f"\n[Stop] 思考阶段检测到重复({pattern})，提前结束", flush=True)
+                            break
+                elif not thinking_started and index not in (
                     TextTokenizer.THINK_START_TOKEN,
                     TextTokenizer.THINK_END_TOKEN,
                     TextTokenizer.START_GENERATION_TOKEN,
@@ -633,16 +488,17 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     else:
                         next_logits = logits[-1].clone()
                     
-                    next_logits = _apply_token_quality_filter(next_logits, force_answer=True)
-                    next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
+                    # 【BUG #2修复】不再永久封死END_TOKEN，只在force_answer_steps>0时禁止
+                    # 允许模型在适当时候自然输出END_TOKEN结束
+                    if force_answer_steps > 0:
+                        force_answer_steps -= 1
+                        next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
+                    
                     next_logits[TextTokenizer.UNKNOWN_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.THINK_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.THINK_END_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
-                    
-                    if force_answer_steps > 0:
-                        force_answer_steps -= 1
                     
                     # Repetition penalty
                     if repetition_penalty > 1.0 and len(generated_tokens) > 0:
@@ -659,39 +515,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         next_logits = _min_p_sampling(next_logits, min_p)
                     
                     probs = torch.softmax(next_logits / temperature, dim=-1)
-                    
-                    # 【修复】强制回答阶段也使用重采样限制
-                    resample_count = 0
                     index = int(torch.multinomial(probs, 1).item())
                     
-                    while True:
-                        is_garbage = _is_garbage_token(index) and index not in (TextTokenizer.END_GENERATION_TOKEN,)
-                        if not is_garbage:
-                            break
-                        
-                        resample_count += 1
-                        if resample_count >= max_resample_attempts:
-                            break
-                        
-                        consecutive_garbage += 1
-                        if consecutive_garbage >= max_consecutive_garbage:
-                            break
-                        
-                        next_logits[index] = float("-inf")
-                        probs = torch.softmax(next_logits / temperature, dim=-1)
-                        if torch.isinf(next_logits).all() or probs.sum().item() < 1e-6:
-                            break
-                        index = int(torch.multinomial(probs, 1).item())
-                    
-                    if resample_count >= max_resample_attempts or consecutive_garbage >= max_consecutive_garbage:
-                        break
-                    
-                    consecutive_garbage = 0
-                    
+                    # 【BUG #2修复】END_TOKEN现在可以被正常采样选中
                     if index == TextTokenizer.END_GENERATION_TOKEN:
-                        # 【修复】无限制模式下，END_TOKEN 是正常终止条件
-                        if not has_token_limit and step >= absolute_max_tokens - 1:
-                            print(f"\n[Stop] 强制回答阶段达到绝对安全上限，结束", flush=True)
                         break
                     
                     decoded_piece = TextTokenizer.decode(torch.tensor([index]))
@@ -702,6 +529,13 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     if index not in (TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN,
                                      TextTokenizer.START_GENERATION_TOKEN, TextTokenizer.END_GENERATION_TOKEN):
                         generated_tokens[index] += 1
+                        # 【BUG #3修复】CoT Guard 强制回答阶段增加重复检测
+                        generated_sequence.append(index)
+                        if force_answer_count >= 5:
+                            should_stop, pattern = _check_repetition_stop(generated_sequence, repetition_stop_threshold)
+                            if should_stop:
+                                print(f"\n[Stop] CoT Guard 检测到重复模式({pattern})，提前结束", flush=True)
+                                break
                     
                     next_token = torch.tensor([index], device=device)
                     result = model(next_token, past_key_values=past_key_values, use_cache=True)
