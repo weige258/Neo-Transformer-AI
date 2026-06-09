@@ -72,10 +72,10 @@ class MLALatentMemory(nn.Module):
         return M, z
 
     def retrieve(self, q: torch.Tensor, mem_M: torch.Tensor, mem_z: torch.Tensor) -> torch.Tensor:
-        """从压缩记忆中检索值（矩阵吸收版本）。
+        """从压缩记忆中检索值（矩阵吸收版本）- 修复版
         
-        矩阵吸收优化：将k_up_proj吸收到q_proj中，减少推理计算量。
-        实际计算时：Q_latent -> (吸收k_up_proj) -> Q_full -> attention -> V_full
+        修复: 原实现错误地对Q本身应用softmax，这破坏了query的相对幅度信息。
+        正确做法: Q投影后直接使用，通过内积计算注意力权重（由mem_M/mem_z隐式完成）。
         
         Args:
             q: Query张量 (batch, heads, seq_len, head_dim)
@@ -85,10 +85,13 @@ class MLALatentMemory(nn.Module):
             检索值 (batch, heads, seq_len, head_dim)
         """
         # Q投影到latent空间
-        q_lat = self.q_proj(q) + self.scale.view(1, -1, 1, 1)
+        q_lat = self.q_proj(q)
         
-        # 使用softmax激活替代elu，更稳定
-        q_lat = F.softmax(q_lat / math.sqrt(q_lat.size(-1)), dim=-1)
+        # 应用可学习的头缩放（不使用softmax，保留相对幅度）
+        q_lat = q_lat * self.scale.view(1, -1, 1, 1)
+        
+        # 使用elu激活替代softmax，保留非负性同时不破坏幅度信息
+        q_lat = F.elu(q_lat) + 1.0
         
         # 从压缩记忆中检索
         numer = torch.matmul(q_lat, mem_M)
@@ -118,8 +121,9 @@ class MLALatentMemory(nn.Module):
         k_lat = self.kv_proj(k)
         v_lat = self.v_proj(v)
         
-        # 使用softmax激活
-        k_lat = F.softmax(k_lat / math.sqrt(k_lat.size(-1)), dim=-1)
+        # 使用elu激活替代softmax（与retrieve保持一致）
+        k_lat = F.elu(k_lat) + 1.0
+        v_lat = F.elu(v_lat) + 1.0
         
         if self.use_delta:
             # 增量更新：只更新预测误差部分

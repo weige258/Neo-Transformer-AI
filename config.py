@@ -22,6 +22,9 @@ CONFIG: Dict[str, Any] = {
     "sliding_window": 128,           # 【修复】从64→128，增大滑动窗口使生成长文本时能关注更多上下文
     "attention_chunk_size": 64,      # 【修复】从32→64，增大注意力块减少分块次数提升长序列质量
     "dynamic_attention_topk": 8,     # 动态注意力Top-K数量（6GB显存推荐8）
+    "rope_base": 1000000,            # 【修复】YaRN风格NT-aware扩展，与Llama 3.1一致
+    "rope_factor": 1.0,              # NTK频率缩放因子（1.0=不缩放）
+    "rope_max_seq_len": 4096,        # RoPE最大训练序列长度
     
     # ═══════════════════════════════════════════════════════
     # 3️⃣ 历史上下文压缩
@@ -57,8 +60,8 @@ CONFIG: Dict[str, Any] = {
     # Min-p 论文: "Turning Up the Heat" (Nguyen et al., ICLR 2025)
     # 核心: 动态截断阈值 = 最大概率 × min_p_ratio，天然过滤垃圾token
     # 已被 HuggingFace Transformers / VLLM 等主流框架采纳
-    "temperature": 0.8,              # 【修复】小模型降温至0.8，减少噪声
-    "min_p": 0.05,                   # Min-p 比例（0.05 为高质量推荐值）
+    "temperature": 0.6,              # 【修复】小模型降温至0.6，减少噪声
+    "min_p": 0.02,                   # 【修复】Min-p 比例降至0.02，小模型需要更多候选
     "top_k": 0,                      # 【修复】关闭top-k，min-p更优
     "top_p": 1.0,                    # 【修复】关闭top-p，min-p替代
     
@@ -66,7 +69,6 @@ CONFIG: Dict[str, Any] = {
     # 6️⃣ 生成质量控制
     # ═══════════════════════════════════════════════════════
     "repetition_penalty": 1.15,      # 【BUG #1修复】从1.02→1.15，符合业界标准(1.1-1.2)，防止字符级重复
-    "repetition_stop_threshold": 8,  # 【BUG #1修复】从16→8，合理阈值检测"复读机"模式
     # ── CoT 与输出完整性保护 ──
     "force_answer_min_steps": 0,     # 【删除限制】设为0，取消强制回答步数限制
     

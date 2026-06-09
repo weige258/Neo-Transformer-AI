@@ -464,7 +464,6 @@ class LightweightPPO:
         gamma: float = 0.99,                   # 保持标准折扣因子
         ppo_epochs: int = 2,                   # 【新增】PPO epoch数（基于研究推荐）
         mini_batch_num: int = 4,               # 【新增】mini-batch数量（基于研究推荐）
-        external_optimizer=None,               # 【修复】外部共享优化器，避免双优化器动量冲突
     ):
         self.model = model
         self.reward_model = reward_model
@@ -484,17 +483,14 @@ class LightweightPPO:
         self.total_training_steps = total_training_steps
         self.ppo_training_steps = 0  # PPO训练步数计数器
         
-        # 【修复】统一优化器：使用外部共享优化器避免动量冲突
-        if external_optimizer is not None:
-            self.optimizer = external_optimizer
-            self.using_shared_optimizer = True
-        else:
-            self.optimizer = torch.optim.AdamW(
-                model.parameters(),
-                lr=learning_rate,
-                foreach=torch.cuda.is_available(),
-            )
-            self.using_shared_optimizer = False
+        # 【修复】PPO使用独立优化器，避免与SFT共享导致梯度污染
+        # 原实现共享优化器会导致：动量状态污染、学习率调度冲突、梯度方向混乱
+        self.optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate,
+            foreach=torch.cuda.is_available(),
+        )
+        self.using_shared_optimizer = False
         
         self.episode_data = {
             'log_probs': [],

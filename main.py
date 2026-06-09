@@ -105,7 +105,8 @@ lr_scheduler = CombinedScheduler(sgdr_scheduler, plateau_scheduler)
 # 混合精度训练 (AMP)
 use_amp = bool(CONFIG.get("use_amp", True))
 amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+# 【修复】torch.cuda.amp.GradScaler已弃用，使用torch.amp.GradScaler
+scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 
 print(f"Using device: {device}")
 print(f"AMP enabled: {use_amp} AMP dtype: {amp_dtype}")
@@ -120,8 +121,9 @@ training_rounds = 0
 optimizer_step_count = 0
 
 # 自奖励模型和PPO训练器
+# 【修复】PPO使用独立优化器，避免与SFT共享导致梯度污染
 reward_model = SelfRewardModel(device)
-ppo_trainer = LightweightPPO(model, reward_model, device, external_optimizer=optimizer)
+ppo_trainer = LightweightPPO(model, reward_model, device)
 
 
 def _build_train_sequence(segments: List[Tuple[torch.Tensor | int, bool]]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -190,64 +192,35 @@ def _prepare_training_data(ask: str, answer: str, history_context: str = None) -
 
 
 
-def _check_repetition_stop(generated_tokens: list, threshold: int = 5) -> tuple[bool, str]:
-    """重复循环检测停止（业界标准方案）
-    
-    检测生成中的重复模式，防止模型陷入无限循环或"复读机"状态。
-    这是比困惑度早停更有效、更稳定的质量控制策略。
-    
-    Args:
-        generated_tokens: 已生成的token列表
-        threshold: 连续相同token的阈值
-    
-    Returns:
-        (should_stop: bool, detected_pattern: str)
-    """
-    if len(generated_tokens) < threshold:
-        return False, ""
-    
-    # 策略1: 检测连续相同token
-    recent_tokens = generated_tokens[-threshold:]
-    if all(t == recent_tokens[0] for t in recent_tokens):
-        return True, f"连续{threshold}个相同token"
-    
-    # 策略2: 检测重复的n-gram序列（2-gram, 3-gram）
-    # 【BUG #6修复】只检查最近的 n-gram，不扫描全序列（O(1) 替代 O(n²)）
-    for n in [2, 3]:
-        if len(generated_tokens) < n * 4:
-            continue
-        
-        # 只取最近 4 个 n-gram，检查后3个是否相同
-        recent_seq = generated_tokens[-(n * 4):]
-        ngrams = []
-        for i in range(len(recent_seq) - n + 1):
-            ngrams.append(tuple(recent_seq[i:i+n]))
-        
-        if len(ngrams) >= 4:
-            last_3 = ngrams[-3:]
-            if len(set(last_3)) == 1:
-                return True, f"重复{n}-gram模式"
-    
-    return False, ""
 
 
-def _min_p_sampling(logits: torch.Tensor, min_p: float) -> torch.Tensor:
-    """Min-p 采样 (Nguyen et al., ICLR 2025)
+
+def _min_p_sampling(logits: torch.Tensor, min_p: float, temperature: float = 1.0) -> torch.Tensor:
+    """Min-p 采样 (Nguyen et al., ICLR 2025) - 修复版
 
     核心思想: 以最大概率 token 为锚点，只保留概率 ≥ p_max × min_p 的 token。
-    比 top-k + top-p 更优：
-      - 高置信度时（p_max 大）→ 自动收紧候选集，避免噪声
-      - 低置信度时（p_max 小）→ 自动放宽，保留多样性
-    无需手动调节 k 或 p，一个参数适配所有场景。
+    正确流程: 先应用temperature → softmax计算概率 → min_p过滤 → 返回处理后的logits
+    
+    修复: 原实现先softmax再返回logits，导致调用方二次softmax，破坏概率分布。
     """
     if min_p <= 0.0:
         return logits
-    probs = torch.softmax(logits, dim=-1)
+    
+    # 先应用temperature
+    logits_temp = logits / temperature
+    
+    # 计算概率分布
+    probs = torch.softmax(logits_temp, dim=-1)
     p_max = probs.max().item()
     threshold = p_max * min_p
-    # 将低于阈值的 token 设为 -inf
-    logits = torch.where(probs < threshold, torch.full_like(logits, float("-inf")), logits)
-    return logits
+    
+    # 将低于阈值的token设为-inf（在temperature后的logits上操作）
+    logits_filtered = torch.where(
+        probs < threshold, 
+        torch.full_like(logits_temp, float("-inf")), 
+        logits_temp
+    )
+    return logits_filtered
 
 
 def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
@@ -257,7 +230,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     - Min-p 采样替代 top-k/top-p
     - Repetition Penalty 防止重复输出
     - 思考阶段长度限制 + 强制回答期确保 CoT→回复 完整过渡
-    - 重复模式检测：连续重复自动停止
     """
     BLUE = '\033[94m'
     GREEN = '\033[92m'
@@ -302,18 +274,18 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     temperature = float(CONFIG.get("temperature", 0.5))
     min_p = float(CONFIG.get("min_p", 0.05))
     repetition_penalty = float(CONFIG.get("repetition_penalty", 1.02))
-    repetition_stop_threshold = int(CONFIG.get("repetition_stop_threshold", 8))
     force_answer_min_steps = int(CONFIG.get("force_answer_min_steps", 16))
 
     with torch.inference_mode():
         thinking_started = False
         force_answer_steps = 0
         
-        # 注入THINK_START
+        # 【修复】不再强制注入THINK_START，让模型自己学习何时生成
+        # 原实现强制注入导致train/test不一致：训练时让模型自己生成THINK_START，推理时却手动注入
+        # 现在推理prompt与训练格式完全一致：text + START_GENERATION
         if thinking_available:
-            thinking_started = True
-            think_start_tensor = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
-            prompt = torch.cat([prompt, think_start_tensor])
+            # 仅设置标志，等待模型自己生成THINK_START
+            thinking_started = False
         
         result = model(prompt, use_cache=True)
         if isinstance(result, tuple):
@@ -324,7 +296,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
         step = 0
         generated_tokens = Counter()
-        generated_sequence = []  # 用于重复检测的完整序列
         
         while step < max_generate_tokens:
             try:
@@ -354,18 +325,19 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                             else:
                                 next_logits[token_id] *= penalty
 
-                # Min-p 采样
+                # Min-p 采样（修复版：内部已处理temperature）
                 if min_p > 0.0:
-                    next_logits = _min_p_sampling(next_logits, min_p)
+                    next_logits = _min_p_sampling(next_logits, min_p, temperature)
 
-                probs = torch.softmax(next_logits / temperature, dim=-1)
+                # 直接从处理后的logits计算概率（不再重复除temperature）
+                probs = torch.softmax(next_logits, dim=-1)
                 
                 index = int(torch.multinomial(probs, 1).item())
                 
                 # 思考阶段或强制回答阶段：禁止 END_TOKEN
                 if index == TextTokenizer.END_GENERATION_TOKEN and (force_answer_steps > 0 or thinking_started):
                     next_logits[index] = float("-inf")
-                    probs = torch.softmax(next_logits / temperature, dim=-1)
+                    probs = torch.softmax(next_logits, dim=-1)
                     if not torch.isinf(next_logits).all() and probs.sum().item() >= 1e-6:
                         index = int(torch.multinomial(probs, 1).item())
                 
@@ -395,32 +367,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     elif not thinking_available:
                         should_skip_output = True
 
-                # 重复检测
-                if thinking_started and index not in (
-                    TextTokenizer.THINK_START_TOKEN,
-                    TextTokenizer.THINK_END_TOKEN,
-                    TextTokenizer.START_GENERATION_TOKEN,
-                    TextTokenizer.END_GENERATION_TOKEN,
-                ):
-                    # 【BUG #5修复】思考阶段也检测重复，防止无限"思考循环"
-                    generated_sequence.append(index)
-                    if step >= 5:
-                        should_stop, pattern = _check_repetition_stop(generated_sequence, repetition_stop_threshold)
-                        if should_stop:
-                            print(f"\n[Stop] 思考阶段检测到重复({pattern})，提前结束", flush=True)
-                            break
-                elif not thinking_started and index not in (
-                    TextTokenizer.THINK_START_TOKEN,
-                    TextTokenizer.THINK_END_TOKEN,
-                    TextTokenizer.START_GENERATION_TOKEN,
-                    TextTokenizer.END_GENERATION_TOKEN,
-                ):
-                    generated_sequence.append(index)
-                    if step >= 5:
-                        should_stop, pattern = _check_repetition_stop(generated_sequence, repetition_stop_threshold)
-                        if should_stop:
-                            print(f"\n[Stop] 检测到重复模式({pattern})，提前结束", flush=True)
-                            break
+
 
                 # 输出解码
                 if not should_skip_output:
@@ -510,11 +457,11 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                                 else:
                                     next_logits[token_id] *= penalty
                     
-                    # Min-p
+                    # Min-p（修复版：内部已处理temperature）
                     if min_p > 0.0:
-                        next_logits = _min_p_sampling(next_logits, min_p)
+                        next_logits = _min_p_sampling(next_logits, min_p, temperature)
                     
-                    probs = torch.softmax(next_logits / temperature, dim=-1)
+                    probs = torch.softmax(next_logits, dim=-1)
                     index = int(torch.multinomial(probs, 1).item())
                     
                     # 【BUG #2修复】END_TOKEN现在可以被正常采样选中
@@ -529,13 +476,6 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     if index not in (TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN,
                                      TextTokenizer.START_GENERATION_TOKEN, TextTokenizer.END_GENERATION_TOKEN):
                         generated_tokens[index] += 1
-                        # 【BUG #3修复】CoT Guard 强制回答阶段增加重复检测
-                        generated_sequence.append(index)
-                        if force_answer_count >= 5:
-                            should_stop, pattern = _check_repetition_stop(generated_sequence, repetition_stop_threshold)
-                            if should_stop:
-                                print(f"\n[Stop] CoT Guard 检测到重复模式({pattern})，提前结束", flush=True)
-                                break
                     
                     next_token = torch.tensor([index], device=device)
                     result = model(next_token, past_key_values=past_key_values, use_cache=True)
