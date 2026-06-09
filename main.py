@@ -280,11 +280,11 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         thinking_started = False
         force_answer_steps = 0
         
-        # 【修复】不再强制注入THINK_START，让模型自己学习何时生成
-        # 原实现强制注入导致train/test不一致：训练时让模型自己生成THINK_START，推理时却手动注入
-        # 现在推理prompt与训练格式完全一致：text + START_GENERATION
+        # 【修复】推理prompt与训练格式一致
+        # 训练格式: ask + START_GENERATION + THINK_START + think + THINK_END + answer + END
+        # 推理格式: ask + START_GENERATION（然后模型自己生成后续内容）
         if thinking_available:
-            # 仅设置标志，等待模型自己生成THINK_START
+            # 给模型机会自己生成THINK_START
             thinking_started = False
         
         result = model(prompt, use_cache=True)
@@ -297,6 +297,27 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         step = 0
         generated_tokens = Counter()
         
+        # 【修复】如果启用了思维链且模型没有自己生成THINK_START，强制注入
+        if thinking_available and not thinking_started:
+            # 检查模型是否生成了THINK_START_TOKEN
+            if logits.dim() == 3:
+                first_logits = logits[0, -1]
+            else:
+                first_logits = logits[-1]
+            
+            # 如果THINK_START_TOKEN不是最高概率，强制注入
+            if torch.argmax(first_logits).item() != TextTokenizer.THINK_START_TOKEN:
+                # 强制注入THINK_START_TOKEN
+                think_start_token = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
+                result = model(think_start_token, past_key_values=past_key_values, use_cache=True)
+                if isinstance(result, tuple):
+                    logits, past_key_values = result
+                else:
+                    logits = result
+                    past_key_values = None
+                thinking_started = True
+                print(f"{BLUE}", end="", flush=True)
+        
         while step < max_generate_tokens:
             try:
                 # 获取最后一个token的logits
@@ -305,11 +326,13 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 else:
                     next_logits = logits[-1].clone()
 
-                # 强制回答阶段：禁止特殊token
+                # 强制回答阶段：禁止特殊token（但允许THINK_START如果还没开始思考）
                 if force_answer_steps > 0:
                     next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.UNKNOWN_TOKEN] = float("-inf")
-                    next_logits[TextTokenizer.THINK_START_TOKEN] = float("-inf")
+                    # 【修复】如果还没开始思考，允许生成THINK_START
+                    if thinking_started:
+                        next_logits[TextTokenizer.THINK_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.THINK_END_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
