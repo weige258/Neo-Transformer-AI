@@ -135,9 +135,15 @@ class MLALatentMemory(nn.Module):
             delta_M = torch.matmul(k_lat.transpose(-2, -1), v_lat)
 
         # 使用指数移动平均更新，更稳定
+        # 【修复】z 之前用 sum()，随序列长度单调增长，导致 denom→∞，v_lat→0，MLA 路径失效
+        # 改用 mean() 保持稳定量级。同时将 M/z 一起按相同指数平滑，避免 M/z 比例漂移
         alpha = 0.9  # 历史权重
-        new_M = alpha * mem_M + (1 - alpha) * delta_M.mean(dim=0, keepdim=True)
-        new_z = alpha * mem_z + (1 - alpha) * k_lat.sum(dim=-2).mean(dim=0, keepdim=True)
+        seq_len_k = max(1, k_lat.size(-2))
+        delta_M_mean = delta_M.mean(dim=0, keepdim=True) / seq_len_k
+        k_lat_mean = k_lat.mean(dim=-2).mean(dim=0, keepdim=True)
+
+        new_M = alpha * mem_M + (1 - alpha) * delta_M_mean
+        new_z = alpha * mem_z + (1 - alpha) * k_lat_mean
         return new_M, new_z
 
 
@@ -256,20 +262,8 @@ def apply_rope(
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
-def attention_mix_prior(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    """HyperAttention先验：CSA + SlidingWindow + MLA"""
-    mix = CONFIG.get("attention_mix", {})
-    weights = torch.tensor(
-        [
-            float(mix.get("csa", 1.0)),        # CSA压缩稀疏注意力
-            float(mix.get("sliding_window", 1.5)),  # SlidingWindow精确注意力
-            float(mix.get("mla", 1.0)),        # MLA低秩压缩
-        ],
-        device=device,
-        dtype=dtype,
-    )
-    weights = torch.clamp(weights, min=1e-6)
-    return torch.log(weights / weights.sum())
+# 注意：HyperAttention 的先验权重现在直接在 forward 中从 CONFIG 读取，
+# 与长度自适应偏置(logit 空间)结合。旧的 attention_mix_prior 已被替换。
 
 
 class HyperAttention(nn.Module):
@@ -479,13 +473,10 @@ class HyperAttention(nn.Module):
         q_start_pos: int,
         k_start_pos: int,
     ) -> torch.Tensor:
-        """局部滑动窗口注意力（显存优化版）
+        """局部滑动窗口注意力
 
-        使用 F.scaled_dot_product_attention 替代手动 index_select + matmul，
-        利用 PyTorch 内置的 FlashAttention / Memory-Efficient Attention 后端，
-        大幅降低显存占用。
-
-        对超过窗口范围的 key 使用 causal mask 屏蔽。
+        对超长序列分 chunk 计算，每个 query 只关注窗口范围内的 key。
+        对于窗口内的序列直接使用 F.scaled_dot_product_attention 加速。
         """
         batch, heads, q_len, dim = q.shape
         k_len = k.size(-2)
@@ -494,37 +485,45 @@ class HyperAttention(nn.Module):
         if k_len == 0:
             return torch.zeros(batch, heads, q_len, dim, device=q.device, dtype=q.dtype)
 
-        outputs = []
+        # 【快速路径】整个序列都在窗口内（最常见的训练情况）
+        # 条件：q_len <= ws 且 k_len <= ws 且 q_start_pos == k_start_pos
+        if q_len <= ws and k_len <= ws and q_start_pos == k_start_pos:
+            try:
+                return F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=None,
+                    dropout_p=self.dropout if self.training else 0.0,
+                    is_causal=True,  # 直接使用原生 causal mask，速度最快
+                )
+            except RuntimeError:
+                pass
 
+        # 【慢速路径】分 chunk 处理长序列
+        outputs = []
         for start in range(0, q_len, self.chunk_size):
             end = min(start + self.chunk_size, q_len)
-            q_chunk = q[:, :, start:end, :]  # (batch, heads, chunk_len, dim)
+            q_chunk = q[:, :, start:end, :]
             chunk_len = end - start
 
-            # 确定此 chunk 需要关注的最小/最大 key 位置
             q_abs_min = q_start_pos + start
             q_abs_max = q_start_pos + end - 1
 
-            # 局部窗口范围：[q_pos - ws + 1, q_pos]（因果）
             k_abs_min = max(0, q_abs_min - ws + 1)
             k_abs_max = q_abs_max
 
-            # 转换为相对于 raw_k 的索引
             k_rel_min = max(0, k_abs_min - k_start_pos)
             k_rel_max = min(k_len - 1, k_abs_max - k_start_pos)
 
             if k_rel_min > k_rel_max:
-                # 此 chunk 没有可关注的 key
                 outputs.append(torch.zeros(batch, heads, chunk_len, dim, device=q.device, dtype=q.dtype))
                 continue
 
-            # 提取局部窗口的 k, v
-            k_local = k[:, :, k_rel_min:k_rel_max + 1, :]  # (batch, heads, local_k_len, dim)
+            k_local = k[:, :, k_rel_min:k_rel_max + 1, :]
             v_local = v[:, :, k_rel_min:k_rel_max + 1, :]
             local_k_len = k_local.size(-2)
 
-            # 构建 causal mask：(chunk_len, local_k_len)
-            # 每个 query 只能看到 key_pos <= query_pos 的 key
+            # 【优化】如果此 chunk 内全部 key 都在窗口范围内且位置连续，
+            # 直接使用 is_causal=True 代替自定义 bool mask（更快、显存更低）
             q_abs = torch.arange(q_abs_min, q_abs_max + 1, device=q.device, dtype=torch.float32)
             k_abs_local = torch.arange(
                 k_start_pos + k_rel_min,
@@ -532,35 +531,23 @@ class HyperAttention(nn.Module):
                 device=q.device,
                 dtype=torch.float32,
             )
-            # causal: (chunk_len, local_k_len), True = 允许关注
-            causal_mask = k_abs_local[None, :] <= q_abs[:, None]
+            causal_mask = (k_abs_local[None, :] <= q_abs[:, None]) & \
+                         (k_abs_local[None, :] >= (q_abs[:, None] - ws + 1))
 
-            # 同时也需要窗口掩码：key 必须在 [q_pos - ws + 1, q_pos] 范围内
-            window_mask = k_abs_local[None, :] >= (q_abs[:, None] - ws + 1)
-            attn_mask = causal_mask & window_mask  # (chunk_len, local_k_len), True=保留
-
-            # 使用 F.scaled_dot_product_attention（自动选择最优后端）
-            # 需要 [batch, heads, chunk_len, dim] x [batch, heads, local_k_len, dim]
-            # attn_mask 形状: (chunk_len, local_k_len) → 广播到 (batch, heads, chunk_len, local_k_len)
-            # 【修复】PyTorch SDPA bool mask: True=保留，False=屏蔽（与官方文档相反！）
             try:
                 attn_out = F.scaled_dot_product_attention(
-                    q_chunk,
-                    k_local,
-                    v_local,
-                    attn_mask=attn_mask,  # PyTorch SDPA bool mask: True=保留，False=屏蔽
+                    q_chunk, k_local, v_local,
+                    attn_mask=causal_mask,
                     dropout_p=self.dropout if self.training else 0.0,
                     is_causal=False,
                 )
-                outputs.append(attn_out)
             except RuntimeError:
-                # 回退：如果 sdpa 不支持（极少数情况），使用手动计算
                 scores = torch.matmul(q_chunk, k_local.transpose(-2, -1)) / math.sqrt(dim)
-                # attn_mask: True=保留, ~attn_mask=True=屏蔽
-                scores = scores.masked_fill(~attn_mask.view(1, 1, chunk_len, local_k_len), float("-inf"))
+                scores = scores.masked_fill(~causal_mask.view(1, 1, chunk_len, local_k_len), float("-inf"))
                 weights = torch.softmax(scores.float(), dim=-1).to(q.dtype)
                 weights = torch.nan_to_num(weights, nan=0.0)
-                outputs.append(torch.matmul(weights, v_local))
+                attn_out = torch.matmul(weights, v_local)
+            outputs.append(attn_out)
 
         return torch.cat(outputs, dim=-2)
 
@@ -734,8 +721,10 @@ class HyperAttention(nn.Module):
                 1, self.num_heads, self.head_dim, x.device, x.dtype)
 
         # 在 RoPE 之前保留一份 q/k 用于 MLA latent memory（无位置编码）
-        q_for_memory = q.detach().clone()
-        k_for_memory = k_new.detach().clone()
+        # 【修复】不 detach，让 MLA 的投影层(kv_proj, v_proj, q_proj)能接收梯度
+        # 之前的 detach() 导致 MLA 所有参数永远不被训练，三路混合只剩两路有效
+        q_for_memory = q
+        k_for_memory = k_new
 
         q, k_new = apply_rope(q, k_new, self.rope, q_start_pos)
 
@@ -758,30 +747,27 @@ class HyperAttention(nn.Module):
         # 1. CSA (Compressed Sparse Attention): 每4个token压缩成1个entry + 稀疏注意力
         # 2. SlidingWindow: 最近128个token的精确注意力（补偿近距离依赖）
         # 3. MLA: 低秩latent压缩，处理长距离上下文
-        prior = attention_mix_prior(x.device, torch.float32)
-        mix = torch.softmax(self.router(x).float() + prior, dim=-1).to(x.dtype)
-        # mix: (batch, seq_len, 3), 对应 csa(0)/sliding_window(1)/mla(2)
+        # 【统一先验】config 权重 + 长度自适应偏置，在 logit 空间相加
+        # 数学上等价于 softmax(router + log(config_weights) + log(length_bias))
+        # 避免了之前先 softmax 再乘系数导致的梯度消失/爆炸
+        cfg_mix = CONFIG.get("attention_mix", {"csa": 1.0, "sliding_window": 1.0, "mla": 1.0})
+        cfg_prior = torch.tensor(
+            [cfg_mix.get("csa", 1.0), cfg_mix.get("sliding_window", 1.0), cfg_mix.get("mla", 1.0)],
+            device=x.device, dtype=torch.float32
+        )
+        cfg_logits = torch.log(cfg_prior.clamp_min(1e-6))
 
-        # 【动态权重调整】根据序列长度自动调整注意力策略
-        # 【修复】使用非原地乘法，避免 gradient checkpointing 时的 inplace operation 错误
-        # 原代码 mix[..., i] = mix[..., i] * scale 是原地操作，在 checkpoint 重计算时
-        # SoftmaxBackward0 的输出版本号被修改，导致梯度计算失败
-        adjust = torch.ones_like(mix)
-        if seq_len <= 128:
-            adjust[..., 0] = 0.1   # 禁用CSA
-            adjust[..., 1] = 2.0   # SlidingWindow主导
-            adjust[..., 2] = 0.1   # 禁用MLA
-        elif seq_len <= 1024:
-            adjust[..., 0] = 0.5   # CSA辅助
-            adjust[..., 1] = 1.5   # SlidingWindow主导
-            adjust[..., 2] = 1.0   # MLA正常
+        # 长度自适应偏置：温和地引导，±30%范围，不强行禁用任何路径
+        if seq_len <= self.window_size:
+            length_bias = torch.tensor([0.8, 1.3, 0.9], device=x.device, dtype=torch.float32)
+        elif seq_len <= self.window_size * 4:
+            length_bias = torch.tensor([1.0, 1.1, 1.0], device=x.device, dtype=torch.float32)
         else:
-            adjust[..., 0] = 1.5   # CSA主导
-            adjust[..., 1] = 0.8   # SlidingWindow辅助
-            adjust[..., 2] = 1.2   # MLA增强
+            length_bias = torch.tensor([1.3, 0.9, 1.2], device=x.device, dtype=torch.float32)
+        length_logits = torch.log(length_bias)
 
-        mix = mix * adjust  # 非原地乘法，创建新张量，不破坏 softmax 计算图
-        mix = mix / mix.sum(dim=-1, keepdim=True)
+        combined_prior = (cfg_logits + length_logits).unsqueeze(0).unsqueeze(0)  # [1,1,3]
+        mix = torch.softmax(self.router(x).float() + combined_prior, dim=-1).to(x.dtype)
 
         # 初始化累积输出为零
         out_accum = None  # (batch, seq_len, emb_size)
@@ -795,11 +781,11 @@ class HyperAttention(nn.Module):
             out_accum = csa_out * mix[..., 0:1]
             del csa_out
 
-        # ── 路径1: SlidingWindow (最近128个token精确注意力) ──
-        # DeepSeek-V4: 补偿近距离依赖，每个query看最近128个token
+        # ── 路径1: SlidingWindow (精确注意力) ──
+        # 【修复】之前硬编码window_size=128，导致sliding_window配置被完全忽略。
+        # 现在使用self.window_size（来自配置）。对于短序列，这等效于full attention。
         if mix[..., 1:2].max().item() > 0.01:
-            # 只取最近128个token进行精确注意力
-            window_size = min(128, raw_k.size(-2))
+            window_size = min(self.window_size, raw_k.size(-2))
             if window_size > 0:
                 window_k = raw_k[..., -window_size:, :]
                 window_v = raw_v[..., -window_size:, :]

@@ -9,20 +9,20 @@ CONFIG: Dict[str, Any] = {
     "num_heads": 8,                  # 注意力头数
     "num_transformer_blocks": 8,     # Transformer层数
     "tie_token_embeddings": True,    # 绑定输入输出嵌入权重
-    "dropout": 0.05,                # 【修复】小模型 0.2 会欠拟合，降至 0.05
+    "dropout": 0.1,                 # 【修复】从0.05→0.1。小模型过拟合风险较低，但适度正则化可防止记住噪声。字符级tokenizer词表稀疏，需要更强正则化
     
     # ═══════════════════════════════════════════════════════
     # 2️⃣ 注意力机制配置
     # ═══════════════════════════════════════════════════════
-    "attention_mix": {               # 注意力混合权重
-        "csa": 2,                    # CSA压缩稀疏注意力权重
-        "sliding_window": 1.3,       # SlidingWindow精确注意力权重
-        "mla": 1,                    # MLA低秩压缩注意力权重
+    "attention_mix": {               # 注意力混合先验权重(作为 logit 偏置加到路由网络)
+        "csa": 1.0,                  # CSA压缩稀疏注意力（长序列摘要）
+        "sliding_window": 1.0,       # SlidingWindow精确注意力（短程依赖建模，短序列=full attention）
+        "mla": 1.0,                  # MLA低秩压缩注意力（长程上下文压缩）
     },
-    "sliding_window": 128,           # 【修复】从64→128，增大滑动窗口使生成长文本时能关注更多上下文
+    "sliding_window": 512,           # 【修复】从128→512。字符级token序列需要更大上下文窗口（一句话30-60字×5-10句=300+token）。<=512时SlidingWindow等效full attention
     "attention_chunk_size": 64,      # 【修复】从32→64，增大注意力块减少分块次数提升长序列质量
     "dynamic_attention_topk": 8,     # 动态注意力Top-K数量（6GB显存推荐8）
-    "rope_base": 1000000,            # 【修复】YaRN风格NT-aware扩展，与Llama 3.1一致
+    "rope_base": 10000,              # 【修复】恢复标准RoPE base值(LLaMA/GPT-NeoX标准)。1e6会导致短序列位置编码失效（pos=1000时旋转角≈0），短序列语言建模必须用10000
     "rope_factor": 1.0,              # NTK频率缩放因子（1.0=不缩放）
     "rope_max_seq_len": 4096,        # RoPE最大训练序列长度
     
@@ -90,7 +90,7 @@ CONFIG: Dict[str, Any] = {
     #    业界采用: PyTorch 原生调度器，被广泛用于在线/持续学习
     #
     # ── 基础参数 ──
-    "gradient_accumulation_steps": 1,            # 梯度累积步数，1=每样本更新
+    "gradient_accumulation_steps": 8,            # 【修复】从1→8。batch=1单样本训练梯度方差极大，累积8步后有效batch=8，显著降低震荡并提高收敛速度。业界标准：小模型4-16步
     "base_learning_rate": 3e-4,                  # 初始基准学习率（SGDR 周期峰值）
     "warmup_steps": 300,                         # 预热步数（线性从 init → base_lr）
     "warmup_init_lr": 1e-6,                      # 预热初始学习率

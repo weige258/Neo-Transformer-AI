@@ -760,8 +760,11 @@ def _chunked_forward_backward(
                 else:
                     loss_chunk = torch.tensor(0.0, device=device)
 
-                num_chunks = max(1, (seq_len + step - 1) // step)
-                loss_scaled = loss_chunk / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
+                # 【修复】简化梯度缩放：只除以 GRADIENT_ACCUMULATION_STEPS
+                # 之前除以 num_chunks 导致长序列样本梯度被额外稀释，
+                # 长序列本应提供更多训练信号。chunk 数由显存限制决定，
+                # 不应影响有效学习率。
+                loss_scaled = loss_chunk / GRADIENT_ACCUMULATION_STEPS
 
             # 【修复】零 loss（无 grad_fn）时跳过 backward，避免崩溃
             if loss_scaled.requires_grad:
@@ -788,7 +791,7 @@ def _chunked_forward_backward(
                     torch.cuda.synchronize()
                     # detach past_kv 后再传入，防止计算图冲突
                     safe_past = _detach_kv_cache(past_kv) if past_kv is not None else None
-                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller, num_chunks)
+                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller)
                     if sub is not None:
                         sub_loss, past_kv = sub
                         chunk_losses.append(sub_loss.detach())
@@ -809,13 +812,13 @@ def _chunked_forward_backward(
 
 def _chunk_one_segment(
     seg: torch.Tensor, seg_mask: torch.Tensor, past_kv, chunk_size: int,
-    num_chunks: int = 1,
-):
-    """递归重试单个段，返回 (avg_loss, past_kv) 或 None。
-    
-    【修复】num_chunks 用于正确缩放梯度：
-    loss_scaled = loss_sub / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
-    确保递归细分后的梯度贡献与正常 chunk 一致，避免梯度被放大 num_chunks 倍。
+) -> tuple[torch.Tensor, any] | None:
+    """OOM 回退：将单个 segment 进一步细分后训练，返回 (avg_loss, past_kv) 或 None。
+
+    【修复】之前除以 num_chunks 导致梯度缩放不一致。
+    新逻辑：每个子 chunk 的 loss 仅除以 GRADIENT_ACCUMULATION_STEPS，
+    与主循环的缩放一致。细分后的多个子 chunk 会自然累加它们的梯度，
+    这与长序列提供更多训练信号的直觉相符。
     """
     seg_len = seg.numel()
     step = max(1, chunk_size // 2)
@@ -850,8 +853,7 @@ def _chunk_one_segment(
                         loss_sub = torch.tensor(0.0, device=device)
                 else:
                     loss_sub = torch.tensor(0.0, device=device)
-                # 【修复】除以 num_chunks，与正常 chunk 梯度缩放一致
-                loss_scaled = loss_sub / (num_chunks * GRADIENT_ACCUMULATION_STEPS)
+                loss_scaled = loss_sub / GRADIENT_ACCUMULATION_STEPS
 
             if loss_scaled.requires_grad:
                 if scaler.is_enabled():
@@ -861,7 +863,6 @@ def _chunk_one_segment(
             seg_losses.append(loss_sub.detach())
             del sub, logits, loss_sub, loss_scaled
 
-            # detach local_past，切断计算图（与主函数一致）
             if local_past is not None:
                 local_past = _detach_kv_cache(local_past)
 
