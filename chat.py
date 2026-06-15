@@ -7,7 +7,7 @@ while True:
         user_input = input("\n请输入: ")
         if not user_input or not user_input.strip():
             continue
-        generation(user_input)
+        generation(user_input)  # None表示无限制，由模型通过END_TOKEN决定何时停止
     except KeyboardInterrupt:
         # 允许KeyboardInterrupt传播，让用户可以Ctrl+C退出
         print("\n\n程序已退出。", flush=True)

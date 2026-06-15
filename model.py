@@ -8,6 +8,10 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 from config import CONFIG
+
+# PyTorch 版本兼容性标记
+_TORCH_MAJOR, _TORCH_MINOR = map(int, torch.__version__.split(".")[:2])
+_CHECKPOINT_SUPPORTS_REENTRANT = (_TORCH_MAJOR, _TORCH_MINOR) >= (2, 0)
 from tokenizer import TextTokenizer
 
 
@@ -53,7 +57,6 @@ class MLALatentMemory(nn.Module):
         self.q_proj = nn.Linear(head_dim, self.latent_dim, bias=False)
         
         # 上投影：从latent_dim恢复到head_dim
-        self.k_up_proj = nn.Linear(self.latent_dim, head_dim, bias=False)
         self.v_up_proj = nn.Linear(self.latent_dim, head_dim, bias=False)
         
         # 输出投影
@@ -93,12 +96,10 @@ class MLALatentMemory(nn.Module):
         # 使用elu激活替代softmax，保留非负性同时不破坏幅度信息
         q_lat = F.elu(q_lat) + 1.0
         
-        # 从压缩记忆中检索
         numer = torch.matmul(q_lat, mem_M)
-        denom = torch.matmul(q_lat, mem_z.unsqueeze(-1)).clamp_min(1e-8)
+        denom = torch.matmul(q_lat, mem_z.unsqueeze(-1)).clamp_min(1e-4)
         v_lat = numer / denom
         
-        # 上投影恢复到head_dim
         v_full = self.v_up_proj(v_lat)
         return self.out_proj(v_full)
 
@@ -125,9 +126,8 @@ class MLALatentMemory(nn.Module):
         k_lat = F.elu(k_lat) + 1.0
         v_lat = F.elu(v_lat) + 1.0
         
-        if self.use_delta:
-            # 增量更新：只更新预测误差部分
-            k_z = torch.matmul(k_lat, mem_z.unsqueeze(-1)).clamp_min(1e-8)
+        if self.use_delta and mem_M.abs().max().item() > 1e-6:
+            k_z = torch.matmul(k_lat, mem_z.unsqueeze(-1)).clamp_min(1e-4)
             v_pred = torch.matmul(k_lat, mem_M) / k_z
             v_error = v_lat - v_pred
             delta_M = torch.matmul(k_lat.transpose(-2, -1), v_error)
@@ -138,9 +138,10 @@ class MLALatentMemory(nn.Module):
         # 【修复】z 之前用 sum()，随序列长度单调增长，导致 denom→∞，v_lat→0，MLA 路径失效
         # 改用 mean() 保持稳定量级。同时将 M/z 一起按相同指数平滑，避免 M/z 比例漂移
         alpha = 0.9  # 历史权重
+        # delta_M 来自 matmul(k_lat.T, v_error)，已在 seq_len 上聚合，故除以 seq_len 得到平均
         seq_len_k = max(1, k_lat.size(-2))
-        delta_M_mean = delta_M.mean(dim=0, keepdim=True) / seq_len_k
-        k_lat_mean = k_lat.mean(dim=-2).mean(dim=0, keepdim=True)
+        delta_M_mean = delta_M.mean(dim=0, keepdim=True) / seq_len_k  # (1, H, latent, latent)
+        k_lat_mean = k_lat.mean(dim=(0, -2), keepdim=True).squeeze(-2)  # (1, H, latent)
 
         new_M = alpha * mem_M + (1 - alpha) * delta_M_mean
         new_z = alpha * mem_z + (1 - alpha) * k_lat_mean
@@ -156,13 +157,16 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         output = x * norm * self.weight
+        # 检查 NaN/Inf，避免传播到后续层
         if torch.isnan(output).any() or torch.isinf(output).any():
             output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
-            print(
-                f"[Warning] RMSNorm detected NaN/Inf; clamped output to safe range. "
-                f"input_min={x.min().item():.3f}, input_max={x.max().item():.3f}",
-                flush=True,
-            )
+            # 仅在训练时打印警告，避免推理时输出干扰
+            if self.training:
+                print(
+                    f"[Warning] RMSNorm detected NaN/Inf; clamped output to safe range. "
+                    f"input_min={x.min().item():.3f}, input_max={x.max().item():.3f}",
+                    flush=True,
+                )
         return output
 
 
@@ -175,11 +179,9 @@ class RotaryPositionEmbedding(nn.Module):
     2. "Scaling Laws of RoPE-based Extrapolation" (Liu et al., ICLR 2024)
        核心：增大 base 值可显著扩展外推长度，仅需短微调
 
-    【修复说明】原 base=10000 限制了模型外推能力。
-    新方案：
-    - base 提高到 1000000（百万级），与 Llama 3.1 一致
-    - 支持 NTK-aware 频率缩放（factor > 1.0）
-    - 当 seq_len > max_seq_len 时自动启用插值
+    【说明】base 值从 CONFIG 读取，默认 10000（LLaMA/GPT-NeoX 标准）。
+    对于短序列语言建模，10000 是稳定的选择；如需长序列外推，可通过 CONFIG 增大 rope_base。
+    支持 NTK-aware 频率缩放（factor > 1.0）和超长序列位置插值。
     """
     def __init__(self, head_dim: int, base: int = 10000) -> None:
         super().__init__()
@@ -187,10 +189,8 @@ class RotaryPositionEmbedding(nn.Module):
             raise ValueError("head_dim must be even for rotary embedding.")
         self.head_dim = head_dim
         
-        # 从配置读取RoPE参数
-        # 【修复HIGH #6】使用CONFIG中的base值作为默认，而非函数签名参数
-        # 确保当CONFIG缺少rope_base键时使用配置值而非默认10000
-        rope_base = int(CONFIG.get("rope_base", 10000))
+        # 从配置读取RoPE参数，以函数参数为fallback
+        rope_base = int(CONFIG.get("rope_base", base))
         self.rope_factor = float(CONFIG.get("rope_factor", 1.0))
         self.max_seq_len = int(CONFIG.get("rope_max_seq_len", 4096))
         
@@ -627,7 +627,7 @@ class HyperAttention(nn.Module):
             with torch.no_grad():
                 importance = overflow_k.norm(dim=-1).mean(dim=(0, 1))  # (seq_len,)
             
-            h2_ratio = 0.3
+            h2_ratio = float(CONFIG.get("h2_ratio", 0.3))
             h2_count = max(4, int(compress_len * h2_ratio))
             _, h2_idx_raw = torch.topk(importance, k=min(h2_count, compress_len), sorted=False)
             
@@ -815,19 +815,15 @@ class HyperAttention(nn.Module):
         # 释放 q 引用
         del q
 
-        # 【启用】MLA latent memory更新
-        new_mla_M, new_mla_z = self.mla_memory.update(
-            k_for_memory, v_new, mla_M, mla_z)
+        # MLA latent memory更新：使用no_grad避免梯度回传到MLA投影层
+        # MLA memory是状态（类似KV cache），不应参与梯度计算
+        # MLA投影层参数通过retrieve路径的梯度来训练
+        with torch.no_grad():
+            new_mla_M, new_mla_z = self.mla_memory.update(
+                k_for_memory.detach(), v_new.detach(), mla_M, mla_z)
 
         out = self.out_proj(out_accum)
         del out_accum
-
-        # 【修复】对 MLA memory 进行 detach().clone()，防止梯度计算图被原地操作破坏
-        # 这是 PyTorch inplace operation error 的根本修复
-        if new_mla_M is not None:
-            new_mla_M = new_mla_M.detach().clone()
-        if new_mla_z is not None:
-            new_mla_z = new_mla_z.detach().clone()
 
         if use_cache:
             # 【修复】从token_ids参数生成special_mask保护特殊Token
@@ -837,7 +833,14 @@ class HyperAttention(nn.Module):
                 if token_ids.dim() == 1:
                     special_mask = token_ids < 10  # ID 0-9 为特殊Token
                 elif token_ids.dim() == 2:
-                    special_mask = token_ids[0] < 10  # batch=1时取第一个
+                    # 支持 batch > 1：取任意样本存在特殊token的位置作为并集保护
+                    if token_ids.size(0) == 1:
+                        special_mask = token_ids[0] < 10
+                    else:
+                        special_mask = (token_ids < 10).any(dim=0)
+                elif token_ids.dim() == 3:
+                    # (batch, seq_len, 1) 等变体
+                    special_mask = (token_ids < 10).any(dim=0).squeeze(-1)
             
             cache = self._build_cache(
                 raw_k,
@@ -966,6 +969,30 @@ class MainModel(nn.Module):
             if isinstance(module, nn.Linear) and module.weight is not self.output_linear.weight:
                 nn.init.xavier_uniform_(module.weight)
 
+    def _compress_embeddings(self, hist_emb: torch.Tensor, compress_num: int) -> torch.Tensor:
+        """对 embedding 序列进行基于重要性权重的压缩聚合。
+
+        Args:
+            hist_emb: (seq_len, emb_size) 的 embedding 序列
+            compress_num: 目标压缩后的段数
+        Returns:
+            (compress_num, emb_size) 的压缩后向量
+        """
+        seq_len = hist_emb.size(0)
+        if seq_len <= compress_num:
+            return self.final_norm(hist_emb)
+
+        scores = hist_emb.norm(dim=-1)
+        boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
+        pieces: list[torch.Tensor] = []
+        for idx in range(compress_num):
+            start = int(boundaries[idx].item())
+            end = max(start + 1, int(boundaries[idx + 1].item()))
+            segment = hist_emb[start:end]
+            weights = torch.softmax(scores[start:end].float(), dim=0).to(hist_emb.dtype)
+            pieces.append((segment * weights[:, None]).sum(dim=0))
+        return self.final_norm(torch.stack(pieces, dim=0))
+
     def compress_history_vectors(
         self,
         history_tokens: torch.Tensor,
@@ -977,9 +1004,7 @@ class MainModel(nn.Module):
             emb_weight = self.token_embedding.weight
             prefer_gpu = bool(CONFIG.get("prefer_gpu_compress", True))
 
-            # 如果 history_tokens 不在 embedding 权重同一设备上，但配置允许在 GPU 上分块压缩，
-            # 则采用分块流式编码：仅把小片段移动到 embedding 设备进行 embedding_lookup 和聚合，
-            # 最终在 embedding 设备上返回压缩向量，避免把压缩结果搬回 CPU。
+            # 如果 history_tokens 不在 embedding 权重同一设备上，但配置允许在 GPU 上分块压缩
             if history_tokens.device != emb_weight.device and prefer_gpu:
                 device = emb_weight.device
                 hist_idx = history_tokens.to(torch.long)
@@ -1001,26 +1026,13 @@ class MainModel(nn.Module):
                     emb_parts.append(emb_slice)
 
                 hist_emb = torch.cat(emb_parts, dim=0)
-                # 后续逻辑与原来在同设备时保持一致
                 if hist_emb.dim() == 3:
                     hist_emb = hist_emb.squeeze(0)
-                if seq_len <= max(16, compress_num):
-                    return self.final_norm(hist_emb)
-
-                scores = hist_emb.norm(dim=-1)
-                boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
-                pieces: list[torch.Tensor] = []
-                for idx in range(compress_num):
-                    start = int(boundaries[idx].item())
-                    end = max(start + 1, int(boundaries[idx + 1].item()))
-                    segment = hist_emb[start:end]
-                    weights = torch.softmax(scores[start:end].float(), dim=0).to(hist_emb.dtype)
-                    pieces.append((segment * weights[:, None]).sum(dim=0))
-                return self.final_norm(torch.stack(pieces, dim=0))
+                return self._compress_embeddings(hist_emb, compress_num)
 
             # 若 history_tokens 在同设备，或不启用 GPU 分块压缩，走原有路径
             if history_tokens.device != emb_weight.device:
-                # 在 CPU 上进行 embedding lookup 与压缩，避免把大张量搬到 GPU
+                # 在 CPU 上进行 embedding lookup 与压缩
                 hist_idx = history_tokens.to(torch.long).to("cpu")
                 weight_cpu = emb_weight.detach().to("cpu")
                 hist_emb = weight_cpu[hist_idx]
@@ -1029,47 +1041,19 @@ class MainModel(nn.Module):
                 seq_len = hist_emb.size(0)
                 compress_num = max(16, int(seq_len * compress_ratio))
                 if seq_len <= compress_num:
-                    # 手动应用 final_norm（在 CPU 上）以避免移动 module
                     w = self.final_norm.weight.detach().to("cpu")
                     eps = self.final_norm.eps
                     normed = hist_emb * torch.rsqrt(hist_emb.pow(2).mean(dim=-1, keepdim=True) + eps)
                     return normed * w
-
-                scores = hist_emb.norm(dim=-1)
-                boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
-                pieces: list[torch.Tensor] = []
-                for idx in range(compress_num):
-                    start = int(boundaries[idx].item())
-                    end = max(start + 1, int(boundaries[idx + 1].item()))
-                    segment = hist_emb[start:end]
-                    weights = torch.softmax(scores[start:end].float(), dim=0).to(hist_emb.dtype)
-                    pieces.append((segment * weights[:, None]).sum(dim=0))
-                pieces_stacked = torch.stack(pieces, dim=0)
-                # final_norm on CPU
-                w = self.final_norm.weight.detach().to("cpu")
-                eps = self.final_norm.eps
-                normed = pieces_stacked * torch.rsqrt(pieces_stacked.pow(2).mean(dim=-1, keepdim=True) + eps)
-                return normed * w
+                return self._compress_embeddings(hist_emb, compress_num)
             else:
-                # 常规路径：history_tokens 与 embedding 在同一设备，按原逻辑处理
+                # 常规路径：history_tokens 与 embedding 在同一设备
                 hist_emb = self.token_embedding(history_tokens)
                 if hist_emb.dim() == 3:
                     hist_emb = hist_emb.squeeze(0)
                 seq_len = hist_emb.size(0)
                 compress_num = max(16, int(seq_len * compress_ratio))
-                if seq_len <= compress_num:
-                    return self.final_norm(hist_emb)
-
-                scores = hist_emb.norm(dim=-1)
-                boundaries = torch.linspace(0, seq_len, compress_num + 1, device=hist_emb.device)
-                pieces: list[torch.Tensor] = []
-                for idx in range(compress_num):
-                    start = int(boundaries[idx].item())
-                    end = max(start + 1, int(boundaries[idx + 1].item()))
-                    segment = hist_emb[start:end]
-                    weights = torch.softmax(scores[start:end].float(), dim=0).to(hist_emb.dtype)
-                    pieces.append((segment * weights[:, None]).sum(dim=0))
-                return self.final_norm(torch.stack(pieces, dim=0))
+                return self._compress_embeddings(hist_emb, compress_num)
 
     def forward(
         self,
@@ -1101,15 +1085,25 @@ class MainModel(nn.Module):
             use_gc = bool(CONFIG.get("use_gradient_checkpointing", True))
             for block in self.transformers:
                 if self.training and use_gc:
-                    x = checkpoint(block, x, use_reentrant=False)
+                    # 【修复】传递token_ids用于特殊Token保护
+                    # checkpoint不支持kwargs，使用args传递
+                    ck_kwargs = {"use_reentrant": False} if _CHECKPOINT_SUPPORTS_REENTRANT else {}
+                    x = checkpoint(block, x, None, False, tokens, **ck_kwargs)
                 else:
-                    x = block(x)
+                    # 【修复】传递token_ids用于特殊Token保护
+                    x = block(x, None, False, tokens)
 
         logits = self.output_linear(self.final_norm(x))
         
-        # 【修复】统一返回3维logits [batch, seq_len, vocab]
         if logits.dim() == 2:
-            logits = logits.unsqueeze(0)  # [seq_len, vocab] -> [1, seq_len, vocab]
+            logits = logits.unsqueeze(0)
+        elif logits.dim() == 3:
+            pass
+        else:
+            raise ValueError(f"logits dimension {logits.dim()} not supported, expected 2 or 3")
+        
+        if squeeze_batch:
+            logits = logits.squeeze(0)
         
         if use_cache:
             return logits, next_key_values

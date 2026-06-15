@@ -9,7 +9,7 @@ CONFIG: Dict[str, Any] = {
     "num_heads": 8,                  # 注意力头数
     "num_transformer_blocks": 8,     # Transformer层数
     "tie_token_embeddings": True,    # 绑定输入输出嵌入权重
-    "dropout": 0.1,                 # 【修复】从0.05→0.1。小模型过拟合风险较低，但适度正则化可防止记住噪声。字符级tokenizer词表稀疏，需要更强正则化
+    "dropout": 0.05,                 # 【修复】改回0.05。小模型需要适度正则化，0.1过强导致收敛困难
     
     # ═══════════════════════════════════════════════════════
     # 2️⃣ 注意力机制配置
@@ -34,6 +34,9 @@ CONFIG: Dict[str, Any] = {
     "compress_stride": 16,           # 压缩步长
     "compress_ratio": 0.25,          # 压缩比例（6GB显存推荐0.25，更激进的压缩）
     "compress_on_memory_ratio": 0.80, # 当 GPU 显存占用超过该比例时触发压缩并卸载（0-1）
+    "prefer_gpu_compress": True,     # 是否在 GPU 上分块压缩历史向量（跨设备时）
+    "max_mem_kv_capacity": 256,      # 压缩记忆的最大容量，超限后固化到 MLA latent memory
+    "h2_ratio": 0.3,                 # H2O Heavy Hitter 筛选比例（保留溢出token的30%）
     # 运行时显存优化开关
     "use_amp": True,                          # 是否启用自动混合精度（AMP）
     "use_gradient_checkpointing": True,       # 是否在Transformer block上启用梯度检查点
@@ -90,7 +93,7 @@ CONFIG: Dict[str, Any] = {
     #    业界采用: PyTorch 原生调度器，被广泛用于在线/持续学习
     #
     # ── 基础参数 ──
-    "gradient_accumulation_steps": 8,            # 【修复】从1→8。batch=1单样本训练梯度方差极大，累积8步后有效batch=8，显著降低震荡并提高收敛速度。业界标准：小模型4-16步
+    "gradient_accumulation_steps": 1,            # 【修复】改回1。小模型50轮内需要足够更新次数才能收敛，累积8步会导致50轮仅更新6次，严重不足
     "base_learning_rate": 3e-4,                  # 初始基准学习率（SGDR 周期峰值）
     "warmup_steps": 300,                         # 预热步数（线性从 init → base_lr）
     "warmup_init_lr": 1e-6,                      # 预热初始学习率

@@ -105,8 +105,7 @@ lr_scheduler = CombinedScheduler(sgdr_scheduler, plateau_scheduler)
 # 混合精度训练 (AMP)
 use_amp = bool(CONFIG.get("use_amp", True))
 amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-# 【修复】torch.cuda.amp.GradScaler已弃用，使用torch.amp.GradScaler
-scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+scaler = torch.amp.GradScaler('cuda', enabled=use_amp and amp_dtype == torch.float16)
 
 print(f"Using device: {device}")
 print(f"AMP enabled: {use_amp} AMP dtype: {amp_dtype}")
@@ -170,14 +169,14 @@ def _prepare_training_data(ask: str, answer: str, history_context: str = None) -
             (TextTokenizer.END_GENERATION_TOKEN, False),
             (TextTokenizer.HISTORY_CONTEXT_START_TOKEN, False),
             (ask_tensor, False),
-            (TextTokenizer.START_GENERATION_TOKEN, False),
+            (TextTokenizer.START_GENERATION_TOKEN, True),  # 【修复】学习在ask后输出START
             (answer_tensor, True),
             (TextTokenizer.END_GENERATION_TOKEN, True),
         ])
     else:
         train_tensor, target_mask = _build_train_sequence([
             (ask_tensor, False),
-            (TextTokenizer.START_GENERATION_TOKEN, False),
+            (TextTokenizer.START_GENERATION_TOKEN, True),  # 【修复】学习在ask后输出START
             (answer_tensor, True),
             (TextTokenizer.END_GENERATION_TOKEN, True),
         ])
@@ -239,12 +238,12 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     if not text or not isinstance(text, str):
         return "无效输入"
     
-    # 【修复】None 表示无限制生成，由模型自己决定何时结束（通过 END_TOKEN）
+    # None 表示无限制生成，由模型自己决定何时结束（通过 END_TOKEN）
     # 设置一个绝对上限防止极端情况下的死循环（如模型始终不输出 END_TOKEN）
     absolute_max_tokens = 4096  # 绝对安全上限
     has_token_limit = max_generate_tokens is not None
     if max_generate_tokens is None:
-        max_generate_tokens = absolute_max_tokens
+        max_generate_tokens = absolute_max_tokens  # 无限制时使用绝对上限作为安全网
     
     model.eval()
     output_text = ""
@@ -330,6 +329,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 if force_answer_steps > 0:
                     next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.UNKNOWN_TOKEN] = float("-inf")
+                    next_logits[TextTokenizer.START_GENERATION_TOKEN] = float("-inf")
                     # 【修复】如果还没开始思考，允许生成THINK_START
                     if thinking_started:
                         next_logits[TextTokenizer.THINK_START_TOKEN] = float("-inf")
@@ -355,14 +355,24 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 # 直接从处理后的logits计算概率（不再重复除temperature）
                 probs = torch.softmax(next_logits, dim=-1)
                 
+                # 【修复】防止所有logits为-inf导致softmax产生nan
+                if torch.isnan(probs).any() or probs.sum().item() < 1e-6:
+                    print(f"\n[Warning] 概率分布异常，使用随机采样", flush=True)
+                    probs = torch.ones_like(probs) / probs.size(0)
+                
                 index = int(torch.multinomial(probs, 1).item())
                 
                 # 思考阶段或强制回答阶段：禁止 END_TOKEN
-                if index == TextTokenizer.END_GENERATION_TOKEN and (force_answer_steps > 0 or thinking_started):
+                # 【修复】循环重采样直到不是END_TOKEN，防止一次重采样仍得到END
+                max_resample = 10
+                resample_count = 0
+                while index == TextTokenizer.END_GENERATION_TOKEN and (force_answer_steps > 0 or thinking_started) and resample_count < max_resample:
                     next_logits[index] = float("-inf")
                     probs = torch.softmax(next_logits, dim=-1)
-                    if not torch.isinf(next_logits).all() and probs.sum().item() >= 1e-6:
-                        index = int(torch.multinomial(probs, 1).item())
+                    if torch.isinf(next_logits).all() or probs.sum().item() < 1e-6:
+                        break
+                    index = int(torch.multinomial(probs, 1).item())
+                    resample_count += 1
                 
                 # 处理特殊token
                 should_skip_output = False
@@ -390,7 +400,9 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     elif not thinking_available:
                         should_skip_output = True
 
-
+                elif index == TextTokenizer.START_GENERATION_TOKEN:
+                    # 【修复】防止模型重复输出START_GENERATION_TOKEN
+                    should_skip_output = True
 
                 # 输出解码
                 if not should_skip_output:
@@ -465,6 +477,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
                     
                     next_logits[TextTokenizer.UNKNOWN_TOKEN] = float("-inf")
+                    next_logits[TextTokenizer.START_GENERATION_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.THINK_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.THINK_END_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
@@ -485,6 +498,12 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         next_logits = _min_p_sampling(next_logits, min_p, temperature)
                     
                     probs = torch.softmax(next_logits, dim=-1)
+                    
+                    # 【修复】防止所有logits为-inf导致softmax产生nan
+                    if torch.isnan(probs).any() or probs.sum().item() < 1e-6:
+                        print(f"\n[Warning] 强制回答阶段概率分布异常，使用随机采样", flush=True)
+                        probs = torch.ones_like(probs) / probs.size(0)
+                    
                     index = int(torch.multinomial(probs, 1).item())
                     
                     # 【BUG #2修复】END_TOKEN现在可以被正常采样选中
@@ -599,8 +618,8 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                     (TextTokenizer.END_GENERATION_TOKEN, False),
                     (TextTokenizer.HISTORY_CONTEXT_START_TOKEN, False),
                     (ask_tensor, False),
-                    (TextTokenizer.START_GENERATION_TOKEN, False),
-                    (TextTokenizer.THINK_START_TOKEN, True),     # 【修复】学习在START后输出THINK_START
+                    (TextTokenizer.START_GENERATION_TOKEN, True), # 【修复】学习在ask后输出START
+                    (TextTokenizer.THINK_START_TOKEN, True),     # 学习在START后输出THINK_START
                     (think_tensor, True),                        # 学习生成思维链内容
                     (TextTokenizer.THINK_END_TOKEN, True),       # 学习在思考结束时输出THINK_END
                     (answer_tensor, True),                       # ★ 学习从THINK_END过渡到回答
@@ -614,8 +633,8 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                 # 同上：THINK_END→answer 的过渡是关键，两者 mask 皆为 True
                 train_tensor, target_mask = _build_train_sequence([
                     (ask_tensor, False),                         # 问题不参与loss
-                    (TextTokenizer.START_GENERATION_TOKEN, False), # 分隔符不参与loss
-                    (TextTokenizer.THINK_START_TOKEN, True),     # 【修复】学习在START后输出THINK_START
+                    (TextTokenizer.START_GENERATION_TOKEN, True), # 【修复】学习在ask后输出START
+                    (TextTokenizer.THINK_START_TOKEN, True),     # 学习在START后输出THINK_START
                     (think_tensor, True),                        # 学习生成思维链内容
                     (TextTokenizer.THINK_END_TOKEN, True),       # 学习在思考结束时输出THINK_END
                     (answer_tensor, True),                       # ★ 学习从THINK_END过渡到回答
@@ -750,21 +769,37 @@ def _chunked_forward_backward(
                         logits_2d = logits.squeeze(0)
                     else:
                         logits_2d = logits
-                    mask_bool = seg_mask[1:].to(device)
-                    if mask_bool.any():
-                        pred = logits_2d[:-1][mask_bool]
-                        tgt = seg[1:].to(device)[mask_bool]
-                        loss_chunk = loss_func(pred, tgt)
+                    
+                    # 【修复】当使用past_kv时，logits包含历史+当前token
+                    # 我们只取当前seg对应的logits部分
+                    if past_kv is not None and seg_start > 0:
+                        # 有历史上下文，只取当前seg的logits
+                        # logits_2d形状: [total_seq_len, vocab]
+                        # 当前seg对应的logits在末尾
+                        current_logits = logits_2d[-seg.numel():]
+                        # 预测目标: seg[1:] 由 current_logits[:-1] 预测
+                        mask_bool = seg_mask[1:].to(device)
+                        if mask_bool.any():
+                            pred = current_logits[:-1][mask_bool]
+                            tgt = seg[1:].to(device)[mask_bool]
+                            loss_chunk = loss_func(pred, tgt)
+                        else:
+                            loss_chunk = torch.tensor(0.0, device=device)
                     else:
-                        loss_chunk = torch.tensor(0.0, device=device)
+                        # 第一个chunk或没有past_kv，使用原始逻辑
+                        mask_bool = seg_mask[1:].to(device)
+                        if mask_bool.any():
+                            pred = logits_2d[:-1][mask_bool]
+                            tgt = seg[1:].to(device)[mask_bool]
+                            loss_chunk = loss_func(pred, tgt)
+                        else:
+                            loss_chunk = torch.tensor(0.0, device=device)
                 else:
                     loss_chunk = torch.tensor(0.0, device=device)
 
-                # 【修复】简化梯度缩放：只除以 GRADIENT_ACCUMULATION_STEPS
-                # 之前除以 num_chunks 导致长序列样本梯度被额外稀释，
-                # 长序列本应提供更多训练信号。chunk 数由显存限制决定，
-                # 不应影响有效学习率。
-                loss_scaled = loss_chunk / GRADIENT_ACCUMULATION_STEPS
+                # 【修复】分段训练中，每个 chunk 的 loss 不再除以 GRADIENT_ACCUMULATION_STEPS
+                # 因为主循环已经会除一次。双重除法会导致梯度过小，训练无效。
+                loss_scaled = loss_chunk
 
             # 【修复】零 loss（无 grad_fn）时跳过 backward，避免崩溃
             if loss_scaled.requires_grad:
@@ -844,16 +879,29 @@ def _chunk_one_segment(
                         logits_2d = logits.squeeze(0)
                     else:
                         logits_2d = logits
-                    mask_bool = sub_mask[1:].to(device)
-                    if mask_bool.any():
-                        pred = logits_2d[:-1][mask_bool]
-                        tgt = sub[1:].to(device)[mask_bool]
-                        loss_sub = loss_func(pred, tgt)
+                    
+                    # 【修复】当使用past_kv时，只取当前sub的logits
+                    if local_past is not None and s > 0:
+                        current_logits = logits_2d[-sub.numel():]
+                        mask_bool = sub_mask[1:].to(device)
+                        if mask_bool.any():
+                            pred = current_logits[:-1][mask_bool]
+                            tgt = sub[1:].to(device)[mask_bool]
+                            loss_sub = loss_func(pred, tgt)
+                        else:
+                            loss_sub = torch.tensor(0.0, device=device)
                     else:
-                        loss_sub = torch.tensor(0.0, device=device)
+                        mask_bool = sub_mask[1:].to(device)
+                        if mask_bool.any():
+                            pred = logits_2d[:-1][mask_bool]
+                            tgt = sub[1:].to(device)[mask_bool]
+                            loss_sub = loss_func(pred, tgt)
+                        else:
+                            loss_sub = torch.tensor(0.0, device=device)
                 else:
                     loss_sub = torch.tensor(0.0, device=device)
-                loss_scaled = loss_sub / GRADIENT_ACCUMULATION_STEPS
+                # 【修复】不再除以 GRADIENT_ACCUMULATION_STEPS，避免双重缩放
+                loss_scaled = loss_sub
 
             if loss_scaled.requires_grad:
                 if scaler.is_enabled():

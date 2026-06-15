@@ -32,9 +32,6 @@ class TextTokenizer(Tokenizer):
     @staticmethod
     def _is_valid_token(idx: int) -> bool:
         """检查token ID是否为有效的Unicode码点
-        
-        修复：添加对Unicode最大码点0x10FFFF(1114111)的检查
-        防止chr()函数抛出ValueError
         """
         if idx <= 0:
             return False
@@ -50,31 +47,22 @@ class TextTokenizer(Tokenizer):
                 text = ""
             else:
                 text = str(text)
-        
+
         tensor: list[int] = []
         dict_size = int(CONFIG["dict_size"])
-        
-        # 保留前10个特殊Token ID（0-9），其余用于字符映射
-        # 特殊Token: UNKNOWN=0, START_GENERATION=1, END_GENERATION=2, etc.
-        SPECIAL_TOKEN_COUNT = 10
-        
+
         for letter in text:
             idx = ord(letter)
-            if TextTokenizer._is_valid_token(idx):
-                if idx < dict_size:
-                    # 正常范围内的字符直接映射
-                    tensor.append(idx)
-                else:
-                    # 【修复】高码点字符（如Emoji、生僻汉字）通过哈希桶映射到词表高位
-                    # 避免全部降级为UNKNOWN_TOKEN导致语义丢失
-                    hashed_idx = SPECIAL_TOKEN_COUNT + (idx % (dict_size - SPECIAL_TOKEN_COUNT))
-                    tensor.append(hashed_idx)
+            # 【修复】简单直接：有效且在词表范围内就保留，否则映射为UNKNOWN
+            # 避免哈希桶导致的编解码不一致和冲突问题
+            if TextTokenizer._is_valid_token(idx) and idx < dict_size:
+                tensor.append(idx)
             else:
                 tensor.append(TextTokenizer.UNKNOWN_TOKEN)
-        
+
         if len(tensor) == 0:
             tensor = [TextTokenizer.UNKNOWN_TOKEN]
-        
+
         return torch.tensor(tensor, dtype=torch.long)
 
     @staticmethod
