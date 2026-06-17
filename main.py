@@ -294,7 +294,9 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
             past_key_values = None
 
         step = 0
+        # 【修复】使用滑动窗口替代累积 Counter，防止长生成时过度惩罚
         generated_tokens = Counter()
+        _token_history = []  # 记录最近生成的 token 序列
         
         # 【修复】如果启用了思维链且模型没有自己生成THINK_START，强制注入
         if thinking_available and not thinking_started:
@@ -338,10 +340,15 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     force_answer_steps -= 1
 
-                # Repetition penalty
-                if repetition_penalty > 1.0 and len(generated_tokens) > 0:
-                    for token_id, count in generated_tokens.items():
+                # 【修复】Repetition penalty 改为滑动窗口（最近64个token）
+                # 避免长生成时累积惩罚导致概率分布严重偏移
+                if repetition_penalty > 1.0 and len(_token_history) > 0:
+                    window_size = 64
+                    recent_tokens = _token_history[-window_size:]
+                    recent_counter = Counter(recent_tokens)
+                    for token_id, count in recent_counter.items():
                         if token_id < next_logits.size(0):
+                            # 限制最大惩罚次数为3，避免极端情况
                             penalty = repetition_penalty ** min(count, 3)
                             if next_logits[token_id] > 0:
                                 next_logits[token_id] /= penalty
@@ -424,6 +431,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     TextTokenizer.END_GENERATION_TOKEN,
                 ):
                     generated_tokens[index] += 1
+                    _token_history.append(index)  # 【修复】同时记录到滑动窗口历史
 
                 # 下一步
                 next_token = torch.tensor([index], device=device)
@@ -483,9 +491,12 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     
-                    # Repetition penalty
-                    if repetition_penalty > 1.0 and len(generated_tokens) > 0:
-                        for token_id, count in generated_tokens.items():
+                    # 【修复】Repetition penalty 滑动窗口（与主循环一致）
+                    if repetition_penalty > 1.0 and len(_token_history) > 0:
+                        window_size = 64
+                        recent_tokens = _token_history[-window_size:]
+                        recent_counter = Counter(recent_tokens)
+                        for token_id, count in recent_counter.items():
                             if token_id < next_logits.size(0):
                                 penalty = repetition_penalty ** min(count, 3)
                                 if next_logits[token_id] > 0:
@@ -518,6 +529,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     if index not in (TextTokenizer.THINK_START_TOKEN, TextTokenizer.THINK_END_TOKEN,
                                      TextTokenizer.START_GENERATION_TOKEN, TextTokenizer.END_GENERATION_TOKEN):
                         generated_tokens[index] += 1
+                        _token_history.append(index)  # 【修复】记录到滑动窗口历史
                     
                     next_token = torch.tensor([index], device=device)
                     result = model(next_token, past_key_values=past_key_values, use_cache=True)
@@ -651,49 +663,42 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         _run_train_step(train_tensor, target_mask, preview, show_preview=False)
     
     # 自奖励评估 —— 智能 RL 切换（基于 SuperRL Adaptive Switch 设计）
-    # 【修复】先检查 SFT 最低训练轮数，未达标则完全跳过 PPO
-    rl_min_rounds = int(CONFIG.get("rl_min_training_rounds", 100000))
-    if training_rounds < rl_min_rounds:
-        # SFT 预热阶段：完全不运行 RL，避免干扰梯度累积
-        if training_rounds % 100 == 0:
-            print(f"[RL Gate] ⏸️ SFT预热阶段 (round {training_rounds}/{rl_min_rounds})，RL 已禁用", flush=True)
-    else:
-        try:
-            # 计算奖励（自动记录到历史）
-            total_reward, reward_breakdown = reward_model.compute_total_reward(
-                think_text=think,
-                answer_text=answer,
+    try:
+        # 计算奖励（自动记录到历史）
+        total_reward, reward_breakdown = reward_model.compute_total_reward(
+            think_text=think,
+            answer_text=answer,
+            context=history_context
+        )
+
+        # 智能决策是否启用 RL 训练（仅由奖励质量决定，不再受训练轮数限制）
+        should_enable_rl, rl_decision_reason = reward_model.should_enable_rl()
+
+        if should_enable_rl:
+            # 启用 RL 训练：收集 episode 并更新策略
+            ppo_trainer.collect_episode(
+                prompt=ask if ask else "",
+                think_text=think if think else "",
+                answer_text=answer if answer else "",
                 context=history_context
             )
-            
-            # 智能决策是否启用 RL 训练
-            should_enable_rl, rl_decision_reason = reward_model.should_enable_rl()
-            
-            if should_enable_rl:
-                # 启用 RL 训练：收集 episode 并更新策略
-                ppo_trainer.collect_episode(
-                    prompt=ask if ask else "",
-                    think_text=think if think else "",
-                    answer_text=answer if answer else "",
-                    context=history_context
-                )
-                if training_rounds > 0 and (training_rounds % 4) == 0:
-                    ppo_update_result = ppo_trainer.update_policy(batch_size=4)
-                    
-                    # 每100步打印一次 RL 状态
-                    if training_rounds % 100 == 0:
-                        print(f"[RL Smart Switch] ✅ 启用RL训练 | "
-                              f"奖励={total_reward:.3f} | "
-                              f"原因: {rl_decision_reason}", flush=True)
-            else:
-                # 暂停 RL 训练：仅执行 SFT，不收集 RL episode
-                # 每50步打印一次切换状态
-                if training_rounds % 50 == 0:
-                    print(f"[RL Smart Switch] ⏸️ 暂停RL训练 | "
+            if training_rounds > 0 and (training_rounds % 4) == 0:
+                ppo_update_result = ppo_trainer.update_policy(batch_size=4)
+
+                # 每100步打印一次 RL 状态
+                if training_rounds % 100 == 0:
+                    print(f"[RL Smart Switch] ✅ 启用RL训练 | "
                           f"奖励={total_reward:.3f} | "
                           f"原因: {rl_decision_reason}", flush=True)
-        except Exception as e:
-            print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
+        else:
+            # 暂停 RL 训练：仅执行 SFT，不收集 RL episode
+            # 每50步打印一次切换状态
+            if training_rounds % 50 == 0:
+                print(f"[RL Smart Switch] ⏸️ 暂停RL训练 | "
+                      f"奖励={total_reward:.3f} | "
+                      f"原因: {rl_decision_reason}", flush=True)
+    except Exception as e:
+        print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
 
 
 def _detach_kv_cache(past_kv):
@@ -732,6 +737,7 @@ def _chunked_forward_backward(
     target_mask: torch.Tensor,
     chunk_size: int,
     overlap: int = 64,
+    grad_scale: int = 1,
 ) -> float | None:
     """MLA 压缩上下文分段训练：每个 chunk 通过 CSA+H2O+MLA 三路压缩上下文感知全量历史，
     梯度跨块累积，零截断。返回平均 loss，None 表示全部 OOM 跳过。
@@ -742,6 +748,9 @@ def _chunked_forward_backward(
       - H2O (Heavy Hitter Oracle): 高注意力分数token保留
       - MLA (Multi-head Latent Attention): 低秩潜在注意力记忆
     下一 chunk 的注意力计算自动使用此三路混合，实现长上下文感知。
+
+    Args:
+        grad_scale: 梯度累积步数，每个 chunk 的 loss 会除以该值以保持梯度量级一致
     """
     seq_len = train_tensor.numel()
     step = max(1, chunk_size - overlap)
@@ -769,15 +778,9 @@ def _chunked_forward_backward(
                         logits_2d = logits.squeeze(0)
                     else:
                         logits_2d = logits
-                    
-                    # 【修复】当使用past_kv时，logits包含历史+当前token
-                    # 我们只取当前seg对应的logits部分
+
                     if past_kv is not None and seg_start > 0:
-                        # 有历史上下文，只取当前seg的logits
-                        # logits_2d形状: [total_seq_len, vocab]
-                        # 当前seg对应的logits在末尾
                         current_logits = logits_2d[-seg.numel():]
-                        # 预测目标: seg[1:] 由 current_logits[:-1] 预测
                         mask_bool = seg_mask[1:].to(device)
                         if mask_bool.any():
                             pred = current_logits[:-1][mask_bool]
@@ -786,7 +789,6 @@ def _chunked_forward_backward(
                         else:
                             loss_chunk = torch.tensor(0.0, device=device)
                     else:
-                        # 第一个chunk或没有past_kv，使用原始逻辑
                         mask_bool = seg_mask[1:].to(device)
                         if mask_bool.any():
                             pred = logits_2d[:-1][mask_bool]
@@ -797,11 +799,10 @@ def _chunked_forward_backward(
                 else:
                     loss_chunk = torch.tensor(0.0, device=device)
 
-                # 【修复】分段训练中，每个 chunk 的 loss 不再除以 GRADIENT_ACCUMULATION_STEPS
-                # 因为主循环已经会除一次。双重除法会导致梯度过小，训练无效。
-                loss_scaled = loss_chunk
+                # 【修复】统一缩放：每个 chunk 的 loss 除以 grad_scale
+                # 保持与标准训练路径的梯度量级一致
+                loss_scaled = loss_chunk / grad_scale
 
-            # 【修复】零 loss（无 grad_fn）时跳过 backward，避免崩溃
             if loss_scaled.requires_grad:
                 if scaler.is_enabled():
                     scaler.scale(loss_scaled).backward()
@@ -811,9 +812,6 @@ def _chunked_forward_backward(
             chunk_losses.append(loss_chunk.detach())
             del seg, logits, loss_chunk, loss_scaled
 
-            # 【关键】detach past_kv，切断上一chunk的计算图
-            # 否则下一个 chunk 的 forward 复用 past_kv 时，
-            # backward 会报 "backward a second time" 错误
             if past_kv is not None:
                 past_kv = _detach_kv_cache(past_kv)
 
@@ -824,9 +822,8 @@ def _chunked_forward_backward(
                     print(f"[Memory] Chunk OOM at [{seg_start}:{seg_end}], 缩半到{smaller}重试", flush=True)
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
-                    # detach past_kv 后再传入，防止计算图冲突
                     safe_past = _detach_kv_cache(past_kv) if past_kv is not None else None
-                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller)
+                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller, grad_scale=grad_scale)
                     if sub is not None:
                         sub_loss, past_kv = sub
                         chunk_losses.append(sub_loss.detach())
@@ -847,11 +844,11 @@ def _chunked_forward_backward(
 
 def _chunk_one_segment(
     seg: torch.Tensor, seg_mask: torch.Tensor, past_kv, chunk_size: int,
+    grad_scale: int = 1,
 ) -> tuple[torch.Tensor, any] | None:
     """OOM 回退：将单个 segment 进一步细分后训练，返回 (avg_loss, past_kv) 或 None。
 
-    【修复】之前除以 num_chunks 导致梯度缩放不一致。
-    新逻辑：每个子 chunk 的 loss 仅除以 GRADIENT_ACCUMULATION_STEPS，
+    【修复】统一梯度缩放：每个子 chunk 的 loss 除以 grad_scale，
     与主循环的缩放一致。细分后的多个子 chunk 会自然累加它们的梯度，
     这与长序列提供更多训练信号的直觉相符。
     """
@@ -879,8 +876,7 @@ def _chunk_one_segment(
                         logits_2d = logits.squeeze(0)
                     else:
                         logits_2d = logits
-                    
-                    # 【修复】当使用past_kv时，只取当前sub的logits
+
                     if local_past is not None and s > 0:
                         current_logits = logits_2d[-sub.numel():]
                         mask_bool = sub_mask[1:].to(device)
@@ -900,8 +896,9 @@ def _chunk_one_segment(
                             loss_sub = torch.tensor(0.0, device=device)
                 else:
                     loss_sub = torch.tensor(0.0, device=device)
-                # 【修复】不再除以 GRADIENT_ACCUMULATION_STEPS，避免双重缩放
-                loss_scaled = loss_sub
+
+                # 【修复】统一缩放
+                loss_scaled = loss_sub / grad_scale
 
             if loss_scaled.requires_grad:
                 if scaler.is_enabled():
@@ -934,13 +931,23 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         模型自动在 chunk 间传递 CSA+H2O+MLA 三路压缩上下文，
         每个 chunk 能感知全量历史（非简单截断），梯度跨块累积。
     3. 所有方法都失败 → 才跳过（不做截断！）
+
+    【修复】梯度累积与优化器步进逻辑重构：
+    - training_rounds 在函数开头立即递增，确保所有判断条件基于最新值
+    - zero_grad 在新累积周期开始时执行 (training_rounds % GAS == 0)
+    - optimizer.step 在累积周期结束时执行 (training_rounds % GAS == 0)
+    - 分段训练路径统一缩放 loss / GRADIENT_ACCUMULATION_STEPS
     """
-    global training_rounds
+    global training_rounds, optimizer_step_count
+
+    # 【修复】training_rounds 在函数开头立即递增
+    # 确保后续所有条件判断（zero_grad、step、scheduler）基于统一的递增值
+    training_rounds += 1
 
     model.train()
     seq_len = train_tensor.numel()
-    
-# ── 显存状态检查 ──
+
+    # ── 显存状态检查 ──
     if torch.cuda.is_available():
         idx = torch.cuda.current_device()
         props = torch.cuda.get_device_properties(idx)
@@ -965,7 +972,8 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             torch.cuda.empty_cache()
             print(f"[Memory] Cleared GPU cache", flush=True)
 
-    # 梯度累积管理
+    # 【修复】梯度累积管理：在新累积周期开始时清零梯度
+    # 当 training_rounds % GAS == 0 时，表示上一周期已结束，开始新周期
     if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
         optimizer.zero_grad(set_to_none=True)
 
@@ -975,7 +983,6 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         print(f"[Memory] 显存占用过高 ({mem_ratio:.1%}), 主动清理后跳过本样本", flush=True)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        training_rounds += 1  # 即使跳过也要递增，保持调度器节奏
         return float('inf')
 
     # ── 策略选择：估算此序列所需显存 ──
@@ -995,9 +1002,8 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 if seq_len > 1:
                     mask_bool = target_mask[1:].to(device)
                     if mask_bool.any():
-                        # 【修复】logits 是3维 [batch, seq_len, vocab]，需要 squeeze 或按正确维度索引
                         if logits.dim() == 3:
-                            logits_2d = logits.squeeze(0)  # [1, seq_len, vocab] -> [seq_len, vocab]
+                            logits_2d = logits.squeeze(0)
                         else:
                             logits_2d = logits
                         pred = logits_2d[:-1][mask_bool]
@@ -1008,12 +1014,10 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 else:
                     loss = torch.tensor(0.0, device=device)
 
-            raw_loss_val = loss.item()  # 保存原始 loss 用于 ReduceLROnPlateau
+            raw_loss_val = loss.item()
+            # 统一缩放：所有路径的 loss 都除以 GRADIENT_ACCUMULATION_STEPS
             loss = loss / GRADIENT_ACCUMULATION_STEPS
-            
-            # 【修复】标准训练路径必须显式调用 backward()
-            # 原代码缺少此调用，导致梯度从未被计算，训练完全无效！
-            # requires_grad 检查防止零 loss（无 grad_fn）时的崩溃
+
             if loss.requires_grad:
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -1028,21 +1032,27 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             print(f"[Memory] MLA压缩上下文训练: seq={seq_len}, chunk={chunk_size}, overlap={overlap}, "
                   f"free={free_bytes/1024**3:.2f}GB (CSA+H2O+MLA三路压缩)", flush=True)
 
-            loss_val = _chunked_forward_backward(train_tensor, target_mask, chunk_size, overlap)
+            # 【修复】传入梯度累积缩放因子，确保分段路径与标准路径梯度量级一致
+            loss_val = _chunked_forward_backward(
+                train_tensor, target_mask, chunk_size, overlap,
+                grad_scale=GRADIENT_ACCUMULATION_STEPS
+            )
             if loss_val is None:
                 print(f"[Memory] 所有分段均 OOM，跳过本样本", flush=True)
                 optimizer.zero_grad(set_to_none=True)
                 torch.cuda.empty_cache()
-                training_rounds += 1  # 即使跳过也要递增，保持调度器节奏
                 return float('inf')
-            raw_loss_val = loss_val  # 保存原始 loss 用于 ReduceLROnPlateau
+            raw_loss_val = loss_val
             loss = torch.tensor(loss_val, device=device)
 
         # ── 统一的梯度后处理 ──
         if not torch.isnan(loss) and not torch.isinf(loss):
+            # 【修复】step 条件与 zero_grad 条件一致：都在周期边界执行
+            # training_rounds 已递增，当 % GAS == 0 表示累积周期完成
+            should_step = (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0
+
             if scaler.is_enabled():
-                # 【修复】unscale 和 clip 只在 step 前调用一次，避免梯度累积时重复除法
-                if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                if should_step:
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
@@ -1052,12 +1062,11 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                             if param.grad is not None and torch.isnan(param.grad).any():
                                 param.grad = None
                         print(f"[Warning] NaN/Inf gradient, skipping optimizer step", flush=True)
-                        training_rounds += 1  # 即使跳过也要递增，保持调度器节奏
                         return float('inf')
                     scaler.step(optimizer)
                     scaler.update()
             else:
-                if (training_rounds + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                if should_step:
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                         optimizer.zero_grad(set_to_none=True)
@@ -1065,19 +1074,15 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                             if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
                                 param.grad = None
                         print(f"[Warning] NaN/Inf gradient, skipping optimizer step", flush=True)
-                        training_rounds += 1  # 即使跳过也要递增，保持调度器节奏
                         return float('inf')
                     optimizer.step()
         else:
             print(f"[Warning] Invalid loss: {loss}, skipping optimizer step", flush=True)
-            training_rounds += 1  # 即使跳过也要递增，保持调度器节奏
             return float('inf')
 
-        training_rounds += 1
-
         # 学习率调度 — SGDR + ReduceLROnPlateau（动态 LR，适配无限训练）
+        # 【修复】step 条件统一为 % GAS == 0
         if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
-            global optimizer_step_count
             optimizer_step_count += 1
             current_lr = lr_scheduler.step(loss=raw_loss_val)
 
@@ -1104,15 +1109,12 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
-            training_rounds += 1  # 即使出错也要递增，保持调度器节奏
             return float('inf')
         else:
             print(f"[RuntimeError] {e}, skipping", flush=True)
-            training_rounds += 1  # 即使出错也要递增，保持调度器节奏
             return float('inf')
     except Exception as e:
         print(f"[Error] 未知错误: {e}, skipping", flush=True)
-        training_rounds += 1  # 即使出错也要递增，保持调度器节奏
         return float('inf')
     finally:
         try:

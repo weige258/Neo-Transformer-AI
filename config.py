@@ -29,8 +29,7 @@ CONFIG: Dict[str, Any] = {
     # ═══════════════════════════════════════════════════════
     # 3️⃣ 历史上下文压缩
     # ═══════════════════════════════════════════════════════
-    "compress_trigger_len": 99999999,# 【删除限制】设为极大值，取消压缩触发长度阈值
-    "compress_trigger_entropy": 1.0, # 【删除限制】设为1.0，实际上取消熵触发压缩
+    "compress_trigger_entropy": 0.6, # 【优化】熵触发压缩阈值，平衡压缩率与语义保留（建议0.5-0.7）
     "compress_stride": 16,           # 压缩步长
     "compress_ratio": 0.25,          # 压缩比例（6GB显存推荐0.25，更激进的压缩）
     "compress_on_memory_ratio": 0.80, # 当 GPU 显存占用超过该比例时触发压缩并卸载（0-1）
@@ -73,7 +72,7 @@ CONFIG: Dict[str, Any] = {
     # ═══════════════════════════════════════════════════════
     "repetition_penalty": 1.15,      # 【BUG #1修复】从1.02→1.15，符合业界标准(1.1-1.2)，防止字符级重复
     # ── CoT 与输出完整性保护 ──
-    "force_answer_min_steps": 0,     # 【删除限制】设为0，取消强制回答步数限制
+    "force_answer_min_steps": 8,     # 【修复】设为8，确保答案阶段至少生成8个token，防止THINK_END后立即结束
     
     # ═══════════════════════════════════════════════════════
     # 7️⃣ 学习率调度配置 (SGDR + ReduceLROnPlateau — 适用于无限循环训练)
@@ -154,7 +153,6 @@ CONFIG: Dict[str, Any] = {
     "rl_loss_threshold": 1.5,                    # 【优化】Loss阈值从1.2提高到1.5，允许更早启用RL
     "rl_loss_stability_window": 10,              # 【优化】稳定性评估窗口从5增加到10，更准确
     "rl_loss_stability_std_threshold": 0.2,      # 【优化】Loss标准差阈值从0.15提高到0.2，更宽容
-    "rl_min_training_rounds": 100000,            # 【修复】先彻底禁用 PPO，等 SFT 收敛后再开
     "rl_check_interval": 100,                    # 【优化】RL就绪检查间隔从200降低到100，更及时
     
     # ═══════════════════════════════════════════════════════

@@ -186,20 +186,18 @@ def evaluate_rl_readiness(
     loss_threshold: float = 1.2,
     stability_window: int = 5,
     stability_std_threshold: float = 0.15,
-    min_training_rounds: int = 3000,
 ) -> tuple[bool, str]:
     """自动评估当前模型是否已准备好进行强化学习（PPO）。
 
     评估维度：
-      1. 训练步数是否达到最低要求
-      2. 近期平均 loss 是否低于阈值
-      3. 近期 loss 是否已稳定（标准差低 = 收敛）
+      1. 近期平均 loss 是否低于阈值
+      2. 近期 loss 是否已稳定（标准差低 = 收敛）
+      （已移除最低训练轮数限制，仅由 loss 质量决定是否就绪）
 
     Args:
         loss_threshold: 平均 loss 必须低于此值
         stability_window: 取最近 N 条 record.txt 记录进行分析
         stability_std_threshold: loss 标准差低于此值视为收敛
-        min_training_rounds: 最低训练轮数（约 = 记录数 × record_interval）
 
     Returns:
         (ready: bool, reason: str) — 是否就绪及原因说明
@@ -231,13 +229,6 @@ def evaluate_rl_readiness(
     record_interval = int(CONFIG.get("record_interval", 1000))
     estimated_rounds = len(losses) * record_interval
 
-    # 条件 1：最低训练量
-    if estimated_rounds < min_training_rounds:
-        return False, (
-            f"训练量不足：估计 {estimated_rounds} 轮 < 最低 {min_training_rounds} 轮 "
-            f"（{len(losses)} 条 loss 记录 × {record_interval}）"
-        )
-
     # 取最近 stability_window 条记录
     recent = losses[-min(len(losses), stability_window):]
     if len(recent) < max(2, stability_window // 2):
@@ -247,14 +238,14 @@ def evaluate_rl_readiness(
     avg_loss = statistics.mean(recent)
     std_loss = statistics.stdev(recent) if len(recent) >= 2 else float("inf")
 
-    # 条件 2：loss 低于阈值
+    # 条件 1：loss 低于阈值
     if avg_loss >= loss_threshold:
         return False, (
             f"平均 loss 过高：{avg_loss:.4f} >= {loss_threshold} "
             f"（最近 {len(recent)} 条记录）"
         )
 
-    # 条件 3：loss 已稳定
+    # 条件 2：loss 已稳定
     if std_loss >= stability_std_threshold:
         return False, (
             f"loss 尚未收敛：标准差 {std_loss:.4f} >= {stability_std_threshold} "

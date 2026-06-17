@@ -815,12 +815,17 @@ class HyperAttention(nn.Module):
         # 释放 q 引用
         del q
 
-        # MLA latent memory更新：使用no_grad避免梯度回传到MLA投影层
-        # MLA memory是状态（类似KV cache），不应参与梯度计算
-        # MLA投影层参数通过retrieve路径的梯度来训练
-        with torch.no_grad():
-            new_mla_M, new_mla_z = self.mla_memory.update(
-                k_for_memory.detach(), v_new.detach(), mla_M, mla_z)
+        # 【修复】MLA latent memory更新：允许kv_proj/v_proj接收梯度
+        # 之前的问题：
+        #   1. 使用no_grad()导致kv_proj/v_proj永远不被训练
+        #   2. k_for_memory.detach()切断了K/V侧的梯度流
+        #   3. 只有retrieve路径的q_proj能接收梯度，三路不对称
+        # 修复策略：
+        #   - mla_M/mla_z是状态，必须detach（防止梯度回传到历史状态）
+        #   - k_for_memory/v_new不detach，让kv_proj/v_proj能通过update训练
+        #   - 移除no_grad()，让update成为可训练路径
+        new_mla_M, new_mla_z = self.mla_memory.update(
+            k_for_memory, v_new, mla_M.detach(), mla_z.detach())
 
         out = self.out_proj(out_accum)
         del out_accum
