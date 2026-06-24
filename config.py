@@ -62,15 +62,16 @@ CONFIG: Dict[str, Any] = {
     # Min-p 论文: "Turning Up the Heat" (Nguyen et al., ICLR 2025)
     # 核心: 动态截断阈值 = 最大概率 × min_p_ratio，天然过滤垃圾token
     # 已被 HuggingFace Transformers / VLLM 等主流框架采纳
-    "temperature": 0.6,              # 【修复】小模型降温至0.6，减少噪声
-    "min_p": 0.02,                   # 【修复】Min-p 比例降至0.02，小模型需要更多候选
-    "top_k": 0,                      # 【修复】关闭top-k，min-p更优
-    "top_p": 1.0,                    # 【修复】关闭top-p，min-p替代
+    "temperature": 0.8,              # 【BUG #2修复】从0.6→0.8。小模型需要适度随机性防止重复循环，0.6太确定性
+    "min_p": 0.05,                   # 【BUG #2修复】从0.02→0.05。0.02几乎不过滤垃圾token，0.05是论文推荐值
+    "top_k": 0,                      # 关闭top-k，min-p替代
+    "top_p": 1.0,                    # 关闭top-p，min-p替代
     
     # ═══════════════════════════════════════════════════════
     # 6️⃣ 生成质量控制
     # ═══════════════════════════════════════════════════════
-    "repetition_penalty": 1.15,      # 【BUG #1修复】从1.02→1.15，符合业界标准(1.1-1.2)，防止字符级重复
+    "repetition_penalty": 1.2,       # 【BUG #2修复】从1.15→1.2。字符级tokenizer极易重复，需要更强惩罚
+    "frequency_penalty": 0.3,        # 【BUG #2新增】频率惩罚系数。每次token出现后logit减去此值，比repetition_penalty更平滑有效
     # ── CoT 与输出完整性保护 ──
     "force_answer_min_steps": 8,     # 【修复】设为8，确保答案阶段至少生成8个token，防止THINK_END后立即结束
     

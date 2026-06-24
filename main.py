@@ -340,20 +340,26 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     force_answer_steps -= 1
 
-                # 【修复】Repetition penalty 改为滑动窗口（最近64个token）
-                # 避免长生成时累积惩罚导致概率分布严重偏移
+                # 【BUG #2修复】Repetition penalty + Frequency penalty 双重防重复
+                # Repetition penalty: 乘法惩罚，对已出现的token施加倍率惩罚
+                # Frequency penalty: 加法惩罚，每次出现减去固定值，更平滑有效
+                frequency_penalty = float(CONFIG.get("frequency_penalty", 0.3))
+                
                 if repetition_penalty > 1.0 and len(_token_history) > 0:
                     window_size = 64
                     recent_tokens = _token_history[-window_size:]
                     recent_counter = Counter(recent_tokens)
                     for token_id, count in recent_counter.items():
                         if token_id < next_logits.size(0):
-                            # 限制最大惩罚次数为3，避免极端情况
+                            # Repetition penalty (乘法)
                             penalty = repetition_penalty ** min(count, 3)
                             if next_logits[token_id] > 0:
                                 next_logits[token_id] /= penalty
                             else:
                                 next_logits[token_id] *= penalty
+                            # Frequency penalty (加法) - 每次出现减去固定值
+                            if frequency_penalty > 0:
+                                next_logits[token_id] -= frequency_penalty * min(count, 5)
 
                 # Min-p 采样（修复版：内部已处理temperature）
                 if min_p > 0.0:
@@ -491,7 +497,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     
-                    # 【修复】Repetition penalty 滑动窗口（与主循环一致）
+                    # 【BUG #2修复】Repetition penalty + Frequency penalty（与主循环一致）
                     if repetition_penalty > 1.0 and len(_token_history) > 0:
                         window_size = 64
                         recent_tokens = _token_history[-window_size:]
@@ -503,6 +509,8 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                                     next_logits[token_id] /= penalty
                                 else:
                                     next_logits[token_id] *= penalty
+                                if frequency_penalty > 0:
+                                    next_logits[token_id] -= frequency_penalty * min(count, 5)
                     
                     # Min-p（修复版：内部已处理temperature）
                     if min_p > 0.0:

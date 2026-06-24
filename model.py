@@ -720,9 +720,18 @@ class HyperAttention(nn.Module):
             mla_M, mla_z = self.mla_memory.init_mem(
                 1, self.num_heads, self.head_dim, x.device, x.dtype)
 
-        # 在 RoPE 之前保留一份 q/k 用于 MLA latent memory（无位置编码）
-        # 【修复】不 detach，让 MLA 的投影层(kv_proj, v_proj, q_proj)能接收梯度
-        # 之前的 detach() 导致 MLA 所有参数永远不被训练，三路混合只剩两路有效
+        # 【BUG修复 #1】训练-推理 MLA 记忆一致性
+        # 原Bug：训练时(use_cache=False) MLA retrieve 使用零记忆，
+        #        推理时(use_cache=True, step2+) MLA retrieve 使用上一步update后的非零记忆。
+        # 这导致训练和推理的注意力输出严重不一致（差异>2.0），是生成崩溃的根因。
+        #
+        # 修复：在训练时(past_key_value is None)，先用当前序列的K/V做MLA update，
+        # 得到非零的mla_M/mla_z，再用更新后的记忆做retrieve。
+        # 这使得训练时的MLA路径与推理时第一步（处理prompt）的行为完全一致。
+        if past_key_value is None:
+            mla_M, mla_z = self.mla_memory.update(
+                k_new, v_new, mla_M, mla_z)
+
         q_for_memory = q
         k_for_memory = k_new
 
@@ -815,17 +824,18 @@ class HyperAttention(nn.Module):
         # 释放 q 引用
         del q
 
-        # 【修复】MLA latent memory更新：允许kv_proj/v_proj接收梯度
-        # 之前的问题：
-        #   1. 使用no_grad()导致kv_proj/v_proj永远不被训练
-        #   2. k_for_memory.detach()切断了K/V侧的梯度流
-        #   3. 只有retrieve路径的q_proj能接收梯度，三路不对称
-        # 修复策略：
-        #   - mla_M/mla_z是状态，必须detach（防止梯度回传到历史状态）
-        #   - k_for_memory/v_new不detach，让kv_proj/v_proj能通过update训练
-        #   - 移除no_grad()，让update成为可训练路径
-        new_mla_M, new_mla_z = self.mla_memory.update(
-            k_for_memory, v_new, mla_M.detach(), mla_z.detach())
+        # 【BUG修复 #1 续】MLA latent memory 更新逻辑
+        # 训练时(past_key_value is None)：MLA已在retrieve前update过，此处跳过二次update
+        # 推理时(past_key_value is not None)：需要update产生新的mla_M/mla_z存入cache
+        if past_key_value is not None:
+            new_mla_M, new_mla_z = self.mla_memory.update(
+                k_for_memory, v_new, mla_M.detach(), mla_z.detach())
+        else:
+            # 训练时：retrieve前的update已经产生了正确的mla_M/mla_z
+            # 这里需要让kv_proj/v_proj也能接收梯度（通过retrieve前的update路径）
+            # retrieve前的update使用了k_new/v_new（未detach），梯度可以回传
+            new_mla_M = mla_M
+            new_mla_z = mla_z
 
         out = self.out_proj(out_accum)
         del out_accum
