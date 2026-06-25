@@ -62,7 +62,7 @@ CONFIG: Dict[str, Any] = {
     # Min-p 论文: "Turning Up the Heat" (Nguyen et al., ICLR 2025)
     # 核心: 动态截断阈值 = 最大概率 × min_p_ratio，天然过滤垃圾token
     # 已被 HuggingFace Transformers / VLLM 等主流框架采纳
-    "temperature": 0.8,              # 【BUG #2修复】从0.6→0.8。小模型需要适度随机性防止重复循环，0.6太确定性
+    "temperature": 0.6,              
     "min_p": 0.05,                   # 【BUG #2修复】从0.02→0.05。0.02几乎不过滤垃圾token，0.05是论文推荐值
     "top_k": 0,                      # 关闭top-k，min-p替代
     "top_p": 1.0,                    # 关闭top-p，min-p替代
