@@ -37,11 +37,26 @@ model.to(device)
 pretrained_path = "model.pth"
 if os.path.exists(pretrained_path):
     try:
-        state_dict = torch.load(pretrained_path, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
-        print(f"Loaded pretrained model from {pretrained_path}")
+        file_size = os.path.getsize(pretrained_path)
+        if file_size < 1024:
+            print(f"Warning: {pretrained_path} 文件过小 ({file_size} 字节)，可能已损坏，跳过加载")
+            bak_path = pretrained_path + ".bak"
+            try:
+                os.rename(pretrained_path, bak_path)
+                print(f"已将损坏文件重命名为 {bak_path}")
+            except Exception:
+                pass
+        else:
+            try:
+                state_dict = torch.load(pretrained_path, map_location=device, weights_only=True)
+            except Exception:
+                print(f"Warning: weights_only=True 加载失败，尝试 weights_only=False ...")
+                state_dict = torch.load(pretrained_path, map_location=device, weights_only=False)
+            model.load_state_dict(state_dict)
+            print(f"Loaded pretrained model from {pretrained_path}")
     except Exception as e:
         print(f"Warning: Failed to load pretrained model: {e}")
+        print(f"将从随机初始化权重开始训练，新权重会自动覆盖 {pretrained_path}")
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
