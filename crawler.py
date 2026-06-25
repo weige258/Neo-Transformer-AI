@@ -72,15 +72,13 @@ class WebCrawler:
                  max_retries=3,
                  timeout=10,
                  max_cache_size=100,
-                 max_sub_urls_per_page=20,
-                 state_file="crawler_state.json"):
+                 max_sub_urls_per_page=20):
         self.queue_threshold = queue_threshold
         self.max_workers = max_workers
         self.max_retries = max_retries
         self.timeout = timeout
         self.max_cache_size = max_cache_size
         self.max_sub_urls_per_page = max_sub_urls_per_page
-        self.state_file = state_file
 
         self.url_queue = queue.Queue()
         self.visited_urls = OrderedDict()
@@ -99,8 +97,6 @@ class WebCrawler:
         self._success_count = 0
         self._fail_count = 0
         self._stats_lock = threading.Lock()
-
-        self._load_state()
 
         if seed_urls:
             if isinstance(seed_urls, str):
@@ -121,62 +117,12 @@ class WebCrawler:
 
         self._start_threads()
 
-    def _load_state(self):
-        if not os.path.exists(self.state_file):
-            return
-        try:
-            with open(self.state_file, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            for url in state.get("visited", []):
-                self.visited_urls[url] = True
-            for url in state.get("failed", []):
-                self.failed_urls[url] = True
-            for url in state.get("pending", []):
-                if url not in self.visited_urls and url not in self.failed_urls:
-                    self.url_queue.put(url)
-            print(f"[Crawler] 加载状态: visited={len(self.visited_urls)}, "
-                  f"failed={len(self.failed_urls)}, pending={self.url_queue.qsize()}", flush=True)
-        except Exception as e:
-            print(f"[Crawler] 加载状态失败: {e}，从零开始", flush=True)
-
-    def save_state(self):
-        try:
-            pending = []
-            temp_queue = queue.Queue()
-            while not self.url_queue.empty():
-                try:
-                    url = self.url_queue.get_nowait()
-                    pending.append(url)
-                    temp_queue.put(url)
-                except queue.Empty:
-                    break
-            while not temp_queue.empty():
-                try:
-                    self.url_queue.put(temp_queue.get_nowait())
-                except queue.Empty:
-                    break
-
-            with self.url_lock:
-                state = {
-                    "visited": list(self.visited_urls.keys())[-50000:],
-                    "failed": list(self.failed_urls.keys())[-10000:],
-                    "pending": pending[-1000:],
-                    "timestamp": datetime.now().isoformat(),
-                }
-            with open(self.state_file, "w", encoding="utf-8") as f:
-                json.dump(state, f, ensure_ascii=False)
-            print(f"[Crawler] 状态已保存: visited={len(self.visited_urls)}, "
-                  f"failed={len(self.failed_urls)}, pending={len(pending)}", flush=True)
-        except Exception as e:
-            print(f"[Crawler] 保存状态失败: {e}", flush=True)
-
     def _start_threads(self):
         self.is_running = True
         for i in range(self.max_workers):
             self.executor.submit(self._crawler_worker)
         threading.Thread(target=self._queue_manager, daemon=True).start()
         threading.Thread(target=self._memory_cleaner, daemon=True).start()
-        threading.Thread(target=self._state_saver, daemon=True).start()
 
     def _crawler_worker(self):
         while self.is_running and not self.stop_event.is_set():
@@ -421,15 +367,6 @@ class WebCrawler:
 
             except Exception as e:
                 logger.warning(f"内存清理线程异常: {e}", exc_info=True)
-
-    def _state_saver(self):
-        while self.is_running and not self.stop_event.is_set():
-            try:
-                time.sleep(300)
-                if self.is_running:
-                    self.save_state()
-            except Exception as e:
-                logger.warning(f"状态保存线程异常: {e}", exc_info=True)
 
     def _add_to_cache(self, data):
         with self.cache_lock:

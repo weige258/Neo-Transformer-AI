@@ -2,8 +2,7 @@
 
 特性：
 - 从随机种子URL开始爬取，自动递归发现新链接
-- 增量爬虫：已访问URL持久化到 crawler_state.json
-- Ctrl+C 优雅退出：保存模型和爬虫状态
+- Ctrl+C 优雅退出：保存模型
 - 健壮异常处理：训练永不退出（除Ctrl+C）
 """
 
@@ -57,7 +56,6 @@ def _save_checkpoint():
             logging.info(f"模型已保存, 训练轮数: {local_training_rounds}")
         except Exception as e:
             logging.error(f"保存模型失败: {e}")
-    crawler.save_state()
 
 
 def _print_status():
