@@ -202,7 +202,7 @@ def main() -> None:
     logging.info(f"Initialized streaming dataset with {dataset.total_entries} training samples.")
 
     local_training_rounds = 0
-    save_interval = 500
+    save_interval = 1000
     consecutive_sample_errors = 0
     max_consecutive_sample_errors = 50
     

@@ -1122,6 +1122,8 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 print(f"[Warning] Preview decode failed: {e}", flush=True)
             print("", flush=True)
 
+        record_loss(raw_loss_val)
+
         return loss.item()
 
     except RuntimeError as e:
