@@ -58,6 +58,11 @@ CONFIG: Dict[str, Any] = {
     "use_gradient_checkpointing": False,  # 禁用：与动态压缩/动态窗口不兼容
     "gpu_cache_clear_threshold_gb": 4.0,
     "max_forward_chunk": 99999999,
+    
+    # ── 显存硬限制配置（新增） ──
+    "max_recent_kv_len": 2048,       # recent_k/v 绝对最大长度
+    "max_total_kv_len": 4096,        # 拼接后 raw_k/v 绝对最大长度
+    "kv_cache_max_len": 1024,        # _detach_kv_cache 最大长度
 
     # ═══════════════════════════════════════════════════════
     # 4️⃣ 序列长度与显存管理（全动态计算）

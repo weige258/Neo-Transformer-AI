@@ -157,7 +157,8 @@ def _compute_entropy_trend(entropy_history: List[float]) -> float:
 
 # 【显存优化】设置 PyTorch CUDA 内存分配策略，避免显存碎片化
 # expandable_segments:True 允许内存段动态扩展，减少碎片
-os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+# max_split_size_mb:512 限制最大分割块大小，减少碎片化导致的OOM
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True,max_split_size_mb:512')
 
 if hasattr(sys.stdin, "reconfigure"):
     sys.stdin.reconfigure(encoding="utf-8")
@@ -1050,24 +1051,35 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
 
 
-def _detach_kv_cache(past_kv, max_cache_len: int = 2048):
-    """递归 detach KV Cache 中的所有张量，切断计算图，并限制缓存长度。
+def _detach_kv_cache(past_kv, max_cache_len: int = None):
+    """递归 detach KV Cache 中的所有张量，切断计算图，并严格限制缓存长度。
 
     past_kv 是 list[CompressedKVCache]，其中 CompressedKVCache 是
     tuple[recent_k, recent_v, mem_k, mem_v, mem_pos, total_len, mla_M, mla_z]。
     必须 detach 后才能跨 chunk 复用，
     否则 backward 后中间值被释放会导致 "backward a second time" 错误。
+    
+    【修复】max_cache_len 从 2048 降到 1024，更严格限制显存占用。
+    同时限制 mem_k/mem_v 的长度，防止压缩记忆无限增长。
     """
     if past_kv is None:
         return None
+    
+    if max_cache_len is None:
+        max_cache_len = int(CONFIG.get("kv_cache_max_len", 1024))
+    
     detached = []
+    max_mem_len = max(128, max_cache_len // 4)  # 压缩记忆更严格限制
     for cache_tuple in past_kv:
         detached_tuple = []
         for i, t in enumerate(cache_tuple):
             if isinstance(t, torch.Tensor):
                 dt = t.detach()
-                if dt.dim() >= 2 and dt.shape[-2] > max_cache_len:
-                    dt = dt[..., -max_cache_len:, :]
+                # recent_k/v (索引0,1) 限制为 max_cache_len
+                # mem_k/v (索引2,3) 限制为 max_mem_len
+                limit = max_cache_len if i < 2 else max_mem_len
+                if dt.dim() >= 2 and dt.shape[-2] > limit:
+                    dt = dt[..., -limit:, :].contiguous()
                 detached_tuple.append(dt)
             else:
                 detached_tuple.append(t)
@@ -1110,16 +1122,38 @@ def _estimate_safe_chunk_size(seq_len: int = 0) -> int:
     # 估算：参数量 * 4 (fp32) * 3 (参数+梯度+优化器)
     if torch.cuda.is_available():
         total_memory = torch.cuda.get_device_properties(0).total_memory
-        # 估算模型参数数量 (粗略估计)
-        vocab_size = int(CONFIG.get("vocab_size", 60000))
-        param_count = (vocab_size * emb_size +  # embedding
-                      emb_size * emb_size * 4 * num_layers +  # attention + ffn
-                      emb_size * vocab_size)  # output
+        # 【修复】使用正确的配置键名 "dict_size" 而非 "vocab_size"
+        vocab_size = int(CONFIG.get("dict_size", 60000))
+        # 【修复】更准确的参数估算：
+        # embedding: vocab_size * emb_size
+        # 每个transformer block: 
+        #   - qkv_proj: emb_size * emb_size * 3
+        #   - out_proj: emb_size * emb_size
+        #   - router: emb_size * (emb_size//4) + (emb_size//4) * 3
+        #   - SwiGLU FFN: gate(emb*hidden) + up(emb*hidden) + down(hidden*emb), hidden=3*emb
+        #   - RMSNorm: 2 * emb_size (attn_norm + ffn_norm)
+        #   - MLA memory: kv_proj(head*latent) + v_proj(head*latent) + q_proj(head*latent) + v_up_proj(latent*head) + out_proj(head*head)
+        # output: emb_size * vocab_size (与embedding共享时忽略)
+        hidden = emb_size * 3  # SwiGLU hidden size
+        attn_params = emb_size * emb_size * 3 + emb_size * emb_size  # qkv + out
+        ffn_params = emb_size * hidden * 2 + hidden * emb_size  # gate + up + down
+        router_params = emb_size * max(1, emb_size // 4) + max(1, emb_size // 4) * 3
+        norm_params = emb_size * 2
+        # MLA 参数 (粗略)
+        head_dim = emb_size // 8  # num_heads=8
+        latent_dim = max(16, head_dim // 4)
+        mla_params = head_dim * latent_dim * 3 + latent_dim * head_dim + head_dim * head_dim
+        block_params = attn_params + ffn_params + router_params + norm_params + mla_params
+        
+        param_count = vocab_size * emb_size + block_params * num_layers
+        if not bool(CONFIG.get("tie_token_embeddings", True)):
+            param_count += emb_size * vocab_size  # output layer
+        
         model_overhead = param_count * 4 * 3  # fp32 * 3 (param + grad + optimizer)
         
-        # 可用显存 = 空闲显存 - 模型固定开销 - 安全余量(10%)
+        # 可用显存 = 空闲显存 - 模型固定开销 - 安全余量(15%)
         free_memory = max(0, total_memory * gpu_free_ratio - model_overhead)
-        free_memory = min(free_memory, total_memory * gpu_free_ratio * 0.9)  # 保留10%安全余量
+        free_memory = min(free_memory, total_memory * gpu_free_ratio * 0.85)  # 保留15%安全余量
     else:
         free_memory = 8 * 1024**3  # 默认8GB
     
@@ -1230,8 +1264,12 @@ def _chunked_forward_backward(
             chunk_losses.append(loss_chunk.detach())
             del seg, logits, loss_chunk, loss_scaled
 
+            # 【修复】强制清理中间变量，防止显存泄漏
             if past_kv is not None:
                 past_kv = _detach_kv_cache(past_kv)
+                # 显存紧张时主动清理缓存
+                if torch.cuda.is_available() and seg_start % 4 == 0:
+                    torch.cuda.empty_cache()
 
         except RuntimeError as e_oom:
             if "out of memory" in str(e_oom).lower():
@@ -1391,8 +1429,9 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             print(f"[Memory] Cleared GPU cache", flush=True)
 
     # 【修复】梯度累积管理：在新累积周期开始时清零梯度
-    # 当 training_rounds % GAS == 0 时，表示上一周期已结束，开始新周期
-    if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
+    # 使用 (training_rounds - 1) % GAS == 0 确保第一个样本前清零
+    # 旧逻辑 training_rounds % GAS == 0 导致第1个样本不清零，梯度会累积到第4个样本
+    if ((training_rounds - 1) % GRADIENT_ACCUMULATION_STEPS) == 0:
         optimizer.zero_grad(set_to_none=True)
 
     # ── 显存安全网关 ──
@@ -1483,6 +1522,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         if not torch.isnan(loss) and not torch.isinf(loss):
             # 【修复】step 条件与 zero_grad 条件一致：都在周期边界执行
             # training_rounds 已递增，当 % GAS == 0 表示累积周期完成
+            # 注意：这里保持 training_rounds % GAS == 0，因为 step 应该在第4个样本后执行
             should_step = (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0
 
             if scaler.is_enabled():
@@ -1516,7 +1556,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
 
         # 学习率调度 — SGDR + ReduceLROnPlateau（动态 LR，适配无限训练）
         # 【修复】step 条件统一为 % GAS == 0
-        if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
+        if should_step:
             optimizer_step_count += 1
             # 【Gemini修复】每N个optimizer step才更新一次学习率，防止SGDR震荡过于频繁
             if optimizer_step_count % LR_SCHEDULER_STEP_INTERVAL == 0:

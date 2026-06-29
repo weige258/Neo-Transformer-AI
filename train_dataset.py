@@ -3,11 +3,29 @@ import os
 import torch
 import random
 import logging
+import gc
+import time
 from typing import List, Optional, Dict
-from main import train, model, optimizer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# ═══════════════════════════════════════════════════════
+# 延迟导入 main 模块，避免循环导入
+# ═══════════════════════════════════════════════════════
+_train_fn = None
+_model = None
+_optimizer = None
+
+def _get_main_refs():
+    """延迟获取 main 模块中的全局对象，避免循环导入"""
+    global _train_fn, _model, _optimizer
+    if _train_fn is None:
+        from main import train, model, optimizer
+        _train_fn = train
+        _model = model
+        _optimizer = optimizer
+    return _train_fn, _model, _optimizer
 
 
 def load_dataset_files(dataset_dir: str = "dataset") -> List[str]:
@@ -43,46 +61,28 @@ class StreamingDataset:
         logging.info(f"Indexed {self.total_entries} total entries across {len(self.dataset_files)} files")
     
     def _count_entries_in_file(self, file_path: str) -> int:
-        """快速统计文件中的有效条目数（流式解析，避免全量加载到内存）"""
+        """快速统计文件中的有效条目数（流式逐行解析，避免全量加载到内存）"""
         try:
             count = 0
             with open(file_path, "r", encoding="utf-8") as f:
                 try:
-                    in_array = False
-                    brace_depth = 0
-                    buffer = ""
                     for line in f:
                         line = line.strip()
-                        if not line:
+                        if not line or line == "[" or line == "]":
                             continue
-                        if not in_array:
-                            if line.startswith("["):
-                                in_array = True
-                            continue
-                        if line.startswith("]"):
-                            break
                         if line.startswith("{"):
-                            brace_depth += 1
-                            buffer = line
-                        elif brace_depth > 0:
-                            buffer += line
-                            if "}" in line:
-                                brace_depth -= 1
-                                if brace_depth == 0:
-                                    try:
-                                        import json
-                                        item = json.loads(buffer.rstrip().rstrip(","))
-                                        if "ask" in item and "answer" in item:
-                                            ask_raw = item.get("ask")
-                                            answer_raw = item.get("answer")
-                                            if ask_raw is not None and answer_raw is not None:
-                                                ask = str(ask_raw).strip()
-                                                answer = str(answer_raw).strip()
-                                                if ask and answer:
-                                                    count += 1
-                                    except (json.JSONDecodeError, Exception):
-                                        pass
-                                    buffer = ""
+                            try:
+                                item = json.loads(line.rstrip().rstrip(","))
+                                if "ask" in item and "answer" in item:
+                                    ask_raw = item.get("ask")
+                                    answer_raw = item.get("answer")
+                                    if ask_raw is not None and answer_raw is not None:
+                                        ask = str(ask_raw).strip()
+                                        answer = str(answer_raw).strip()
+                                        if ask and answer:
+                                            count += 1
+                            except (json.JSONDecodeError, Exception):
+                                pass
                     return count
                 except MemoryError:
                     logging.warning(f"内存不足，无法处理 {file_path}，该文件暂时跳过")
@@ -216,6 +216,9 @@ def main() -> None:
     当发生内存不足等可恢复错误时，自动重试或重启训练循环，而不是退出
     只有 KeyboardInterrupt 才会真正退出
     """
+    # 延迟获取 main 模块引用
+    train_fn, model_obj, optimizer_obj = _get_main_refs()
+    
     # 使用流式数据集，不再一次性加载所有数据到内存
     dataset = StreamingDataset("dataset")
 
@@ -278,7 +281,7 @@ def main() -> None:
                     continue
 
                 try:
-                    train(
+                    train_fn(
                         ask=ask,
                         think=think if think else None,
                         answer=answer,
@@ -287,7 +290,7 @@ def main() -> None:
                     
                     local_training_rounds += 1
                     
-                    current_lr = optimizer.param_groups[0]['lr']
+                    current_lr = optimizer_obj.param_groups[0]['lr']
                     
                     import record
                     if record.record_count > 0:
@@ -306,17 +309,18 @@ def main() -> None:
                 except RuntimeError as e:
                     if "NaN" in str(e) or "nan" in str(e).lower():
                         logging.error(f"NaN training error: {e}, skipping this sample")
-                        optimizer.zero_grad(set_to_none=True)
+                        optimizer_obj.zero_grad(set_to_none=True)
                         continue
                     elif "out of memory" in str(e).lower():
                         logging.warning(f"CUDA Out of Memory: {e}, skipping this sample")
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
-                        optimizer.zero_grad(set_to_none=True)
+                            torch.cuda.synchronize()
+                        optimizer_obj.zero_grad(set_to_none=True)
                         continue
                     else:
                         logging.error(f"RuntimeError: {e}, skipping this sample")
-                        optimizer.zero_grad(set_to_none=True)
+                        optimizer_obj.zero_grad(set_to_none=True)
                         continue
                         
                 except Exception as e:
@@ -328,26 +332,28 @@ def main() -> None:
                         logging.warning(f"CUDA Out of Memory: {e}, skipping this sample")
                         if torch.cuda.is_available():
                             torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
                     else:
                         logging.error(f"Training error: {e}, skipping this sample")
                     
-                    optimizer.zero_grad(set_to_none=True)
+                    optimizer_obj.zero_grad(set_to_none=True)
                     continue
 
         except KeyboardInterrupt:
             logging.info("Training interrupted by user.")
-            torch.save(obj=model.state_dict(), f="model.pth")
+            torch.save(obj=model_obj.state_dict(), f="model.pth")
             logging.info(f"Final model saved, training rounds: {local_training_rounds}")
             return
         
         except MemoryError as e:
             logging.error(f"内存不足导致训练循环异常: {e}")
-            torch.save(obj=model.state_dict(), f="model.pth")
+            torch.save(obj=model_obj.state_dict(), f="model.pth")
             logging.info("模型已保存，清理内存后自动重启训练...")
-            import gc; gc.collect()
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            import time; time.sleep(5)
+                torch.cuda.synchronize()
+            time.sleep(5)
             try:
                 dataset = StreamingDataset("dataset")
                 if dataset.total_entries == 0:
@@ -360,12 +366,13 @@ def main() -> None:
         
         except Exception as e:
             logging.error(f"训练循环意外异常: {e}")
-            torch.save(obj=model.state_dict(), f="model.pth")
+            torch.save(obj=model_obj.state_dict(), f="model.pth")
             logging.info("模型已保存，5秒后自动重启训练...")
-            import time; time.sleep(5)
-            import gc; gc.collect()
+            time.sleep(5)
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                torch.cuda.synchronize()
             try:
                 dataset = StreamingDataset("dataset")
             except Exception as rebuild_err:

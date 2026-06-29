@@ -691,7 +691,12 @@ class HyperAttention(nn.Module):
         total_len = start_pos + k_all.size(-2)
         # 【动态窗口】使用动态计算的窗口大小
         dynamic_window = self._get_dynamic_window_size(total_len)
-        keep = min(dynamic_window, k_all.size(-2))
+        
+        # 【修复】严格限制 recent_k/v 的最大长度，防止显存无限增长
+        # 即使 dynamic_window 很大，也设置一个绝对上限
+        max_recent_len_cfg = int(CONFIG.get("max_recent_kv_len", 2048))
+        max_recent_len = min(dynamic_window, max_recent_len_cfg)
+        keep = min(max_recent_len, k_all.size(-2))
         compress_len = k_all.size(-2) - keep
         
         # 【全动态金字塔压缩】运行时计算压缩比例
@@ -793,7 +798,17 @@ class HyperAttention(nn.Module):
             mem_pos = torch.empty(0, device=k_all.device, dtype=torch.long)
 
         # ── Level 4: 当mem_k超限时，固化最旧部分到 MLA latent memory ──
-        max_mem_capacity = int(CONFIG.get("max_mem_kv_capacity", 256))
+        # 【修复】根据显存压力动态调整 max_mem_capacity
+        mem_pressure = self._get_gpu_memory_pressure()
+        base_capacity = int(CONFIG.get("max_mem_kv_capacity", 256))
+        # 显存压力大时，更激进地限制压缩记忆容量
+        if mem_pressure > 0.8:
+            max_mem_capacity = max(64, base_capacity // 4)
+        elif mem_pressure > 0.6:
+            max_mem_capacity = max(128, base_capacity // 2)
+        else:
+            max_mem_capacity = base_capacity
+        
         if mem_k.size(-2) > max_mem_capacity:
             overflow = mem_k.size(-2) - max_mem_capacity
             to_linear_k = mem_k[:, :, :overflow, :]
@@ -869,6 +884,18 @@ class HyperAttention(nn.Module):
             raw_k = k_new
             raw_v = v_new
         else:
+            # 【修复】限制拼接后的长度，防止无限增长
+            max_total_len = int(CONFIG.get("max_total_kv_len", 4096))  # 从配置读取
+            past_len = past_recent_k.size(-2)
+            if past_len + seq_len > max_total_len:
+                # 截断旧的 past KV
+                keep_past = max_total_len - seq_len
+                if keep_past > 0:
+                    past_recent_k = past_recent_k[..., -keep_past:, :]
+                    past_recent_v = past_recent_v[..., -keep_past:, :]
+                else:
+                    past_recent_k = past_recent_k.new_zeros(batch, self.num_heads, 0, self.head_dim)
+                    past_recent_v = past_recent_v.new_zeros(batch, self.num_heads, 0, self.head_dim)
             raw_k = torch.cat((past_recent_k, k_new), dim=-2)
             raw_v = torch.cat((past_recent_v, v_new), dim=-2)
 
