@@ -69,11 +69,11 @@ CONFIG: Dict[str, Any] = {
     #   - gen_len_complexity_factor: 复杂度调节因子
     #   - gen_len_memory_sensitivity: 显存敏感度（显存紧张时降低长度）
     #   - gen_len_entropy_sensitivity: 生成熵敏感度（高熵时允许更长生成）
-    "gen_len_base_ratio": 8.0,        # 基础长度倍数
+    "gen_len_base_ratio": 32.0,       # 【修复】基础长度倍数：8.0→32.0，确保短问题也能生成长文本
     "gen_len_complexity_factor": 1.5,  # 复杂度因子
-    "gen_len_memory_sensitivity": 0.3, # 显存敏感度
+    "gen_len_memory_sensitivity": 0.15, # 【修复】显存敏感度：0.3→0.15，减少显存对长度的抑制
     "gen_len_entropy_sensitivity": 0.5, # 熵敏感度
-    "gen_len_min_absolute": 64,       # 绝对最小长度（防止过短）
+    "gen_len_min_absolute": 256,      # 【修复】绝对最小长度：64→256，保证最低生成质量
     "gen_len_max_absolute": 4096,     # 绝对最大长度（安全上限）
     "dynamic_segment_overlap": 32,
     "gpu_memory_safe_ratio": 0.85,
@@ -89,11 +89,11 @@ CONFIG: Dict[str, Any] = {
     #   - temp_entropy_scale: 熵调节缩放
     #   - temp_repetition_sensitivity: 重复敏感度
     #   - temp_length_decay: 长度衰减（长生成时降低温度稳定输出）
-    "temp_base": 0.8,
-    "temp_entropy_scale": 0.4,
-    "temp_repetition_sensitivity": 0.6,
-    "temp_length_decay": 0.001,
-    "temp_min_clip": 0.3,             # 温度下限裁剪
+    "temp_base": 0.85,                # 【修复】基础温度：0.8→0.85，稍微提高创造力
+    "temp_entropy_scale": 0.3,        # 【修复】熵调节缩放：0.4→0.3，减少温度波动
+    "temp_repetition_sensitivity": 0.4, # 【修复】重复敏感度：0.6→0.4，避免过度升温
+    "temp_length_decay": 0.0005,      # 【修复】长度衰减：0.001→0.0005，减缓温度下降
+    "temp_min_clip": 0.4,             # 【修复】温度下限：0.3→0.4，防止温度过低
     "temp_max_clip": 1.5,             # 温度上限裁剪
     "enable_edt": True,
     "min_p": 0.04,
@@ -110,15 +110,15 @@ CONFIG: Dict[str, Any] = {
     #   - rep_penalty_length_factor: 长度因子（长生成增加惩罚）
     #   - rep_penalty_repeat_sensitivity: 重复检测敏感度
     #   - rep_penalty_entropy_factor: 熵趋势因子（熵下降时增强惩罚）
-    "rep_penalty_scale": 0.25,        # 惩罚缩放（增强以匹配旧版固定1.2的效果）
-    "rep_penalty_length_factor": 0.002, # 长度因子
-    "rep_penalty_repeat_sensitivity": 2.0, # 重复敏感度
+    "rep_penalty_scale": 0.15,        # 【修复】惩罚缩放：0.25→0.15，避免过度惩罚正常重复
+    "rep_penalty_length_factor": 0.001, # 【修复】长度因子：0.002→0.001，减缓惩罚增长
+    "rep_penalty_repeat_sensitivity": 1.5, # 【修复】重复敏感度：2.0→1.5，降低重复检测敏感度
     "rep_penalty_entropy_factor": 0.8, # 熵趋势因子
-    "frequency_penalty": 0.3,
+    "frequency_penalty": 0.15,         # 【修复】频率惩罚：0.3→0.15，大幅减弱频率惩罚
     # 强制回答步数完全运行时动态计算：
     #   min_steps = f(question_len, question_complexity, answer_quality_estimate)
-    "force_answer_scale": 1.2,        # 步数缩放
-    "force_answer_min_absolute": 16,  # 绝对最小步数
+    "force_answer_scale": 8.0,        # 【修复】步数缩放：1.2→8.0，确保强制回答阶段足够长
+    "force_answer_min_absolute": 128, # 【修复】绝对最小步数：16→128，保证回答质量
     "force_answer_complexity_exp": 0.5, # 复杂度指数
 
     # ═══════════════════════════════════════════════════════

@@ -1043,12 +1043,14 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
 
 
-def _detach_kv_cache(past_kv):
-    """递归 detach KV Cache 中的所有张量，切断计算图。
+def _detach_kv_cache(past_kv, max_cache_len: int = 2048):
+    """递归 detach KV Cache 中的所有张量，切断计算图，并限制缓存长度。
 
     past_kv 是 list[CompressedKVCache]，其中 CompressedKVCache 是
     tuple[6个Tensor + 1个int]。必须 detach 后才能跨 chunk 复用，
     否则 backward 后中间值被释放会导致 "backward a second time" 错误。
+    
+    【修复】新增max_cache_len参数，限制KV Cache的最大长度，防止显存无限增长。
     """
     if past_kv is None:
         return None
@@ -1056,11 +1058,18 @@ def _detach_kv_cache(past_kv):
     for cache_tuple in past_kv:
         # cache_tuple: (recent_k, recent_v, mem_k, mem_v, mem_pos, total_len)
         # 前5个是 Tensor，第6个是 int
-        detached_tuple = tuple(
-            t.detach() if isinstance(t, torch.Tensor) else t
-            for t in cache_tuple
-        )
-        detached.append(detached_tuple)
+        detached_tuple = []
+        for i, t in enumerate(cache_tuple):
+            if isinstance(t, torch.Tensor):
+                dt = t.detach()
+                # 【修复】限制KV Cache长度：如果序列维度超过max_cache_len，截断保留最近的部分
+                if dt.dim() >= 2 and dt.shape[-2] > max_cache_len:
+                    # 假设序列维度是倒数第2维
+                    dt = dt[..., -max_cache_len:, :]
+                detached_tuple.append(dt)
+            else:
+                detached_tuple.append(t)
+        detached.append(tuple(detached_tuple))
     return detached
 
 
@@ -1077,7 +1086,11 @@ def _estimate_safe_chunk_size(seq_len: int = 0) -> int:
     """
     emb_size = int(CONFIG.get("emb_size", 512))
     num_layers = int(CONFIG.get("num_transformer_blocks", 8))
-    bytes_per_token = emb_size * num_layers * 8
+    # 【修复】修正bytes_per_token计算：
+    # 旧版：emb_size * num_layers * 8 = 512*8*8 = 32,768 bytes/token（严重高估）
+    # 新版：emb_size * num_layers * 2 = 512*8*2 = 8,192 bytes/token（bf16激活值更合理）
+    # 实际每个token的激活值 = hidden_size * num_layers * dtype_size
+    bytes_per_token = emb_size * num_layers * 2
     
     # 获取硬件状态
     gpu_free_ratio = _get_gpu_free_memory_ratio()
@@ -1090,19 +1103,32 @@ def _estimate_safe_chunk_size(seq_len: int = 0) -> int:
     chunk_max_ratio = float(CONFIG.get("chunk_max_ratio", 0.5))
     chunk_cpu_pressure_factor = float(CONFIG.get("chunk_cpu_pressure_factor", 0.2))
     
-    # 计算可用显存
+    # 【修复】计算可用显存时扣除模型固定开销
+    # 模型固定开销 = 参数 + 梯度 + 优化器状态(Adam = 2x参数)
+    # 估算：参数量 * 4 (fp32) * 3 (参数+梯度+优化器)
     if torch.cuda.is_available():
         total_memory = torch.cuda.get_device_properties(0).total_memory
-        free_memory = total_memory * gpu_free_ratio
+        # 估算模型参数数量 (粗略估计)
+        vocab_size = int(CONFIG.get("vocab_size", 60000))
+        param_count = (vocab_size * emb_size +  # embedding
+                      emb_size * emb_size * 4 * num_layers +  # attention + ffn
+                      emb_size * vocab_size)  # output
+        model_overhead = param_count * 4 * 3  # fp32 * 3 (param + grad + optimizer)
+        
+        # 可用显存 = 空闲显存 - 模型固定开销 - 安全余量(10%)
+        free_memory = max(0, total_memory * gpu_free_ratio - model_overhead)
+        free_memory = min(free_memory, total_memory * gpu_free_ratio * 0.9)  # 保留10%安全余量
     else:
         free_memory = 8 * 1024**3  # 默认8GB
     
-    # 显存因子
+    # 显存因子（显存紧张时更保守）
     memory_factor = gpu_free_ratio * (1.0 - (1.0 - cpu_free_ratio) * chunk_cpu_pressure_factor)
     
     # 计算chunk大小
-    # 1. 基于显存
-    mem_based_chunk = int(free_memory * chunk_memory_ratio * memory_factor / bytes_per_token)
+    # 1. 基于显存（使用更保守的比例）
+    # 【修复】chunk_memory_ratio从0.15降到0.08，更保守
+    conservative_ratio = chunk_memory_ratio * 0.5  # 使用一半的比例
+    mem_based_chunk = int(free_memory * conservative_ratio * memory_factor / bytes_per_token)
     
     # 2. 基于序列长度
     seq_based_chunk = int(seq_len * chunk_seq_len_factor)
@@ -1367,16 +1393,26 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         optimizer.zero_grad(set_to_none=True)
 
     # ── 显存安全网关 ──
-    skip_thresh = float(CONFIG.get("gpu_memory_skip_ratio", 0.92))
+    # 【修复】降低skip阈值到0.85，更早触发保护
+    # 旧版0.92太晚，此时已经OOM风险很高
+    skip_thresh = float(CONFIG.get("gpu_memory_skip_ratio", 0.85))
     if mem_ratio >= skip_thresh:
         print(f"[Memory] 显存占用过高 ({mem_ratio:.1%}), 主动清理后跳过本样本", flush=True)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         return float('inf')
-
+    
     # ── 策略选择：全动态计算分块大小 ──
     # 【全动态分块】基于实时硬件状态计算
     safe_chunk = _estimate_safe_chunk_size(seq_len)
+    
+    # 【新增】显存预检：如果预计训练后会超过阈值，提前使用更小的chunk
+    # 估算每个token的显存占用（使用保守估计）
+    est_bytes_per_token = int(CONFIG.get("emb_size", 512)) * int(CONFIG.get("num_transformer_blocks", 8)) * 2
+    estimated_usage = mem_ratio + (seq_len * est_bytes_per_token / total_mem if torch.cuda.is_available() else 0)
+    if estimated_usage > skip_thresh and seq_len > 256:
+        print(f"[Memory] 预计显存不足 (当前{mem_ratio:.1%}, 估计{estimated_usage:.1%}), 强制使用小chunk训练", flush=True)
+        safe_chunk = min(safe_chunk, 256)  # 强制小chunk
     
     # 【全动态overlap】基于chunk_size和序列长度动态计算
     chunk_overlap_base = int(CONFIG.get("chunk_overlap_base", 32))
