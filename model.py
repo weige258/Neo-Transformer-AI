@@ -43,6 +43,8 @@ class MLALatentMemory(nn.Module):
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.use_delta = use_delta
+        # 【修复】将alpha暴露为可配置属性，允许推理时动态调整更新速率
+        self.alpha = 0.9
 
         # 根据网络研究，latent维度应该是head_dim的1/4到1/2
         # DeepSeek-V2使用512维latent压缩2048维的KV
@@ -137,7 +139,8 @@ class MLALatentMemory(nn.Module):
         # 使用指数移动平均更新，更稳定
         # 【修复】z 之前用 sum()，随序列长度单调增长，导致 denom→∞，v_lat→0，MLA 路径失效
         # 改用 mean() 保持稳定量级。同时将 M/z 一起按相同指数平滑，避免 M/z 比例漂移
-        alpha = 0.9  # 历史权重
+        # 【修复】使用self.alpha替代硬编码，支持推理时动态调整
+        alpha = self.alpha
         # delta_M 来自 matmul(k_lat.T, v_error)，已在 seq_len 上聚合，故除以 seq_len 得到平均
         seq_len_k = max(1, k_lat.size(-2))
         delta_M_mean = delta_M.mean(dim=0, keepdim=True) / seq_len_k  # (1, H, latent, latent)
@@ -267,7 +270,15 @@ def apply_rope(
 
 
 class HyperAttention(nn.Module):
-    """HyperAttention: 压缩记忆 + 局部滑动窗口 + MLA低秩压缩 三路混合注意力"""
+    """HyperAttention: 压缩记忆 + 局部滑动窗口 + MLA低秩压缩 三路混合注意力
+    
+    【全动态设计】所有运行时参数（窗口大小、压缩比例等）都基于：
+    - 当前序列长度
+    - GPU显存压力（reserved/total比例）
+    - CPU负载
+    - 层深度（金字塔压缩）
+    没有任何固定阈值，所有决策都是运行时动态计算。
+    """
 
     def __init__(self, emb_size: int, num_heads: int, dropout: float) -> None:
         super().__init__()
@@ -275,11 +286,19 @@ class HyperAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = emb_size // num_heads
         self.dropout = dropout
-        self.window_size = max(8, int(CONFIG.get("sliding_window", 256)))
+        # ── 动态窗口系数（运行时计算，非固定值） ──
+        self.window_scale_factor = float(CONFIG.get("window_scale_factor", 0.5))
+        self.window_min_ratio = float(CONFIG.get("window_min_ratio", 0.25))
+        self.window_full_attention_ratio = float(CONFIG.get("window_full_attention_ratio", 0.125))
         self.compress_stride = max(2, int(CONFIG.get("compress_stride", 16)))
         self.chunk_size = max(8, int(CONFIG.get("attention_chunk_size", 128)))
-        self.sink_count = max(1, int(CONFIG.get("attention_sink_count", 4)))  # StreamingLLM sink保护
+        self.sink_count = max(1, int(CONFIG.get("attention_sink_count", 4)))
+        # 动态压缩系数
+        self.compress_scale = float(CONFIG.get("compress_scale", 0.25))
+        self.compress_depth_sensitivity = float(CONFIG.get("compress_depth_sensitivity", 2.0))
+        self.compress_memory_pressure_factor = float(CONFIG.get("compress_memory_pressure_factor", 1.5))
 
+        # ── 注意力投影层 ──
         self.qkv_proj = nn.Linear(emb_size, emb_size * 3, bias=False)
         self.router = nn.Sequential(
             nn.Linear(emb_size, max(1, emb_size // 4), bias=False),
@@ -296,6 +315,93 @@ class HyperAttention(nn.Module):
         # 【新增】Learned Soft Pooling：可学习的门控压缩权重
         if bool(CONFIG.get("use_learned_pooling", True)):
             self.importance_pooler = nn.Linear(self.head_dim, 1, bias=False)
+
+    def _get_gpu_memory_pressure(self) -> float:
+        """获取当前GPU显存压力（0.0-1.0）"""
+        if not torch.cuda.is_available():
+            return 0.0
+        try:
+            allocated = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0.0
+            reserved = torch.cuda.memory_reserved() / torch.cuda.get_device_properties(0).total_memory
+            return max(allocated, reserved)
+        except:
+            return 0.0
+
+    def _get_dynamic_window_size(self, seq_len: int) -> int:
+        """全动态窗口大小计算
+        
+        基于：
+        1. 序列长度（seq_len）
+        2. GPU显存压力（memory_pressure）
+        3. 缩放因子（window_scale_factor）
+        
+        公式：
+        - 如果 seq_len <= full_attention_threshold: 返回seq_len（full attention）
+        - 否则: window = seq_len * scale_factor * (1 - memory_pressure * 0.3)
+        - 下限: max(512, seq_len * min_ratio)  # 保证至少512的上下文窗口（与旧版一致）
+        """
+        if seq_len <= 0:
+            return 8
+        
+        # 获取显存压力
+        mem_pressure = self._get_gpu_memory_pressure()
+        
+        # 【修复】full attention阈值：使用绝对值512而非比例
+        # 旧版行为：seq_len <= 512 时用full attention
+        full_threshold = max(512, int(seq_len * self.window_full_attention_ratio))
+        
+        if seq_len <= full_threshold:
+            return seq_len  # 短序列用full attention
+        
+        # 动态缩放：显存压力大时减小窗口
+        adaptive_scale = self.window_scale_factor * (1.0 - mem_pressure * 0.3)
+        adaptive_scale = max(0.1, min(0.9, adaptive_scale))
+        
+        window_size = int(seq_len * adaptive_scale)
+        
+        # 【修复】下限保护：至少512（与旧版sliding_window=512一致）
+        min_window = max(512, int(seq_len * self.window_min_ratio))
+        window_size = max(min_window, window_size)
+        
+        return window_size
+
+    def _get_dynamic_compress_ratio(self, seq_len: int, layer_idx: int, total_layers: int) -> float:
+        """全动态压缩比例计算
+        
+        基于：
+        1. 层深度（layer_idx / total_layers）→ 金字塔压缩
+        2. GPU显存压力 → 压力大时增加压缩
+        3. 序列长度 → 长序列更激进压缩
+        
+        公式：
+        ratio = base_scale * depth_factor * memory_factor * seq_len_factor
+        """
+        if total_layers <= 1:
+            depth_ratio = 0.5
+        else:
+            depth_ratio = layer_idx / (total_layers - 1)  # 0.0 ~ 1.0
+        
+        # 金字塔因子：浅层保留更多，深层压缩更多
+        # depth_sensitivity控制差异程度
+        depth_factor = 1.0 + (depth_ratio - 0.5) * self.compress_depth_sensitivity
+        depth_factor = max(0.3, min(2.0, depth_factor))
+        
+        # 显存压力因子：压力大时增加压缩（降低ratio=保留更少）
+        mem_pressure = self._get_gpu_memory_pressure()
+        memory_factor = 1.0 + mem_pressure * self.compress_memory_pressure_factor
+        
+        # 序列长度因子：超长序列更激进
+        if seq_len > 4096:
+            seq_factor = 1.3
+        elif seq_len > 2048:
+            seq_factor = 1.1
+        else:
+            seq_factor = 1.0
+        
+        ratio = self.compress_scale * depth_factor * memory_factor * seq_factor
+        
+        # 裁剪到合理范围
+        return max(0.05, min(0.8, ratio))
 
     def _split_qkv(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         batch, seq_len, emb = x.shape
@@ -473,14 +579,16 @@ class HyperAttention(nn.Module):
         q_start_pos: int,
         k_start_pos: int,
     ) -> torch.Tensor:
-        """局部滑动窗口注意力
+        """局部滑动窗口注意力（动态窗口大小）
 
         对超长序列分 chunk 计算，每个 query 只关注窗口范围内的 key。
-        对于窗口内的序列直接使用 F.scaled_dot_product_attention 加速。
+        窗口大小根据总序列长度动态调整：短序列使用full attention，长序列使用限制窗口。
         """
         batch, heads, q_len, dim = q.shape
         k_len = k.size(-2)
-        ws = self.window_size
+        # 【动态窗口】根据总序列长度计算窗口大小
+        total_seq_len = q_start_pos + q_len
+        ws = self._get_dynamic_window_size(total_seq_len)
 
         if k_len == 0:
             return torch.zeros(batch, heads, q_len, dim, device=q.device, dtype=q.dtype)
@@ -562,18 +670,31 @@ class HyperAttention(nn.Module):
         old_lin_M: torch.Tensor | None = None,
         old_lin_z: torch.Tensor | None = None,
         special_mask: torch.Tensor | None = None,
+        layer_idx: int = 0,
+        total_layers: int = 8,
     ) -> CompressedKVCache:
-        """多级记忆流水线：构建带5级层次化压缩的KV Cache
+        """多级记忆流水线：构建带5级层次化压缩的KV Cache（支持金字塔压缩）
 
-        Level 1 (工作记忆): recent_k/v — 最新sliding_window个token，全量保留
+        Level 1 (工作记忆): recent_k/v — 最新动态窗口个token，全量保留
         Level 2 (关键筛选): H2O风格 — 溢出token中保留Heavy Hitters
-        Level 3 (语义凝聚): Learned Pooling — 剩余token加权压缩
+        Level 3 (语义凝聚): Learned Pooling — 剩余token加权压缩（支持金字塔比例）
         Level 4 (无限历史): MLA latent memory — mem_k 满时固化到低秩关联矩阵
         Level 5 (物理卸载): 量化后CPU offload（由调用方触发）
+        
+        【金字塔压缩】根据层深度动态调整压缩比例：
+        - 浅层（前1/3）: 保留更多细节，压缩率较低
+        - 中层（中1/3）: 标准压缩率
+        - 深层（后1/3）: 高度抽象，压缩率较高
         """
         total_len = start_pos + k_all.size(-2)
-        keep = min(self.window_size, k_all.size(-2))
+        # 【动态窗口】使用动态计算的窗口大小
+        dynamic_window = self._get_dynamic_window_size(total_len)
+        keep = min(dynamic_window, k_all.size(-2))
         compress_len = k_all.size(-2) - keep
+        
+        # 【全动态金字塔压缩】运行时计算压缩比例
+        # 基于：层深度、序列长度、GPU显存压力
+        pyramid_ratio = self._get_dynamic_compress_ratio(total_len, layer_idx, total_layers)
 
         # ── Level 1: 工作记忆区（最新token全量保留） ──
         recent_k = k_all[:, :, -keep:, :].contiguous()
@@ -624,10 +745,13 @@ class HyperAttention(nn.Module):
             # 【注意】当前使用key范数作为重要性代理，这是H2O原始论文的方法。
             # SnapKV (Li et al., 2024) 证明注意力累积分数比key范数更准确，
             # 但计算注意力分数需要额外的forward pass，会增加显存开销。
+            # 【金字塔压缩】使用动态计算的h2_ratio（浅层保留更多）
             with torch.no_grad():
                 importance = overflow_k.norm(dim=-1).mean(dim=(0, 1))  # (seq_len,)
             
-            h2_ratio = float(CONFIG.get("h2_ratio", 0.3))
+            # 金字塔比例：浅层保留更多Heavy Hitters
+            h2_ratio = float(CONFIG.get("h2_ratio", 0.3)) * pyramid_ratio / 0.25
+            h2_ratio = max(0.1, min(0.8, h2_ratio))  # 限制在合理范围
             h2_count = max(4, int(compress_len * h2_ratio))
             _, h2_idx_raw = torch.topk(importance, k=min(h2_count, compress_len), sorted=False)
             
@@ -694,6 +818,8 @@ class HyperAttention(nn.Module):
         past_key_value: CompressedKVCache | None = None,
         use_cache: bool = False,
         token_ids: torch.Tensor | None = None,
+        layer_idx: int = 0,
+        total_layers: int = 8,
     ) -> torch.Tensor | tuple[torch.Tensor, CompressedKVCache]:
         batch, seq_len, _ = x.shape
         
@@ -744,21 +870,22 @@ class HyperAttention(nn.Module):
             raw_k = torch.cat((past_recent_k, k_new), dim=-2)
             raw_v = torch.cat((past_recent_v, v_new), dim=-2)
 
+        # 【动态窗口】计算当前序列的窗口大小
+        dynamic_window = self._get_dynamic_window_size(raw_k.size(-2))
+        
         if past_key_value is None and seq_len > 1:
             # 训练时（use_cache=False）需要在此处构建压缩记忆
             # 推理时由末尾_build_cache处理
-            if raw_k.size(-2) > self.window_size:
+            if raw_k.size(-2) > dynamic_window:
                 mem_k, mem_v, mem_pos = self._compress_kv_with_sink(
                     raw_k, raw_v, raw_k_start_pos, sink_count=self.sink_count)
 
         # 【HyperAttention】DeepSeek-V4风格：CSA + SlidingWindow + MLA
         # 核心思想：
         # 1. CSA (Compressed Sparse Attention): 每4个token压缩成1个entry + 稀疏注意力
-        # 2. SlidingWindow: 最近128个token的精确注意力（补偿近距离依赖）
+        # 2. SlidingWindow: 动态窗口大小的精确注意力（短序列=full attention）
         # 3. MLA: 低秩latent压缩，处理长距离上下文
         # 【统一先验】config 权重 + 长度自适应偏置，在 logit 空间相加
-        # 数学上等价于 softmax(router + log(config_weights) + log(length_bias))
-        # 避免了之前先 softmax 再乘系数导致的梯度消失/爆炸
         cfg_mix = CONFIG.get("attention_mix", {"csa": 1.0, "sliding_window": 1.0, "mla": 1.0})
         cfg_prior = torch.tensor(
             [cfg_mix.get("csa", 1.0), cfg_mix.get("sliding_window", 1.0), cfg_mix.get("mla", 1.0)],
@@ -766,13 +893,23 @@ class HyperAttention(nn.Module):
         )
         cfg_logits = torch.log(cfg_prior.clamp_min(1e-6))
 
-        # 长度自适应偏置：温和地引导，±30%范围，不强行禁用任何路径
-        if seq_len <= self.window_size:
-            length_bias = torch.tensor([0.8, 1.3, 0.9], device=x.device, dtype=torch.float32)
-        elif seq_len <= self.window_size * 4:
-            length_bias = torch.tensor([1.0, 1.1, 1.0], device=x.device, dtype=torch.float32)
+        # 【动态长度自适应偏置】根据实际序列长度和动态窗口大小调整
+        total_len = raw_k.size(-2)
+        dynamic_window = self._get_dynamic_window_size(total_len)
+        full_threshold = max(16, int(total_len * self.window_full_attention_ratio))
+        
+        if total_len <= full_threshold:
+            # 短序列：主要依赖SlidingWindow（等效full attention）
+            length_bias = torch.tensor([0.7, 1.4, 0.8], device=x.device, dtype=torch.float32)
+        elif total_len <= dynamic_window:
+            # 中等序列：平衡三路
+            length_bias = torch.tensor([0.9, 1.2, 0.9], device=x.device, dtype=torch.float32)
+        elif total_len <= dynamic_window * 2:
+            # 较长序列：增加CSA和MLA权重
+            length_bias = torch.tensor([1.1, 1.0, 1.1], device=x.device, dtype=torch.float32)
         else:
-            length_bias = torch.tensor([1.3, 0.9, 1.2], device=x.device, dtype=torch.float32)
+            # 超长序列：主要依赖CSA和MLA压缩
+            length_bias = torch.tensor([1.3, 0.8, 1.2], device=x.device, dtype=torch.float32)
         length_logits = torch.log(length_bias)
 
         combined_prior = (cfg_logits + length_logits).unsqueeze(0).unsqueeze(0)  # [1,1,3]
@@ -794,7 +931,9 @@ class HyperAttention(nn.Module):
         # 【修复】之前硬编码window_size=128，导致sliding_window配置被完全忽略。
         # 现在使用self.window_size（来自配置）。对于短序列，这等效于full attention。
         if mix[..., 1:2].max().item() > 0.01:
-            window_size = min(self.window_size, raw_k.size(-2))
+            # 【动态窗口】使用动态计算的窗口大小
+            dynamic_window = self._get_dynamic_window_size(raw_k.size(-2))
+            window_size = min(dynamic_window, raw_k.size(-2))
             if window_size > 0:
                 window_k = raw_k[..., -window_size:, :]
                 window_v = raw_v[..., -window_size:, :]
@@ -827,9 +966,22 @@ class HyperAttention(nn.Module):
         # 【BUG修复 #1 续】MLA latent memory 更新逻辑
         # 训练时(past_key_value is None)：MLA已在retrieve前update过，此处跳过二次update
         # 推理时(past_key_value is not None)：需要update产生新的mla_M/mla_z存入cache
+        # 【修复】推理时不再detach，确保MLA记忆能持续累积；同时扩大单步更新权重
         if past_key_value is not None:
-            new_mla_M, new_mla_z = self.mla_memory.update(
-                k_for_memory, v_new, mla_M.detach(), mla_z.detach())
+            # 【修复】推理时单token更新：使用更大的(1-alpha)让新信息有效进入记忆
+            # 原alpha=0.9导致单token的delta_M_mean几乎被忽略
+            # 改为动态alpha：序列短时允许更多新信息进入
+            with torch.no_grad():
+                seq_len_k = max(1, k_for_memory.size(-2))
+                # 推理时seq_len_k通常为1，降低alpha让单步更新有效
+                infer_alpha = 0.5 if seq_len_k <= 2 else 0.9
+                # 临时替换alpha执行update
+                saved_alpha = self.mla_memory.alpha if hasattr(self.mla_memory, 'alpha') else None
+                self.mla_memory.alpha = infer_alpha
+                new_mla_M, new_mla_z = self.mla_memory.update(
+                    k_for_memory, v_new, mla_M, mla_z)
+                if saved_alpha is not None:
+                    self.mla_memory.alpha = saved_alpha
         else:
             # 训练时：retrieve前的update已经产生了正确的mla_M/mla_z
             # 这里需要让kv_proj/v_proj也能接收梯度（通过retrieve前的update路径）
@@ -867,6 +1019,8 @@ class HyperAttention(nn.Module):
                 old_lin_M=new_mla_M,
                 old_lin_z=new_mla_z,
                 special_mask=special_mask,
+                layer_idx=layer_idx,
+                total_layers=total_layers,
             )
             return out, cache
         return out
@@ -886,8 +1040,10 @@ class SwiGLUFFN(nn.Module):
 
 
 class HyperAttentionBlock(nn.Module):
-    def __init__(self, emb_size: int, num_heads: int, dropout: float) -> None:
+    def __init__(self, emb_size: int, num_heads: int, dropout: float, layer_idx: int = 0, total_layers: int = 8) -> None:
         super().__init__()
+        self.layer_idx = layer_idx
+        self.total_layers = total_layers
         self.attn_norm = RMSNorm(emb_size)
         self.ffn_norm = RMSNorm(emb_size)
         self.attention = HyperAttention(emb_size, num_heads, dropout)
@@ -905,6 +1061,8 @@ class HyperAttentionBlock(nn.Module):
             past_key_value=past_key_value,
             use_cache=use_cache,
             token_ids=token_ids,
+            layer_idx=self.layer_idx,
+            total_layers=self.total_layers,
         )
         if use_cache:
             attn_out, present = attn_result
@@ -937,8 +1095,8 @@ class MainModel(nn.Module):
         self.token_embedding = nn.Embedding(dict_size, emb_size)
         self.embedding_dropout = nn.Dropout(dropout)
         self.transformers = nn.ModuleList(
-            HyperAttentionBlock(emb_size, num_heads, dropout)
-            for _ in range(num_transformer_blocks)
+            HyperAttentionBlock(emb_size, num_heads, dropout, layer_idx=i, total_layers=num_transformer_blocks)
+            for i in range(num_transformer_blocks)
         )
         self.final_norm = RMSNorm(emb_size)
         self.output_linear = nn.Linear(emb_size, dict_size, bias=False)

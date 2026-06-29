@@ -4,12 +4,155 @@ import os
 import torch
 import time
 import logging
+import math
 from collections import Counter
 from config import CONFIG
 from model import MainModel
 from record import record_loss, evaluate_rl_readiness
 from tokenizer import TextTokenizer
 from rl import SelfRewardModel, LightweightPPO
+
+# ═══════════════════════════════════════════════════════
+# 全动态计算辅助函数
+# ═══════════════════════════════════════════════════════
+
+def _get_gpu_free_memory_ratio() -> float:
+    """获取GPU空闲显存比例（0.0-1.0）"""
+    if not torch.cuda.is_available():
+        return 1.0
+    try:
+        total = torch.cuda.get_device_properties(0).total_memory
+        reserved = torch.cuda.memory_reserved()
+        allocated = torch.cuda.memory_allocated()
+        # free = total - reserved + (reserved - allocated)  # 包含缓存
+        free = total - allocated
+        return max(0.0, min(1.0, free / total))
+    except:
+        return 1.0
+
+def _get_cpu_free_memory_ratio() -> float:
+    """获取CPU空闲内存比例（0.0-1.0）"""
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        return max(0.0, min(1.0, mem.available / mem.total))
+    except ImportError:
+        return 1.0
+
+def _estimate_question_complexity(text: str) -> float:
+    """估计问题复杂度（0.0-1.0）
+    
+    基于多种启发式特征：
+    - 问题长度
+    - 标点复杂度
+    - 关键词密度（为什么/如何/解释等）
+    - 代码/数学符号存在性
+    """
+    if not text:
+        return 0.0
+    
+    score = 0.0
+    
+    # 1. 长度因子（长尾分布，用对数压缩）
+    length_score = min(1.0, math.log1p(len(text)) / math.log1p(500))
+    score += length_score * 0.25
+    
+    # 2. 复杂标点密度（问号、分号、括号等）
+    complex_punct = sum(1 for c in text if c in '？?;；:：（）()[]{}')
+    punct_score = min(1.0, complex_punct / 5)
+    score += punct_score * 0.15
+    
+    # 3. 复杂关键词
+    complex_keywords = ['为什么', '如何', '解释', '比较', '分析', '推导', '证明', '优化', '设计', '实现']
+    keyword_count = sum(1 for kw in complex_keywords if kw in text)
+    keyword_score = min(1.0, keyword_count / 3)
+    score += keyword_score * 0.25
+    
+    # 4. 代码/数学符号
+    code_math_symbols = sum(1 for c in text if c in '`=+-*/<>[]{}|&^%~')
+    code_score = min(1.0, code_math_symbols / 10)
+    score += code_score * 0.2
+    
+    # 5. 句子数量（多句子通常更复杂）
+    sentence_count = text.count('。') + text.count('.') + text.count('？') + text.count('?')
+    sentence_score = min(1.0, sentence_count / 5)
+    score += sentence_score * 0.15
+    
+    return max(0.0, min(1.0, score))
+
+def _compute_repeat_score(token_history: List[int]) -> float:
+    """计算重复模式得分（0.0-1.0）
+    
+    基于最近生成token的重复程度。
+    0.0 = 无重复，1.0 = 严重重复
+    """
+    if len(token_history) < 8:
+        return 0.0
+    
+    # 检测2-gram、3-gram、4-gram的连续重复
+    max_repeat_score = 0.0
+    for n in [2, 3, 4]:
+        if len(token_history) >= n * 3:
+            last_n = tuple(token_history[-n:])
+            prev_n = tuple(token_history[-(n*2):-n])
+            prev_n2 = tuple(token_history[-(n*3):-(n*2)])
+            if last_n == prev_n == prev_n2:
+                # 3次连续重复，得分基于n-gram长度
+                max_repeat_score = max(max_repeat_score, n / 4.0)
+    
+    # 检测局部重复率（最近32个token中唯一token的比例）
+    recent = token_history[-32:]
+    if len(recent) >= 8:
+        unique_ratio = len(set(recent)) / len(recent)
+        # unique_ratio越低，重复越严重
+        repeat_score = max(0.0, 1.0 - unique_ratio * 2.0)
+        max_repeat_score = max(max_repeat_score, repeat_score)
+    
+    return min(1.0, max_repeat_score)
+
+def _compute_diversity_score(token_history: List[int]) -> float:
+    """计算N-gram多样性得分（0.0-1.0）
+    
+    基于最近生成token的多样性。
+    1.0 = 非常多样，0.0 = 完全重复
+    """
+    if len(token_history) < 8:
+        return 1.0
+    
+    recent = token_history[-64:]
+    if len(recent) < 8:
+        return 1.0
+    
+    # 计算2-gram、3-gram、4-gram的唯一比例
+    diversity_scores = []
+    for n in [2, 3, 4]:
+        if len(recent) >= n + 4:
+            ngrams = [tuple(recent[i:i+n]) for i in range(len(recent) - n + 1)]
+            if ngrams:
+                unique_ratio = len(set(ngrams)) / len(ngrams)
+                diversity_scores.append(unique_ratio)
+    
+    if not diversity_scores:
+        return 1.0
+    
+    return max(0.0, min(1.0, sum(diversity_scores) / len(diversity_scores)))
+
+def _compute_entropy_trend(entropy_history: List[float]) -> float:
+    """计算熵趋势（最近几步的平均变化）
+    
+    正值：熵在增加（生成变得更多样）
+    负值：熵在减少（生成变得更确定/可能重复）
+    """
+    if len(entropy_history) < 5:
+        return 0.0
+    
+    recent = entropy_history[-10:]
+    if len(recent) < 3:
+        return 0.0
+    
+    # 计算线性趋势（简单差分平均）
+    diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
+    return sum(diffs) / len(diffs)
 
 
 # 【显存优化】设置 PyTorch CUDA 内存分配策略，避免显存碎片化
@@ -129,6 +272,14 @@ loss_func = torch.nn.CrossEntropyLoss()
 
 # 梯度累积步数
 GRADIENT_ACCUMULATION_STEPS = int(CONFIG.get("gradient_accumulation_steps", 4))
+
+# 学习率调度器步进间隔（Gemini修复：防止SGDR震荡过于频繁）
+LR_SCHEDULER_STEP_INTERVAL = int(CONFIG.get("lr_scheduler_step_interval", 4))
+
+# PPO配置（Gemini修复：增加episode收集量，减少方差）
+RL_MIN_EPISODES = int(CONFIG.get("rl_min_episodes", 32))
+RL_UPDATE_BATCH_SIZE = int(CONFIG.get("rl_update_batch_size", 8))
+RL_UPDATE_INTERVAL = int(CONFIG.get("rl_update_interval", 4))
 
 # 训练轮数计数器
 training_rounds = 0
@@ -253,12 +404,43 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     if not text or not isinstance(text, str):
         return "无效输入"
     
-    # None 表示无限制生成，由模型自己决定何时结束（通过 END_TOKEN）
-    # 设置一个绝对上限防止极端情况下的死循环（如模型始终不输出 END_TOKEN）
-    absolute_max_tokens = 4096  # 绝对安全上限
+    # 【全动态生成长度】运行时根据多因素动态计算最大生成长度
+    # 基于：问题长度、问题复杂度、GPU空闲显存、CPU空闲内存、历史生成熵趋势
+    question_len = len(text) if text else 0
+    
+    # 1. 计算问题复杂度（基于字符特征）
+    complexity_score = _estimate_question_complexity(text)
+    
+    # 2. 获取硬件状态
+    gpu_free_ratio = _get_gpu_free_memory_ratio()
+    cpu_free_ratio = _get_cpu_free_memory_ratio()
+    
+    # 3. 动态计算基础长度
+    gen_len_base_ratio = float(CONFIG.get("gen_len_base_ratio", 8.0))
+    gen_len_complexity_factor = float(CONFIG.get("gen_len_complexity_factor", 1.5))
+    gen_len_memory_sensitivity = float(CONFIG.get("gen_len_memory_sensitivity", 0.3))
+    gen_len_entropy_sensitivity = float(CONFIG.get("gen_len_entropy_sensitivity", 0.5))
+    
+    # 基础长度 = 问题长度 * 基础倍数 * 复杂度因子
+    base_len = question_len * gen_len_base_ratio * (1.0 + complexity_score * (gen_len_complexity_factor - 1.0))
+    
+    # 显存调节：显存紧张时降低长度
+    memory_factor = 1.0 - (1.0 - gpu_free_ratio) * gen_len_memory_sensitivity
+    memory_factor *= 1.0 - (1.0 - cpu_free_ratio) * gen_len_memory_sensitivity * 0.5
+    
+    # 动态长度
+    dynamic_max_len = int(base_len * memory_factor)
+    
+    # 绝对边界保护
+    gen_min = int(CONFIG.get("gen_len_min_absolute", 64))
+    gen_max = int(CONFIG.get("gen_len_max_absolute", 4096))
+    dynamic_max_len = max(gen_min, min(gen_max, dynamic_max_len))
+    
+    # 设置绝对上限防止极端情况下的死循环
+    absolute_max_tokens = min(4096, dynamic_max_len * 2)
     has_token_limit = max_generate_tokens is not None
     if max_generate_tokens is None:
-        max_generate_tokens = absolute_max_tokens  # 无限制时使用绝对上限作为安全网
+        max_generate_tokens = dynamic_max_len
     
     model.eval()
     output_text = ""
@@ -285,10 +467,29 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
     max_generate_tokens = max(1, int(max_generate_tokens))
     
-    temperature = float(CONFIG.get("temperature", 0.5))
-    min_p = float(CONFIG.get("min_p", 0.05))
-    repetition_penalty = float(CONFIG.get("repetition_penalty", 1.02))
-    force_answer_min_steps = int(CONFIG.get("force_answer_min_steps", 16))
+    # 【全动态EDT温度】系数
+    temp_base = float(CONFIG.get("temp_base", 0.7))
+    temp_entropy_scale = float(CONFIG.get("temp_entropy_scale", 0.4))
+    temp_repetition_sensitivity = float(CONFIG.get("temp_repetition_sensitivity", 0.6))
+    temp_length_decay = float(CONFIG.get("temp_length_decay", 0.001))
+    temp_min_clip = float(CONFIG.get("temp_min_clip", 0.3))
+    temp_max_clip = float(CONFIG.get("temp_max_clip", 1.5))
+    enable_edt = bool(CONFIG.get("enable_edt", True))
+    
+    min_p = float(CONFIG.get("min_p", 0.04))
+    top_k = int(CONFIG.get("top_k", 50))
+    
+    # 【全动态重复惩罚】系数
+    rep_penalty_scale = float(CONFIG.get("rep_penalty_scale", 0.15))
+    rep_penalty_length_factor = float(CONFIG.get("rep_penalty_length_factor", 0.002))
+    rep_penalty_repeat_sensitivity = float(CONFIG.get("rep_penalty_repeat_sensitivity", 2.0))
+    rep_penalty_entropy_factor = float(CONFIG.get("rep_penalty_entropy_factor", 0.8))
+    
+    # 【全动态强制回答步数】运行时计算
+    force_answer_scale = float(CONFIG.get("force_answer_scale", 1.2))
+    force_answer_min_absolute = int(CONFIG.get("force_answer_min_absolute", 16))
+    force_answer_complexity_exp = float(CONFIG.get("force_answer_complexity_exp", 0.5))
+    force_answer_min_steps = max(force_answer_min_absolute, int(question_len * force_answer_scale * (1.0 + complexity_score ** force_answer_complexity_exp)))
 
     with torch.inference_mode():
         thinking_started = False
@@ -312,6 +513,9 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         # 【修复】使用滑动窗口替代累积 Counter，防止长生成时过度惩罚
         generated_tokens = Counter()
         _token_history = []  # 记录最近生成的 token 序列
+        _entropy_history = []  # 【全动态】记录生成过程中的熵历史
+        # 【修复】累积完整的生成token序列，用于在推理时构建正确的special_mask保护特殊Token
+        _full_generated_ids = []
         
         # 【修复】如果启用了思维链且模型没有自己生成THINK_START，强制注入
         if thinking_available and not thinking_started:
@@ -355,30 +559,92 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     force_answer_steps -= 1
 
-                # 【BUG #2修复】Repetition penalty + Frequency penalty 双重防重复
-                # Repetition penalty: 乘法惩罚，对已出现的token施加倍率惩罚
-                # Frequency penalty: 加法惩罚，每次出现减去固定值，更平滑有效
+                # 【BUG #2修复】Repetition penalty + Frequency penalty + N-gram阻断 三重防重复
                 frequency_penalty = float(CONFIG.get("frequency_penalty", 0.3))
                 
+                # 【全动态重复惩罚】运行时计算惩罚强度
+                current_len = len(_token_history)
+                
+                # 1. 计算重复模式得分（0.0-1.0）
+                repeat_score = _compute_repeat_score(_token_history)
+                
+                # 2. 计算N-gram多样性得分（0.0-1.0，越高越多样）
+                diversity_score = _compute_diversity_score(_token_history)
+                
+                # 3. 计算熵趋势（最近10步的平均熵变化）
+                entropy_trend = _compute_entropy_trend(_entropy_history)
+                
+                # 4. 全动态惩罚公式
+                # penalty = 1.0 + scale * (length_factor + repeat_sensitivity * repeat_score - entropy_factor * entropy_trend)
+                length_factor = min(1.0, current_len * rep_penalty_length_factor)
+                repetition_penalty = 1.0 + rep_penalty_scale * (
+                    length_factor 
+                    + rep_penalty_repeat_sensitivity * repeat_score 
+                    - rep_penalty_entropy_factor * max(0, entropy_trend)
+                )
+                # 多样性调节：多样性低时增强惩罚
+                repetition_penalty *= 1.0 + (1.0 - diversity_score) * 0.5
+                
+                # 裁剪到合理范围
+                repetition_penalty = max(1.0, min(2.0, repetition_penalty))
+                
                 if repetition_penalty > 1.0 and len(_token_history) > 0:
-                    window_size = 64
+                    # 动态惩罚窗口：基于生成长度
+                    window_size = min(128, max(32, current_len // 2))
                     recent_tokens = _token_history[-window_size:]
                     recent_counter = Counter(recent_tokens)
                     for token_id, count in recent_counter.items():
                         if token_id < next_logits.size(0):
-                            # Repetition penalty (乘法)
+                            # Repetition penalty (乘法) - 使用对数衰减避免过度惩罚
                             penalty = repetition_penalty ** min(count, 3)
                             if next_logits[token_id] > 0:
                                 next_logits[token_id] /= penalty
                             else:
                                 next_logits[token_id] *= penalty
-                            # Frequency penalty (加法) - 每次出现减去固定值
+                            # Frequency penalty (加法) - 上限3次
                             if frequency_penalty > 0:
-                                next_logits[token_id] -= frequency_penalty * min(count, 5)
+                                next_logits[token_id] -= frequency_penalty * min(count, 3)
+
+                # 【新增】N-gram重复阻断
+                if len(_token_history) >= 8:
+                    for n in [2, 3, 4]:
+                        if len(_token_history) >= n * 3:
+                            last_n = tuple(_token_history[-n:])
+                            prev_n = tuple(_token_history[-(n*2):-n])
+                            prev_n2 = tuple(_token_history[-(n*3):-(n*2)])
+                            if last_n == prev_n == prev_n2:
+                                repeat_token = last_n[-1]
+                                if repeat_token < next_logits.size(0):
+                                    next_logits[repeat_token] = float("-inf")
+
+                # 【全动态EDT温度】基于多因素的temperature计算
+                raw_probs = torch.softmax(next_logits, dim=-1)
+                entropy = -(raw_probs * torch.log(raw_probs + 1e-10)).sum().item()
+                _entropy_history.append(entropy)
+                
+                if enable_edt:
+                    # 多因素temperature：
+                    # temp = base + entropy_scale * (target_entropy - entropy) - length_decay * current_len - repetition_sensitivity * repeat_score
+                    target_entropy = 1.0  # 目标熵值
+                    temperature = temp_base + temp_entropy_scale * (target_entropy - entropy)
+                    # 长度衰减：长生成时降低温度稳定输出
+                    temperature -= temp_length_decay * current_len
+                    # 重复敏感度：检测到重复时提高温度打破循环
+                    temperature += temp_repetition_sensitivity * repeat_score
+                    # 裁剪
+                    temperature = max(temp_min_clip, min(temp_max_clip, temperature))
+                else:
+                    temperature = temp_base
 
                 # Min-p 采样（修复版：内部已处理temperature）
                 if min_p > 0.0:
                     next_logits = _min_p_sampling(next_logits, min_p, temperature)
+
+                # 【新增】top-k过滤：限制采样范围，防止选中极低概率token
+                if top_k > 0:
+                    vals, indices = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                    next_logits = torch.full_like(next_logits, float("-inf"))
+                    next_logits[indices] = vals
 
                 # 直接从处理后的logits计算概率（不再重复除temperature）
                 probs = torch.softmax(next_logits, dim=-1)
@@ -453,6 +719,9 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 ):
                     generated_tokens[index] += 1
                     _token_history.append(index)  # 【修复】同时记录到滑动窗口历史
+                
+                # 【修复】累积完整token历史（包含特殊Token），用于构建special_mask
+                _full_generated_ids.append(index)
 
                 # 下一步
                 next_token = torch.tensor([index], device=device)
@@ -512,9 +781,23 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     
-                    # 【BUG #2修复】Repetition penalty + Frequency penalty（与主循环一致）
+                    # 【全动态重复惩罚】与主循环一致
+                    current_len = len(_token_history)
+                    repeat_score = _compute_repeat_score(_token_history)
+                    diversity_score = _compute_diversity_score(_token_history)
+                    entropy_trend = _compute_entropy_trend(_entropy_history)
+                    
+                    length_factor = min(1.0, current_len * rep_penalty_length_factor)
+                    repetition_penalty = 1.0 + rep_penalty_scale * (
+                        length_factor 
+                        + rep_penalty_repeat_sensitivity * repeat_score 
+                        - rep_penalty_entropy_factor * max(0, entropy_trend)
+                    )
+                    repetition_penalty *= 1.0 + (1.0 - diversity_score) * 0.5
+                    repetition_penalty = max(1.0, min(2.0, repetition_penalty))
+                    
                     if repetition_penalty > 1.0 and len(_token_history) > 0:
-                        window_size = 64
+                        window_size = min(128, max(32, current_len // 2))
                         recent_tokens = _token_history[-window_size:]
                         recent_counter = Counter(recent_tokens)
                         for token_id, count in recent_counter.items():
@@ -525,11 +808,43 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                                 else:
                                     next_logits[token_id] *= penalty
                                 if frequency_penalty > 0:
-                                    next_logits[token_id] -= frequency_penalty * min(count, 5)
+                                    next_logits[token_id] -= frequency_penalty * min(count, 3)
+
+                    # 【新增】N-gram重复阻断（强制回答阶段同样需要）
+                    if len(_token_history) >= 8:
+                        for n in [2, 3, 4]:
+                            if len(_token_history) >= n * 3:
+                                last_n = tuple(_token_history[-n:])
+                                prev_n = tuple(_token_history[-(n*2):-n])
+                                prev_n2 = tuple(_token_history[-(n*3):-(n*2)])
+                                if last_n == prev_n == prev_n2:
+                                    repeat_token = last_n[-1]
+                                    if repeat_token < next_logits.size(0):
+                                        next_logits[repeat_token] = float("-inf")
+                    
+                    # 【全动态EDT温度】强制回答阶段同样使用
+                    raw_probs = torch.softmax(next_logits, dim=-1)
+                    entropy = -(raw_probs * torch.log(raw_probs + 1e-10)).sum().item()
+                    _entropy_history.append(entropy)
+                    
+                    if enable_edt:
+                        target_entropy = 1.0
+                        temperature = temp_base + temp_entropy_scale * (target_entropy - entropy)
+                        temperature -= temp_length_decay * current_len
+                        temperature += temp_repetition_sensitivity * repeat_score
+                        temperature = max(temp_min_clip, min(temp_max_clip, temperature))
+                    else:
+                        temperature = temp_base
                     
                     # Min-p（修复版：内部已处理temperature）
                     if min_p > 0.0:
                         next_logits = _min_p_sampling(next_logits, min_p, temperature)
+                    
+                    # 【新增】top-k过滤（强制回答阶段同样需要）
+                    if top_k > 0:
+                        vals, indices = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+                        next_logits = torch.full_like(next_logits, float("-inf"))
+                        next_logits[indices] = vals
                     
                     probs = torch.softmax(next_logits, dim=-1)
                     
@@ -705,8 +1020,12 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                 answer_text=answer if answer else "",
                 context=history_context
             )
-            if training_rounds > 0 and (training_rounds % 4) == 0:
-                ppo_update_result = ppo_trainer.update_policy(batch_size=4)
+            # 【Gemini修复】收集足够episode后才更新策略，减少优势函数方差
+            # 条件：1) 训练轮数>0  2) 到达检查间隔  3) episode数>=最小阈值
+            if (training_rounds > 0 and 
+                (training_rounds % RL_UPDATE_INTERVAL) == 0 and
+                len(ppo_trainer.episode_data['rewards']) >= RL_MIN_EPISODES):
+                ppo_update_result = ppo_trainer.update_policy(batch_size=RL_UPDATE_BATCH_SIZE)
 
                 # 每100步打印一次 RL 状态
                 if training_rounds % 100 == 0:
@@ -745,14 +1064,61 @@ def _detach_kv_cache(past_kv):
     return detached
 
 
-def _estimate_safe_chunk_size(free_bytes: float, safety_factor: float = 0.7) -> int:
-    """根据当前空闲显存动态估算安全的分块大小（token数）。"""
+def _estimate_safe_chunk_size(seq_len: int = 0) -> int:
+    """全动态分块大小计算
+    
+    基于：
+    1. GPU总显存和已用显存
+    2. CPU空闲内存
+    3. 序列长度
+    4. 系统负载
+    
+    没有任何固定值，完全运行时计算。
+    """
     emb_size = int(CONFIG.get("emb_size", 512))
     num_layers = int(CONFIG.get("num_transformer_blocks", 8))
-    bytes_per_token = emb_size * num_layers * 8  # 含注意力开销
-    safe_bytes = free_bytes * safety_factor
-    chunk_size = max(128, int(safe_bytes / bytes_per_token))
-    return min(chunk_size, 2048)
+    bytes_per_token = emb_size * num_layers * 8
+    
+    # 获取硬件状态
+    gpu_free_ratio = _get_gpu_free_memory_ratio()
+    cpu_free_ratio = _get_cpu_free_memory_ratio()
+    
+    # 获取配置系数
+    chunk_memory_ratio = float(CONFIG.get("chunk_memory_ratio", 0.15))
+    chunk_seq_len_factor = float(CONFIG.get("chunk_seq_len_factor", 0.3))
+    chunk_min_absolute = int(CONFIG.get("chunk_min_absolute", 128))
+    chunk_max_ratio = float(CONFIG.get("chunk_max_ratio", 0.5))
+    chunk_cpu_pressure_factor = float(CONFIG.get("chunk_cpu_pressure_factor", 0.2))
+    
+    # 计算可用显存
+    if torch.cuda.is_available():
+        total_memory = torch.cuda.get_device_properties(0).total_memory
+        free_memory = total_memory * gpu_free_ratio
+    else:
+        free_memory = 8 * 1024**3  # 默认8GB
+    
+    # 显存因子
+    memory_factor = gpu_free_ratio * (1.0 - (1.0 - cpu_free_ratio) * chunk_cpu_pressure_factor)
+    
+    # 计算chunk大小
+    # 1. 基于显存
+    mem_based_chunk = int(free_memory * chunk_memory_ratio * memory_factor / bytes_per_token)
+    
+    # 2. 基于序列长度
+    seq_based_chunk = int(seq_len * chunk_seq_len_factor)
+    
+    # 取两者较小值，但不超过seq_len的max_ratio
+    chunk_size = min(mem_based_chunk, seq_based_chunk)
+    chunk_size = min(chunk_size, int(seq_len * chunk_max_ratio))
+    
+    # 绝对边界
+    chunk_size = max(chunk_min_absolute, chunk_size)
+    
+    # 如果seq_len很短，尝试完整序列
+    if seq_len > 0 and seq_len < chunk_min_absolute * 2:
+        chunk_size = max(chunk_size, seq_len)
+    
+    return chunk_size
 
 
 def _chunked_forward_backward(
@@ -1008,8 +1374,15 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         torch.cuda.synchronize()
         return float('inf')
 
-    # ── 策略选择：估算此序列所需显存 ──
-    safe_chunk = _estimate_safe_chunk_size(free_bytes, safety_factor=0.65)
+    # ── 策略选择：全动态计算分块大小 ──
+    # 【全动态分块】基于实时硬件状态计算
+    safe_chunk = _estimate_safe_chunk_size(seq_len)
+    
+    # 【全动态overlap】基于chunk_size和序列长度动态计算
+    chunk_overlap_base = int(CONFIG.get("chunk_overlap_base", 32))
+    chunk_overlap_scale = float(CONFIG.get("chunk_overlap_scale", 0.02))
+    overlap = int(chunk_overlap_base + safe_chunk * chunk_overlap_scale)
+    overlap = min(overlap, safe_chunk // 4)  # overlap不超过chunk的1/4
 
     try:
         if seq_len <= safe_chunk:
@@ -1049,8 +1422,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
 
         else:
             # ✅ 策略 2: MLA压缩上下文分段训练（CSA+H2O+MLA三路压缩）
-            chunk_size = min(safe_chunk, int(CONFIG.get("max_forward_chunk", 512)))
-            overlap = int(CONFIG.get("dynamic_segment_overlap", 32))
+            chunk_size = safe_chunk
 
             print(f"[Memory] MLA压缩上下文训练: seq={seq_len}, chunk={chunk_size}, overlap={overlap}, "
                   f"free={free_bytes/1024**3:.2f}GB (CSA+H2O+MLA三路压缩)", flush=True)
@@ -1107,7 +1479,9 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         # 【修复】step 条件统一为 % GAS == 0
         if (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0:
             optimizer_step_count += 1
-            current_lr = lr_scheduler.step(loss=raw_loss_val)
+            # 【Gemini修复】每N个optimizer step才更新一次学习率，防止SGDR震荡过于频繁
+            if optimizer_step_count % LR_SCHEDULER_STEP_INTERVAL == 0:
+                current_lr = lr_scheduler.step(loss=raw_loss_val)
 
         # Preview 输出
         if show_preview:
