@@ -99,6 +99,7 @@ CONFIG: Dict[str, Any] = {
     "min_p": 0.04,
     "top_k": 0,                       # 关闭top-k，完全依赖min-p采样（与旧版一致）
     "top_p": 1.0,
+    "force_thinking_chain": True,     # True=强制注入THINK_START(确保思维链), False=让模型自己决定
 
     # ═══════════════════════════════════════════════════════
     # 6️⃣ 生成质量控制（全动态惩罚）
@@ -210,13 +211,43 @@ CONFIG: Dict[str, Any] = {
     "multi_gpu": False,
     "attention_sink_count": 4,
     "use_compile_generate": False,
-    "eos_token_id": 1,
-    "pad_token_id": 0,
-    "unk_token_id": 2,
-    "bos_token_id": 3,
-    "system_token_id": 4,
-    "user_token_id": 5,
-    "assistant_token_id": 6,
-    "think_token_id": 7,
-    "answer_token_id": 8,
 }
+
+
+def validate_config(cfg: Dict[str, Any]) -> list[str]:
+    """运行时配置校验，返回警告列表"""
+    warnings = []
+    
+    emb_size = int(cfg.get("emb_size", 512))
+    num_heads = int(cfg.get("num_heads", 8))
+    if emb_size % num_heads != 0:
+        warnings.append(f"emb_size({emb_size}) must be divisible by num_heads({num_heads})")
+    
+    dict_size = int(cfg.get("dict_size", 60000))
+    if dict_size < 10:
+        warnings.append(f"dict_size({dict_size}) is too small, must be >= 10")
+    
+    num_blocks = int(cfg.get("num_transformer_blocks", 8))
+    if num_blocks < 1:
+        warnings.append(f"num_transformer_blocks({num_blocks}) must be >= 1")
+    
+    lr = float(cfg.get("base_learning_rate", 3e-4))
+    if lr <= 0 or lr > 0.1:
+        warnings.append(f"base_learning_rate({lr}) out of reasonable range (0, 0.1]")
+    
+    dropout = float(cfg.get("dropout", 0.05))
+    if dropout < 0 or dropout >= 1:
+        warnings.append(f"dropout({dropout}) must be in [0, 1)")
+    
+    gen_max = int(cfg.get("gen_len_max_absolute", 4096))
+    gen_min = int(cfg.get("gen_len_min_absolute", 256))
+    if gen_min > gen_max:
+        warnings.append(f"gen_len_min_absolute({gen_min}) > gen_len_max_absolute({gen_max})")
+    
+    return warnings
+
+
+_config_warnings = validate_config(CONFIG)
+if _config_warnings:
+    for w in _config_warnings:
+        print(f"[Config Warning] {w}", flush=True)

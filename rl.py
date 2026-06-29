@@ -596,12 +596,8 @@ class LightweightPPO:
                     torch.tensor([0.0], device=self.device)
                 )
         else:
-            self.episode_data['log_probs'].append(
-                torch.tensor([0.0], device=self.device)
-            )
-            self.episode_data['entropies'].append(
-                torch.tensor([0.0], device=self.device)
-            )
+            self.episode_data['log_probs'].append(None)
+            self.episode_data['entropies'].append(None)
 
         return total_reward, reward_breakdown
     
@@ -680,18 +676,41 @@ class LightweightPPO:
             return torch.tensor(0.0, device=self.device)
         return token_lps.mean()
     
-    def compute_advantages(self, rewards: List[float]) -> List[float]:
-        """计算优势函数"""
-        advantages = []
-        returns = 0
-        
-        for reward in reversed(rewards):
-            returns = reward + self.gamma * returns
-            advantages.insert(0, returns)
-        
+    def compute_advantages(self, rewards: List[float], values: List[float] = None) -> List[float]:
+        """计算优势函数（GAE - Generalized Advantage Estimation）
+
+        当 values 可用时，使用 GAE(λ) 降低方差：
+          A_t = Σ_{l=0}^{T-t} (γλ)^l δ_{t+l}
+          δ_t = r_t + γ V(s_{t+1}) - V(s_t)
+
+        当 values 不可用时，退化为带 baseline 的折扣累积奖励：
+          A_t = G_t - mean(G)，其中 G_t = Σ_{l=0}^{T-t} γ^l r_{t+l}
+        """
+        if not rewards:
+            return []
+
+        if values is not None and len(values) == len(rewards) and any(v != 0.0 for v in values):
+            lam = 0.95
+            advantages = []
+            gae = 0.0
+            for t in reversed(range(len(rewards))):
+                if t == len(rewards) - 1:
+                    next_value = 0.0
+                else:
+                    next_value = values[t + 1]
+                delta = rewards[t] + self.gamma * next_value - values[t]
+                gae = delta + self.gamma * lam * gae
+                advantages.insert(0, gae)
+        else:
+            advantages = []
+            returns = 0
+            for reward in reversed(rewards):
+                returns = reward + self.gamma * returns
+                advantages.insert(0, returns)
+
         advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+
         return advantages.tolist()
     
     def update_policy(self, batch_size: int = 4) -> Dict[str, float]:
@@ -734,8 +753,11 @@ class LightweightPPO:
             epoch_update_count = 0
             
             for idx in high_reward_indices:
-                old_token_lps = self.episode_data['log_probs'][idx]  # (G,) 或标量占位
+                old_token_lps = self.episode_data['log_probs'][idx]
                 advantage = advantages_raw[idx]
+                
+                if old_token_lps is None:
+                    continue
                 
                 if not isinstance(old_token_lps, torch.Tensor):
                     old_token_lps = torch.tensor([old_token_lps], device=self.device, dtype=torch.float32)
@@ -1018,10 +1040,18 @@ class TreeReinforcementLearning:
             
             for child in new_children:
                 child_tokens = child.get_path()
+                think_tokens = None
+                if thinking_available:
+                    try:
+                        think_end_idx = child_tokens.index(TextTokenizer.THINK_END_TOKEN)
+                        think_tokens = child_tokens[:think_end_idx + 1]
+                    except ValueError:
+                        think_tokens = child_tokens
                 reward = self.evaluate_node(
                     child,
                     prompt_tokens,
                     child_tokens,
+                    think_tokens=think_tokens,
                     context=context
                 )
                 child.reward = reward
@@ -1033,8 +1063,19 @@ class TreeReinforcementLearning:
         
         generated_text = TextTokenizer.decode(torch.tensor(best_tokens))
         
+        think_text = None
+        answer_text = generated_text
+        if thinking_available:
+            try:
+                think_end_idx = best_tokens.index(TextTokenizer.THINK_END_TOKEN)
+                think_text = TextTokenizer.decode(torch.tensor(best_tokens[:think_end_idx + 1]))
+                answer_text = TextTokenizer.decode(torch.tensor(best_tokens[think_end_idx + 1:]))
+            except ValueError:
+                pass
+        
         total_reward, reward_breakdown = self.reward_model.compute_total_reward(
-            answer_text=generated_text,
+            think_text=think_text,
+            answer_text=answer_text,
             context=context
         )
         
@@ -1131,8 +1172,19 @@ class TreeReinforcementLearning:
                         full_tokens = prompt_tokens.tolist() + new_beam['tokens']
                         generated_text = TextTokenizer.decode(torch.tensor(full_tokens))
                         
+                        think_text = None
+                        answer_text = generated_text
+                        if thinking_available:
+                            try:
+                                think_end_idx = new_beam['tokens'].index(TextTokenizer.THINK_END_TOKEN)
+                                think_text = TextTokenizer.decode(torch.tensor(new_beam['tokens'][:think_end_idx + 1]))
+                                answer_text = TextTokenizer.decode(torch.tensor(new_beam['tokens'][think_end_idx + 1:]))
+                            except ValueError:
+                                pass
+                        
                         total_reward, _ = self.reward_model.compute_total_reward(
-                            answer_text=generated_text,
+                            think_text=think_text,
+                            answer_text=answer_text,
                             context=context
                         )
                         new_beam['reward'] = total_reward
@@ -1153,8 +1205,19 @@ class TreeReinforcementLearning:
         
         generated_text = TextTokenizer.decode(torch.tensor(best_tokens))
         
+        think_text = None
+        answer_text = generated_text
+        if thinking_available:
+            try:
+                think_end_idx = best_tokens.index(TextTokenizer.THINK_END_TOKEN)
+                think_text = TextTokenizer.decode(torch.tensor(best_tokens[:think_end_idx + 1]))
+                answer_text = TextTokenizer.decode(torch.tensor(best_tokens[think_end_idx + 1:]))
+            except ValueError:
+                pass
+        
         total_reward, reward_breakdown = self.reward_model.compute_total_reward(
-            answer_text=generated_text,
+            think_text=think_text,
+            answer_text=answer_text,
             context=context
         )
         

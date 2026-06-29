@@ -156,20 +156,22 @@ class RMSNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
+        self._nan_warned = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         output = x * norm * self.weight
-        # 检查 NaN/Inf，避免传播到后续层
         if torch.isnan(output).any() or torch.isinf(output).any():
             output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
-            # 仅在训练时打印警告，避免推理时输出干扰
-            if self.training:
+            if self.training and not self._nan_warned:
+                self._nan_warned = True
                 print(
                     f"[Warning] RMSNorm detected NaN/Inf; clamped output to safe range. "
                     f"input_min={x.min().item():.3f}, input_max={x.max().item():.3f}",
                     flush=True,
                 )
+        elif self._nan_warned:
+            self._nan_warned = False
         return output
 
 
@@ -324,7 +326,7 @@ class HyperAttention(nn.Module):
             allocated = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0.0
             reserved = torch.cuda.memory_reserved() / torch.cuda.get_device_properties(0).total_memory
             return max(allocated, reserved)
-        except:
+        except (RuntimeError, ValueError):
             return 0.0
 
     def _get_dynamic_window_size(self, seq_len: int) -> int:
@@ -960,32 +962,13 @@ class HyperAttention(nn.Module):
         if out_accum is None:
             out_accum = torch.zeros(batch, seq_len, self.emb_size, device=x.device, dtype=x.dtype)
 
-        # 释放 q 引用
         del q
 
-        # 【BUG修复 #1 续】MLA latent memory 更新逻辑
-        # 训练时(past_key_value is None)：MLA已在retrieve前update过，此处跳过二次update
-        # 推理时(past_key_value is not None)：需要update产生新的mla_M/mla_z存入cache
-        # 【修复】推理时不再detach，确保MLA记忆能持续累积；同时扩大单步更新权重
         if past_key_value is not None:
-            # 【修复】推理时单token更新：使用更大的(1-alpha)让新信息有效进入记忆
-            # 原alpha=0.9导致单token的delta_M_mean几乎被忽略
-            # 改为动态alpha：序列短时允许更多新信息进入
             with torch.no_grad():
-                seq_len_k = max(1, k_for_memory.size(-2))
-                # 推理时seq_len_k通常为1，降低alpha让单步更新有效
-                infer_alpha = 0.5 if seq_len_k <= 2 else 0.9
-                # 临时替换alpha执行update
-                saved_alpha = self.mla_memory.alpha if hasattr(self.mla_memory, 'alpha') else None
-                self.mla_memory.alpha = infer_alpha
                 new_mla_M, new_mla_z = self.mla_memory.update(
                     k_for_memory, v_new, mla_M, mla_z)
-                if saved_alpha is not None:
-                    self.mla_memory.alpha = saved_alpha
         else:
-            # 训练时：retrieve前的update已经产生了正确的mla_M/mla_z
-            # 这里需要让kv_proj/v_proj也能接收梯度（通过retrieve前的update路径）
-            # retrieve前的update使用了k_new/v_new（未detach），梯度可以回传
             new_mla_M = mla_M
             new_mla_z = mla_z
 
@@ -1255,7 +1238,7 @@ class MainModel(nn.Module):
                 x, present = block(x, past_key_value=past, use_cache=True, token_ids=tokens)
                 next_key_values.append(present)
         else:
-            use_gc = bool(CONFIG.get("use_gradient_checkpointing", True))
+            use_gc = bool(CONFIG.get("use_gradient_checkpointing", False))
             for block in self.transformers:
                 if self.training and use_gc:
                     # 【修复】传递token_ids用于特殊Token保护

@@ -43,27 +43,51 @@ class StreamingDataset:
         logging.info(f"Indexed {self.total_entries} total entries across {len(self.dataset_files)} files")
     
     def _count_entries_in_file(self, file_path: str) -> int:
-        """快速统计文件中的有效条目数"""
+        """快速统计文件中的有效条目数（流式解析，避免全量加载到内存）"""
         try:
+            count = 0
             with open(file_path, "r", encoding="utf-8") as f:
                 try:
-                    data = json.load(f)
+                    in_array = False
+                    brace_depth = 0
+                    buffer = ""
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        if not in_array:
+                            if line.startswith("["):
+                                in_array = True
+                            continue
+                        if line.startswith("]"):
+                            break
+                        if line.startswith("{"):
+                            brace_depth += 1
+                            buffer = line
+                        elif brace_depth > 0:
+                            buffer += line
+                            if "}" in line:
+                                brace_depth -= 1
+                                if brace_depth == 0:
+                                    try:
+                                        import json
+                                        item = json.loads(buffer.rstrip().rstrip(","))
+                                        if "ask" in item and "answer" in item:
+                                            ask_raw = item.get("ask")
+                                            answer_raw = item.get("answer")
+                                            if ask_raw is not None and answer_raw is not None:
+                                                ask = str(ask_raw).strip()
+                                                answer = str(answer_raw).strip()
+                                                if ask and answer:
+                                                    count += 1
+                                    except (json.JSONDecodeError, Exception):
+                                        pass
+                                    buffer = ""
+                    return count
                 except MemoryError:
-                    logging.warning(f"内存不足，无法加载 {file_path} 进行计数，该文件暂时跳过")
+                    logging.warning(f"内存不足，无法处理 {file_path}，该文件暂时跳过")
                     import gc; gc.collect()
                     return 0
-            
-            count = 0
-            for item in data:
-                if "ask" in item and "answer" in item:
-                    ask_raw = item.get("ask")
-                    answer_raw = item.get("answer")
-                    if ask_raw is not None and answer_raw is not None:
-                        ask = str(ask_raw).strip()
-                        answer = str(answer_raw).strip()
-                        if ask and answer:
-                            count += 1
-            return count
         except MemoryError:
             logging.warning(f"内存不足，无法处理 {file_path}，该文件暂时跳过")
             import gc; gc.collect()
@@ -202,7 +226,7 @@ def main() -> None:
     logging.info(f"Initialized streaming dataset with {dataset.total_entries} training samples.")
 
     local_training_rounds = 0
-    save_interval = 1000
+    save_interval = 500
     consecutive_sample_errors = 0
     max_consecutive_sample_errors = 50
     

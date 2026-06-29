@@ -210,8 +210,24 @@ def evaluate_rl_readiness(
         return False, "record.txt 不存在，尚无训练数据"
 
     try:
-        with open(record_file, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f.readlines() if l.strip()]
+        file_size = os.path.getsize(record_file)
+        max_read_lines = stability_window * 10
+        if file_size > 100_000:
+            with open(record_file, "r", encoding="utf-8") as f:
+                lines = []
+                for i, line in enumerate(f):
+                    if i >= max_read_lines:
+                        f.seek(max(0, file_size - 50000))
+                        f.readline()
+                        break
+                    lines.append(line.strip())
+                lines = [l for l in lines if l.strip()]
+                if not lines:
+                    remaining = f.readlines()
+                    lines = [l.strip() for l in remaining if l.strip()][-max_read_lines:]
+        else:
+            with open(record_file, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f.readlines() if l.strip()]
     except Exception as e:
         return False, f"读取 record.txt 失败: {e}"
 
