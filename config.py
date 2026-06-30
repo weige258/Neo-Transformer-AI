@@ -102,8 +102,8 @@ CONFIG: Dict[str, Any] = {
     "temp_max_clip": 1.5,             # 温度上限裁剪
     "enable_edt": True,
     "min_p": 0.04,
-    "top_k": 0,                       # 关闭top-k，完全依赖min-p采样（与旧版一致）
-    "top_p": 1.0,
+    "top_k": 50,                      # 【修复】开启top-k=50，配合top-p使用
+    "top_p": 0.9,                     # 【修复】开启Top-p(Nucleus)采样，p=0.9
     "force_thinking_chain": True,     # True=强制注入THINK_START(确保思维链), False=让模型自己决定
 
     # ═══════════════════════════════════════════════════════
@@ -121,6 +121,7 @@ CONFIG: Dict[str, Any] = {
     "rep_penalty_repeat_sensitivity": 1.5, # 【修复】重复敏感度：2.0→1.5，降低重复检测敏感度
     "rep_penalty_entropy_factor": 0.8, # 熵趋势因子
     "frequency_penalty": 0.15,         # 【修复】频率惩罚：0.3→0.15，大幅减弱频率惩罚
+    "presence_penalty": 0.1,           # 【新增】存在惩罚：只要token出现过就惩罚，防止主题漂移
     # 强制回答步数完全运行时动态计算：
     #   min_steps = f(question_len, question_complexity, answer_quality_estimate)
     "force_answer_scale": 8.0,        # 【修复】步数缩放：1.2→8.0，确保强制回答阶段足够长

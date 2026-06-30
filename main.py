@@ -386,6 +386,44 @@ def _min_p_sampling(logits: torch.Tensor, min_p: float, temperature: float = 1.0
     return logits_filtered
 
 
+def _top_p_sampling(logits: torch.Tensor, top_p: float, temperature: float = 1.0) -> torch.Tensor:
+    """Top-p (Nucleus) 采样
+
+    设计说明：
+    1. 按概率从高到低排序，累积概率达到top_p时停止
+    2. 只保留累积概率内的token，其余设为-inf
+    3. 与_min_p_sampling配合使用：先min-p过滤，再top-p过滤
+    """
+    if top_p >= 1.0 or top_p <= 0.0:
+        return logits
+    
+    logits_temp = logits / temperature
+    probs = torch.softmax(logits_temp, dim=-1)
+    
+    # 按概率降序排序
+    sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+    
+    # 计算累积概率
+    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+    
+    # 找到累积概率超过top_p的位置
+    mask = cumsum_probs > top_p
+    
+    # 至少保留一个token（概率最高的）
+    if mask.numel() > 0:
+        mask[0] = False
+    
+    # 将超出top_p的token设为-inf
+    sorted_logits = logits_temp[sorted_indices]
+    sorted_logits = torch.where(mask, torch.full_like(sorted_logits, float("-inf")), sorted_logits)
+    
+    # 恢复原始顺序
+    logits_filtered = torch.full_like(logits, float("-inf"))
+    logits_filtered[sorted_indices] = sorted_logits
+    
+    return logits_filtered
+
+
 def generation(text: str, history_context: str = None, max_generate_tokens: int|None = None, thinking_available: bool = True) -> str:
     """生成函数 (Min-p采样 + Repetition Penalty + CoT完整性保护)
 
@@ -479,12 +517,14 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     
     min_p = float(CONFIG.get("min_p", 0.04))
     top_k = int(CONFIG.get("top_k", 50))
+    top_p = float(CONFIG.get("top_p", 0.9))
     
     # 【全动态重复惩罚】系数
     rep_penalty_scale = float(CONFIG.get("rep_penalty_scale", 0.15))
     rep_penalty_length_factor = float(CONFIG.get("rep_penalty_length_factor", 0.002))
     rep_penalty_repeat_sensitivity = float(CONFIG.get("rep_penalty_repeat_sensitivity", 2.0))
     rep_penalty_entropy_factor = float(CONFIG.get("rep_penalty_entropy_factor", 0.8))
+    presence_penalty = float(CONFIG.get("presence_penalty", 0.1))
     
     # 【全动态强制回答步数】运行时计算
     force_answer_scale = float(CONFIG.get("force_answer_scale", 1.2))
@@ -590,21 +630,29 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     window_size = min(128, max(32, current_len // 2))
                     recent_tokens = _token_history[-window_size:]
                     recent_counter = Counter(recent_tokens)
-                    for token_id, count in recent_counter.items():
+                    # 【新增】Presence Penalty：记录窗口内出现过的所有token（不管次数）
+                    recent_set = set(recent_tokens)
+                    for token_id in range(next_logits.size(0)):
                         if token_id < next_logits.size(0):
-                            # Repetition penalty (乘法) - 使用对数衰减避免过度惩罚
-                            penalty = repetition_penalty ** min(count, 3)
-                            if next_logits[token_id] > 0:
-                                next_logits[token_id] /= penalty
-                            else:
-                                next_logits[token_id] *= penalty
-                            # Frequency penalty (加法) - 上限3次
-                            if frequency_penalty > 0:
-                                next_logits[token_id] -= frequency_penalty * min(count, 3)
+                            count = recent_counter.get(token_id, 0)
+                            if count > 0:
+                                # Repetition penalty (乘法) - 使用对数衰减避免过度惩罚
+                                penalty = repetition_penalty ** min(count, 3)
+                                if next_logits[token_id] > 0:
+                                    next_logits[token_id] /= penalty
+                                else:
+                                    next_logits[token_id] *= penalty
+                                # Frequency penalty (加法) - 上限3次
+                                if frequency_penalty > 0:
+                                    next_logits[token_id] -= frequency_penalty * min(count, 3)
+                                # 【新增】Presence penalty (加法)：只要出现过就惩罚
+                                if presence_penalty > 0 and token_id in recent_set:
+                                    next_logits[token_id] -= presence_penalty
 
                 # 【修复】N-gram重复阻断：只在严重重复时触发
                 # 旧版：2-gram重复3次就阻断（过于激进）
                 # 新版：只在4-gram重复3次时才阻断（更宽松）
+                blocked_tokens = set()
                 if len(_token_history) >= 16:  # 增加触发长度阈值
                     for n in [4]:  # 只检查4-gram，避免误伤正常重复
                         if len(_token_history) >= n * 3:
@@ -615,7 +663,17 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                                 repeat_token = last_n[-1]
                                 if repeat_token < next_logits.size(0):
                                     next_logits[repeat_token] = float("-inf")
+                                    blocked_tokens.add(repeat_token)
                                     print(f"[Gen] Blocked 4-gram repeat", flush=True)
+                
+                # 【新增】阻断后回退策略：如果阻断导致概率分布异常，提高温度并放宽采样
+                if blocked_tokens:
+                    # 检查是否所有高概率token都被阻断
+                    temp_probs = torch.softmax(next_logits / max(temperature, 0.1), dim=-1)
+                    if temp_probs.max().item() < 0.1 or torch.isnan(temp_probs).any():
+                        # 概率分布紊乱，紧急回退：提高温度，允许更多token
+                        temperature = min(1.2, temperature * 1.5)
+                        print(f"[Gen] Emergency fallback: temp={temperature:.2f}", flush=True)
 
                 # 【全动态EDT温度】基于多因素的temperature计算
                 raw_probs = torch.softmax(next_logits, dim=-1)
@@ -639,6 +697,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 # Min-p 采样（返回原始logits，只过滤不合格的token）
                 if min_p > 0.0:
                     next_logits = _min_p_sampling(next_logits, min_p, temperature)
+
+                # 【新增】Top-p (Nucleus) 采样：累积概率过滤
+                if top_p < 1.0 and top_p > 0.0:
+                    next_logits = _top_p_sampling(next_logits, top_p, temperature)
 
                 # 【新增】top-k过滤：限制采样范围，防止选中极低概率token
                 if top_k > 0:
@@ -808,17 +870,23 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                         window_size = min(128, max(32, current_len // 2))
                         recent_tokens = _token_history[-window_size:]
                         recent_counter = Counter(recent_tokens)
-                        for token_id, count in recent_counter.items():
+                        recent_set = set(recent_tokens)
+                        for token_id in range(next_logits.size(0)):
                             if token_id < next_logits.size(0):
-                                penalty = repetition_penalty ** min(count, 3)
-                                if next_logits[token_id] > 0:
-                                    next_logits[token_id] /= penalty
-                                else:
-                                    next_logits[token_id] *= penalty
-                                if frequency_penalty > 0:
-                                    next_logits[token_id] -= frequency_penalty * min(count, 3)
+                                count = recent_counter.get(token_id, 0)
+                                if count > 0:
+                                    penalty = repetition_penalty ** min(count, 3)
+                                    if next_logits[token_id] > 0:
+                                        next_logits[token_id] /= penalty
+                                    else:
+                                        next_logits[token_id] *= penalty
+                                    if frequency_penalty > 0:
+                                        next_logits[token_id] -= frequency_penalty * min(count, 3)
+                                    if presence_penalty > 0 and token_id in recent_set:
+                                        next_logits[token_id] -= presence_penalty
 
                     # 【新增】N-gram重复阻断（强制回答阶段同样需要）
+                    blocked_tokens_fallback = set()
                     if len(_token_history) >= 8:
                         for n in [2, 3, 4]:
                             if len(_token_history) >= n * 3:
@@ -829,6 +897,13 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                                     repeat_token = last_n[-1]
                                     if repeat_token < next_logits.size(0):
                                         next_logits[repeat_token] = float("-inf")
+                                        blocked_tokens_fallback.add(repeat_token)
+                    
+                    # 【新增】强制回答阶段阻断后回退
+                    if blocked_tokens_fallback:
+                        temp_probs = torch.softmax(next_logits / max(temperature, 0.1), dim=-1)
+                        if temp_probs.max().item() < 0.1 or torch.isnan(temp_probs).any():
+                            temperature = min(1.2, temperature * 1.5)
                     
                     # 【全动态EDT温度】强制回答阶段同样使用
                     raw_probs = torch.softmax(next_logits, dim=-1)
@@ -847,6 +922,10 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     # Min-p（修复版：内部已处理temperature）
                     if min_p > 0.0:
                         next_logits = _min_p_sampling(next_logits, min_p, temperature)
+                    
+                    # 【新增】Top-p (Nucleus) 采样
+                    if top_p < 1.0 and top_p > 0.0:
+                        next_logits = _top_p_sampling(next_logits, top_p, temperature)
                     
                     # 【新增】top-k过滤（强制回答阶段同样需要）
                     if top_k > 0:
