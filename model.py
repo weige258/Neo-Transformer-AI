@@ -318,14 +318,24 @@ class HyperAttention(nn.Module):
         if bool(CONFIG.get("use_learned_pooling", True)):
             self.importance_pooler = nn.Linear(self.head_dim, 1, bias=False)
 
+    _gpu_pressure_cache = None
+    _gpu_pressure_cache_time = 0.0
+
     def _get_gpu_memory_pressure(self) -> float:
-        """获取当前GPU显存压力（0.0-1.0）"""
+        """获取当前GPU显存压力（0.0-1.0），带1秒缓存避免频繁CUDA同步"""
         if not torch.cuda.is_available():
             return 0.0
+        import time as _time
+        now = _time.monotonic()
+        if self._gpu_pressure_cache is not None and now - self._gpu_pressure_cache_time < 1.0:
+            return self._gpu_pressure_cache
         try:
             allocated = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0.0
             reserved = torch.cuda.memory_reserved() / torch.cuda.get_device_properties(0).total_memory
-            return max(allocated, reserved)
+            pressure = max(allocated, reserved)
+            self.__class__._gpu_pressure_cache = pressure
+            self.__class__._gpu_pressure_cache_time = now
+            return pressure
         except (RuntimeError, ValueError):
             return 0.0
 
@@ -855,6 +865,12 @@ class HyperAttention(nn.Module):
             # 解包 cache；兼容旧版本缓存（缺少 MLA latent memory）
             (past_recent_k, past_recent_v, mem_k, mem_v, mem_pos,
              q_start_pos, *rest) = past_key_value
+            # 【修复】raw_k_start_pos 必须反映 past_recent_k 实际的起始位置
+            # q_start_pos 是 total_len（全局token计数），past_recent_k 可能被截断
+            # 正确计算：raw_k_start_pos = q_start_pos - past_recent_k.size(-2)
+            # 但截断后 past_recent_k 不再从位置0开始，所以需要用 cache 中的信息
+            # 由于 _build_cache 中 total_len = start_pos + k_all.size(-2)，
+            # 而 recent_k = k_all[:, :, -keep:, :]，所以 recent_k 的起始位置 = total_len - keep
             raw_k_start_pos = q_start_pos - past_recent_k.size(-2)
             mla_M = rest[0] if len(rest) >= 2 else None
             mla_z = rest[1] if len(rest) >= 2 else None
@@ -896,6 +912,8 @@ class HyperAttention(nn.Module):
                 else:
                     past_recent_k = past_recent_k.new_zeros(batch, self.num_heads, 0, self.head_dim)
                     past_recent_v = past_recent_v.new_zeros(batch, self.num_heads, 0, self.head_dim)
+                # 【修复】截断后必须更新 raw_k_start_pos，否则位置编码错位
+                raw_k_start_pos = q_start_pos - past_recent_k.size(-2)
             raw_k = torch.cat((past_recent_k, k_new), dim=-2)
             raw_v = torch.cat((past_recent_v, v_new), dim=-2)
 
