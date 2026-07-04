@@ -52,17 +52,17 @@ CONFIG: Dict[str, Any] = {
     "use_pyramid_compression": True,
     "compress_on_memory_ratio": 0.80,
     "prefer_gpu_compress": True,
-    "max_mem_kv_capacity": 256,
+    "max_mem_kv_capacity": 128,        # 压缩记忆容量（256→128，防显存膨胀）
     "h2_ratio": 0.3,
     "use_amp": True,
-    "use_gradient_checkpointing": False,  # 禁用：与动态压缩/动态窗口不兼容
+    "use_gradient_checkpointing": True,
     "gpu_cache_clear_threshold_gb": 4.0,
-    "max_forward_chunk": 99999999,
+    "max_forward_chunk": 512,
     
-    # ── 显存硬限制配置（新增） ──
-    "max_recent_kv_len": 2048,       # recent_k/v 绝对最大长度
-    "max_total_kv_len": 4096,        # 拼接后 raw_k/v 绝对最大长度
-    "kv_cache_max_len": 1024,        # _detach_kv_cache 最大长度
+    # ── 显存硬限制配置 ──
+    "max_recent_kv_len": 512,        # recent_k/v 绝对最大长度（2048→512，防显存爆炸）
+    "max_total_kv_len": 1024,        # 拼接后 raw_k/v 绝对最大长度（4096→1024）
+    "kv_cache_max_len": 512,         # _detach_kv_cache 最大长度（1024→512）
 
     # ═══════════════════════════════════════════════════════
     # 4️⃣ 序列长度与显存管理（全动态计算）
@@ -74,64 +74,47 @@ CONFIG: Dict[str, Any] = {
     #   - gen_len_complexity_factor: 复杂度调节因子
     #   - gen_len_memory_sensitivity: 显存敏感度（显存紧张时降低长度）
     #   - gen_len_entropy_sensitivity: 生成熵敏感度（高熵时允许更长生成）
-    "gen_len_base_ratio": 32.0,       # 【修复】基础长度倍数：8.0→32.0，确保短问题也能生成长文本
+    "gen_len_base_ratio": 8.0,        # 基础长度倍数（32→8，防生成过长卡死）
     "gen_len_complexity_factor": 1.5,  # 复杂度因子
-    "gen_len_memory_sensitivity": 0.15, # 【修复】显存敏感度：0.3→0.15，减少显存对长度的抑制
+    "gen_len_memory_sensitivity": 0.3, # 显存敏感度（0.15→0.3，显存紧张时更积极缩短）
     "gen_len_entropy_sensitivity": 0.5, # 熵敏感度
-    "gen_len_min_absolute": 256,      # 【修复】绝对最小长度：64→256，保证最低生成质量
-    "gen_len_max_absolute": 4096,     # 绝对最大长度（安全上限）
+    "gen_len_min_absolute": 64,       # 绝对最小长度（256→64）
+    "gen_len_max_absolute": 2048,     # 绝对最大长度（4096→2048，防生成卡死）
     "dynamic_segment_overlap": 32,
     "gpu_memory_safe_ratio": 0.85,
-    "gpu_memory_skip_ratio": 0.92,
+    "gpu_memory_skip_ratio": 0.80,     # 显存跳过阈值（0.92→0.80，更早保护）
 
     # ═══════════════════════════════════════════════════════
-    # 5️⃣ 生成采样策略（EDT全动态温度 — 南京大学2024）
+    # 5️⃣ 生成采样策略
     # ═══════════════════════════════════════════════════════
-    # Temperature完全运行时动态计算：
-    #   temp = f(entropy, repetition_score, generation_length, gpu_load)
-    # 系数说明：
-    #   - temp_base: 基础温度
-    #   - temp_entropy_scale: 熵调节缩放
-    #   - temp_repetition_sensitivity: 重复敏感度
-    #   - temp_length_decay: 长度衰减（长生成时降低温度稳定输出）
-    "temp_base": 0.85,                # 【修复】基础温度：0.8→0.85，稍微提高创造力
-    "temp_entropy_scale": 0.3,        # 【修复】熵调节缩放：0.4→0.3，减少温度波动
-    "temp_repetition_sensitivity": 0.4, # 【修复】重复敏感度：0.6→0.4，避免过度升温
-    "temp_length_decay": 0.0005,      # 【修复】长度衰减：0.001→0.0005，减缓温度下降
-    "temp_min_clip": 0.4,             # 【修复】温度下限：0.3→0.4，防止温度过低
-    "temp_max_clip": 1.5,             # 温度上限裁剪
+    "temp_base": 0.7,
+    "temp_entropy_scale": 0.4,
+    "temp_repetition_sensitivity": 0.6,
+    "temp_length_decay": 0.001,
+    "temp_min_clip": 0.3,
+    "temp_max_clip": 1.5,
     "enable_edt": True,
     "min_p": 0.04,
-    "top_k": 50,                      # 【修复】开启top-k=50，配合top-p使用
-    "top_p": 0.9,                     # 【修复】开启Top-p(Nucleus)采样，p=0.9
-    "force_thinking_chain": True,     # True=强制注入THINK_START(确保思维链), False=让模型自己决定
-
+    "top_k": 50,
+    "top_p": 0.9,
+    "force_thinking_chain": True,
     # ═══════════════════════════════════════════════════════
-    # 6️⃣ 生成质量控制（全动态惩罚）
+    # 6️⃣ 重复惩罚
     # ═══════════════════════════════════════════════════════
-    # 重复惩罚完全运行时动态计算：
-    #   penalty = f(repetition_score, generation_length, ngram_diversity, entropy_trend)
-    # 系数说明：
-    #   - rep_penalty_scale: 惩罚缩放系数
-    #   - rep_penalty_length_factor: 长度因子（长生成增加惩罚）
-    #   - rep_penalty_repeat_sensitivity: 重复检测敏感度
-    #   - rep_penalty_entropy_factor: 熵趋势因子（熵下降时增强惩罚）
-    "rep_penalty_scale": 0.15,        # 【修复】惩罚缩放：0.25→0.15，避免过度惩罚正常重复
-    "rep_penalty_length_factor": 0.001, # 【修复】长度因子：0.002→0.001，减缓惩罚增长
-    "rep_penalty_repeat_sensitivity": 1.5, # 【修复】重复敏感度：2.0→1.5，降低重复检测敏感度
-    "rep_penalty_entropy_factor": 0.8, # 熵趋势因子
-    "frequency_penalty": 0.15,         # 【修复】频率惩罚：0.3→0.15，大幅减弱频率惩罚
-    "presence_penalty": 0.1,           # 【新增】存在惩罚：只要token出现过就惩罚，防止主题漂移
-    # 强制回答步数完全运行时动态计算：
-    #   min_steps = f(question_len, question_complexity, answer_quality_estimate)
-    "force_answer_scale": 8.0,        # 【修复】步数缩放：1.2→8.0，确保强制回答阶段足够长
-    "force_answer_min_absolute": 128, # 【修复】绝对最小步数：16→128，保证回答质量
-    "force_answer_complexity_exp": 0.5, # 复杂度指数
+    "rep_penalty_scale": 0.25,
+    "rep_penalty_length_factor": 0.002,
+    "rep_penalty_repeat_sensitivity": 2.0,
+    "rep_penalty_entropy_factor": 0.8,
+    "frequency_penalty": 0.3,
+    "presence_penalty": 0.1,
+    "force_answer_scale": 8.0,
+    "force_answer_min_absolute": 128,
+    "force_answer_complexity_exp": 0.5,
 
     # ═══════════════════════════════════════════════════════
     # 7️⃣ 学习率调度配置
     # ═══════════════════════════════════════════════════════
-    "gradient_accumulation_steps": 1,
+    "gradient_accumulation_steps": 4,    # 梯度累积步数（1→4，减少显存占用）
     "base_learning_rate": 3e-4,
     "warmup_steps": 300,
     "warmup_init_lr": 1e-6,
@@ -150,9 +133,9 @@ CONFIG: Dict[str, Any] = {
     # ═══════════════════════════════════════════════════════
     # 8️⃣ 训练数据与采样配置
     # ═══════════════════════════════════════════════════════
-    "max_seq_len": 99999999,
+    "max_seq_len": 2048,               # 最大序列长度（99999999→2048，防显存爆炸）
     "min_seq_len": 8,
-    "packing_max_seq_len": 99999999,
+    "packing_max_seq_len": 2048,       # 打包最大序列长度（99999999→2048）
     "packing_buffer_size": 5000,
     "dataset_shuffle": True,
     "dataset_num_workers": 0,
@@ -190,9 +173,10 @@ CONFIG: Dict[str, Any] = {
     #   - rl_min_episodes: 收集至少N个episode后才更新策略（防止小样本方差大）
     #   - rl_update_batch_size: 策略更新时的batch size
     #   - rl_update_interval: 每N个training round检查一次是否满足更新条件
-    "rl_min_episodes": 32,            # 最小episode数（Gemini建议：32-64）
-    "rl_update_batch_size": 8,        # PPO更新batch size（Gemini建议：4-8）
-    "rl_update_interval": 4,          # 更新检查间隔
+    "rl_min_episodes": 32,
+    "rl_update_batch_size": 4,        # PPO更新batch size（8→4，减少显存）
+    "rl_update_interval": 8,          # 更新检查间隔（4→8，降低PPO频率）
+    "rl_enabled": False,              # PPO默认禁用（防显存爆炸，手动开启）
 
     # ═══════════════════════════════════════════════════════
     # ⑪ 学习率调度器配置

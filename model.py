@@ -137,13 +137,11 @@ class MLALatentMemory(nn.Module):
             delta_M = torch.matmul(k_lat.transpose(-2, -1), v_lat)
 
         # 使用指数移动平均更新，更稳定
-        # 【修复】z 之前用 sum()，随序列长度单调增长，导致 denom→∞，v_lat→0，MLA 路径失效
-        # 改用 mean() 保持稳定量级。同时将 M/z 一起按相同指数平滑，避免 M/z 比例漂移
         # 【修复】使用self.alpha替代硬编码，支持推理时动态调整
         alpha = self.alpha
-        # delta_M 来自 matmul(k_lat.T, v_error)，已在 seq_len 上聚合，故除以 seq_len 得到平均
-        seq_len_k = max(1, k_lat.size(-2))
-        delta_M_mean = delta_M.mean(dim=0, keepdim=True) / seq_len_k  # (1, H, latent, latent)
+        # delta_M 来自 matmul(k_lat.T, v_error)，已在 seq_len 上聚合
+        # 只用 mean(dim=0) 做batch归一化，不再除以 seq_len（已由mean隐式完成）
+        delta_M_mean = delta_M.mean(dim=0, keepdim=True)  # (1, H, latent, latent)
         k_lat_mean = k_lat.mean(dim=(0, -2), keepdim=True).squeeze(-2)  # (1, H, latent)
 
         new_M = alpha * mem_M + (1 - alpha) * delta_M_mean
@@ -320,21 +318,31 @@ class HyperAttention(nn.Module):
 
     _gpu_pressure_cache = None
     _gpu_pressure_cache_time = 0.0
+    _in_checkpoint = False  # 标记是否在gradient checkpoint内
 
     def _get_gpu_memory_pressure(self) -> float:
-        """获取当前GPU显存压力（0.0-1.0），带1秒缓存避免频繁CUDA同步"""
+        """获取当前GPU显存压力（0.0-1.0），带1秒缓存避免频繁CUDA同步
+        
+        【修复】在gradient checkpoint模式下返回缓存值或0.5，
+        因为CUDA设备状态访问在checkpoint中不被允许。
+        """
         if not torch.cuda.is_available():
             return 0.0
+        # 在checkpoint模式下，不能访问CUDA设备状态，返回缓存值或默认值
+        if HyperAttention._in_checkpoint:
+            if HyperAttention._gpu_pressure_cache is not None:
+                return HyperAttention._gpu_pressure_cache
+            return 0.5  # 默认中等压力
         import time as _time
         now = _time.monotonic()
-        if self._gpu_pressure_cache is not None and now - self._gpu_pressure_cache_time < 1.0:
-            return self._gpu_pressure_cache
+        if HyperAttention._gpu_pressure_cache is not None and now - HyperAttention._gpu_pressure_cache_time < 1.0:
+            return HyperAttention._gpu_pressure_cache
         try:
             allocated = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0.0
             reserved = torch.cuda.memory_reserved() / torch.cuda.get_device_properties(0).total_memory
             pressure = max(allocated, reserved)
-            self.__class__._gpu_pressure_cache = pressure
-            self.__class__._gpu_pressure_cache_time = now
+            HyperAttention._gpu_pressure_cache = pressure
+            HyperAttention._gpu_pressure_cache_time = now
             return pressure
         except (RuntimeError, ValueError):
             return 0.0
@@ -358,12 +366,13 @@ class HyperAttention(nn.Module):
         # 获取显存压力
         mem_pressure = self._get_gpu_memory_pressure()
         
-        # 【修复】full attention阈值：使用绝对值512而非比例
-        # 旧版行为：seq_len <= 512 时用full attention
-        full_threshold = max(512, int(seq_len * self.window_full_attention_ratio))
+        # 【修复】full attention阈值：最大512，超过512必须用窗口
+        # 旧版 seq_len <= full_threshold 时返回 seq_len（full attention），
+        # 当 seq_len=2048 时 full_threshold=512，但 512 的 full attention 已经很大
+        full_threshold = min(512, max(64, int(seq_len * self.window_full_attention_ratio)))
         
         if seq_len <= full_threshold:
-            return seq_len  # 短序列用full attention
+            return seq_len
         
         # 动态缩放：显存压力大时减小窗口
         adaptive_scale = self.window_scale_factor * (1.0 - mem_pressure * 0.3)
@@ -371,9 +380,10 @@ class HyperAttention(nn.Module):
         
         window_size = int(seq_len * adaptive_scale)
         
-        # 【修复】下限保护：至少512（与旧版sliding_window=512一致）
-        min_window = max(512, int(seq_len * self.window_min_ratio))
+        # 【修复】下限保护：至少64，上限512（防显存爆炸）
+        min_window = max(64, int(seq_len * self.window_min_ratio))
         window_size = max(min_window, window_size)
+        window_size = min(window_size, 512)  # 窗口硬上限512
         
         return window_size
 
@@ -723,7 +733,13 @@ class HyperAttention(nn.Module):
         mem_parts_pos = []
 
         # 先保留上一轮的压缩记忆
+        # 【修复】限制old_mem长度，防止压缩记忆无限膨胀
         if old_mem_k is not None and old_mem_k.size(-2) > 0:
+            base_capacity = int(CONFIG.get("max_mem_kv_capacity", 128))
+            if old_mem_k.size(-2) > base_capacity:
+                old_mem_k = old_mem_k[:, :, -base_capacity:, :].contiguous()
+                old_mem_v = old_mem_v[:, :, -base_capacity:, :].contiguous()
+                old_mem_pos = old_mem_pos[-base_capacity:].contiguous()
             mem_parts_k.append(old_mem_k)
             mem_parts_v.append(old_mem_v)
             mem_parts_pos.append(old_mem_pos)
@@ -888,8 +904,9 @@ class HyperAttention(nn.Module):
         # 得到非零的mla_M/mla_z，再用更新后的记忆做retrieve。
         # 这使得训练时的MLA路径与推理时第一步（处理prompt）的行为完全一致。
         if past_key_value is None:
-            mla_M, mla_z = self.mla_memory.update(
-                k_new, v_new, mla_M, mla_z)
+            with torch.no_grad():
+                mla_M, mla_z = self.mla_memory.update(
+                    k_new.detach(), v_new.detach(), mla_M, mla_z)
 
         q_for_memory = q
         k_for_memory = k_new
@@ -1009,10 +1026,10 @@ class HyperAttention(nn.Module):
 
         del q
 
-        if past_key_value is not None:
+        if past_key_value is not None and use_cache:
             with torch.no_grad():
                 new_mla_M, new_mla_z = self.mla_memory.update(
-                    k_for_memory, v_new, mla_M, mla_z)
+                    k_for_memory.detach(), v_new.detach(), mla_M, mla_z)
         else:
             new_mla_M = mla_M
             new_mla_z = mla_z
@@ -1284,15 +1301,18 @@ class MainModel(nn.Module):
                 next_key_values.append(present)
         else:
             use_gc = bool(CONFIG.get("use_gradient_checkpointing", False))
-            for block in self.transformers:
+            if self.training and use_gc:
+                HyperAttention._in_checkpoint = True
+            try:
+                for block in self.transformers:
+                    if self.training and use_gc:
+                        ck_kwargs = {"use_reentrant": False} if _CHECKPOINT_SUPPORTS_REENTRANT else {}
+                        x = checkpoint(block, x, None, False, tokens, **ck_kwargs)
+                    else:
+                        x = block(x, None, False, tokens)
+            finally:
                 if self.training and use_gc:
-                    # 【修复】传递token_ids用于特殊Token保护
-                    # checkpoint不支持kwargs，使用args传递
-                    ck_kwargs = {"use_reentrant": False} if _CHECKPOINT_SUPPORTS_REENTRANT else {}
-                    x = checkpoint(block, x, None, False, tokens, **ck_kwargs)
-                else:
-                    # 【修复】传递token_ids用于特殊Token保护
-                    x = block(x, None, False, tokens)
+                    HyperAttention._in_checkpoint = False
 
         logits = self.output_linear(self.final_norm(x))
         

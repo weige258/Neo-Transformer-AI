@@ -576,15 +576,35 @@ class LightweightPPO:
         self.episode_data['generated_texts'].append(generated_text)
 
         # 【核心修复】在 no_grad + eval 下记录旧策略的逐 token log_prob + 熵
-        # 关键：
-        # 1. 必须切换到 eval() 模式确保 dropout 被禁用，得到确定性 log_prob
-        # 2. no_grad 确保不构建计算图，不污染 SFT 训练的梯度状态
-        # 3. 之后恢复 train() 模式
+        # 【修复】限制episode数据总量，防止显存泄漏
+        max_episodes = int(64)  # 最大存储episode数
+        if len(self.episode_data['rewards']) >= max_episodes:
+            for key in self.episode_data:
+                if isinstance(self.episode_data[key], list):
+                    self.episode_data[key] = self.episode_data[key][-max_episodes//2:]
+        
         if prompt and generated_text:
+            # 【修复】显存保护：跳过过长序列的log_prob计算
+            try:
+                prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
+                generated_tokens = TextTokenizer.encode(generated_text).to(self.device)
+                total_tokens = len(prompt_tokens) + len(generated_tokens)
+                if total_tokens > 1024:  # 超长序列跳过，防显存爆炸
+                    self.episode_data['log_probs'].append(None)
+                    self.episode_data['entropies'].append(None)
+                    return total_reward, reward_breakdown
+            except Exception:
+                self.episode_data['log_probs'].append(None)
+                self.episode_data['entropies'].append(None)
+                return total_reward, reward_breakdown
+            
             self.model.eval()
             with torch.no_grad():
                 old_token_lps, old_entropies = self._compute_token_log_probs_and_entropy(prompt, generated_text)
             self.model.train()  # 恢复训练模式
+            # 【修复】计算完后立即清理GPU缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             if old_token_lps is not None:
                 self.episode_data['log_probs'].append(old_token_lps.detach())
                 self.episode_data['entropies'].append(old_entropies.detach() if old_entropies is not None else torch.tensor([0.0], device=self.device))
@@ -737,6 +757,8 @@ class LightweightPPO:
         ]
         if len(high_reward_indices) == 0:
             high_reward_indices = list(range(len(self.episode_data['rewards'])))
+        # 【修复】限制高奖励样本数量，防止PPO更新时做过多forward
+        high_reward_indices = high_reward_indices[:8]
         
         total_policy_loss = 0.0
         total_entropy_loss = 0.0
@@ -854,7 +876,7 @@ class LightweightPPO:
         # ── 清空 episode 数据 ──
         self.episode_data = {
             'log_probs': [],
-            'entropies': [],  # 【修复CRIT-1】遗漏导致内存泄漏
+            'entropies': [],
             'rewards': [],
             'values': [],
             'actions': [],
@@ -862,6 +884,10 @@ class LightweightPPO:
             'prompts': [],
             'generated_texts': []
         }
+        
+        # 【修复】PPO更新后强制清理GPU缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         n_updates = max(update_count, 1)
         return {

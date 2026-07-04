@@ -115,6 +115,7 @@ while True:
                 logging.warning(f"CUDA OOM，跳过此样本")
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
                 _optimizer_obj.zero_grad(set_to_none=True)
                 continue
             elif "nan" in error_msg.lower():

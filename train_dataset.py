@@ -302,7 +302,7 @@ def main() -> None:
                     print("*" * 100, flush=True)
 
                     if local_training_rounds % save_interval == 0:
-                        torch.save(obj=model.state_dict(), f="model.pth")
+                        torch.save(obj=model_obj.state_dict(), f="model.pth")
                         avg_loss = sum(recent_losses) / len(recent_losses) if recent_losses else 0
                         logging.info(f"Model saved, training rounds: {local_training_rounds}, current LR: {current_lr:.6f}, avg loss: {avg_loss:.6f}")
 
