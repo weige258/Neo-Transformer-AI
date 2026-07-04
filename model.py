@@ -321,22 +321,43 @@ class HyperAttention(nn.Module):
     _in_checkpoint = False  # 标记是否在gradient checkpoint内
 
     def _get_gpu_memory_pressure(self) -> float:
-        """获取当前GPU显存压力（0.0-1.0），带1秒缓存避免频繁CUDA同步
-        
-        【修复】在gradient checkpoint模式下返回缓存值或0.5，
-        因为CUDA设备状态访问在checkpoint中不被允许。
+        """获取当前GPU显存压力（0.0-1.0），带缓存避免频繁CUDA同步
+
+        【关键修复】推理时(torch.inference_mode)不查询CUDA状态，避免同步阻塞。
+        torch.cuda.memory_allocated() / memory_reserved() 是同步操作，
+        每次调用都会阻塞CPU等待GPU完成所有排队内核。
+        生成阶段每个token调用此函数3-4次，导致"卡住几十秒"的现象。
+
+        修复策略：
+        1. 推理模式下直接返回缓存值或0.3（低压力），完全不触碰CUDA状态
+        2. 训练模式下保留1秒缓存
+        3. checkpoint模式下返回缓存值或0.5
         """
         if not torch.cuda.is_available():
             return 0.0
-        # 在checkpoint模式下，不能访问CUDA设备状态，返回缓存值或默认值
+
+        import time as _time
+        now = _time.monotonic()
+
+        # 优先返回缓存（无论训练/推理/checkpoint）
+        if HyperAttention._gpu_pressure_cache is not None and now - HyperAttention._gpu_pressure_cache_time < 1.0:
+            return HyperAttention._gpu_pressure_cache
+
+        # 【修复】推理模式：不查询CUDA，避免同步阻塞。显存在推理期间基本稳定。
+        if not self.training and not torch.is_grad_enabled():
+            # 推理时返回缓存值或默认低压力0.3
+            if HyperAttention._gpu_pressure_cache is not None:
+                return HyperAttention._gpu_pressure_cache
+            HyperAttention._gpu_pressure_cache = 0.3
+            HyperAttention._gpu_pressure_cache_time = now
+            return 0.3
+
+        # checkpoint模式下不能访问CUDA设备状态
         if HyperAttention._in_checkpoint:
             if HyperAttention._gpu_pressure_cache is not None:
                 return HyperAttention._gpu_pressure_cache
-            return 0.5  # 默认中等压力
-        import time as _time
-        now = _time.monotonic()
-        if HyperAttention._gpu_pressure_cache is not None and now - HyperAttention._gpu_pressure_cache_time < 1.0:
-            return HyperAttention._gpu_pressure_cache
+            return 0.5
+
         try:
             allocated = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0.0
             reserved = torch.cuda.memory_reserved() / torch.cuda.get_device_properties(0).total_memory
@@ -345,7 +366,7 @@ class HyperAttention(nn.Module):
             HyperAttention._gpu_pressure_cache_time = now
             return pressure
         except (RuntimeError, ValueError):
-            return 0.0
+            return HyperAttention._gpu_pressure_cache if HyperAttention._gpu_pressure_cache is not None else 0.0
 
     def _get_dynamic_window_size(self, seq_len: int) -> int:
         """全动态窗口大小计算
