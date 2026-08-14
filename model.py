@@ -1062,18 +1062,26 @@ class HyperAttention(nn.Module):
             # 【修复】从token_ids参数生成special_mask保护特殊Token
             special_mask = None
             if token_ids is not None:
-                # 生成掩码：标记所有特殊Token（ID < 10）的位置
+                # 【修复】使用TextTokenizer中的特殊token值判断，而非硬编码<10
+                from tokenizer import TextTokenizer
+                special_ids = torch.tensor([
+                    TextTokenizer.UNKNOWN_TOKEN,
+                    TextTokenizer.START_GENERATION_TOKEN,
+                    TextTokenizer.END_GENERATION_TOKEN,
+                    TextTokenizer.HISTORY_CONTEXT_START_TOKEN,
+                    TextTokenizer.HISTORY_CONTEXT_END_TOKEN,
+                    TextTokenizer.THINK_START_TOKEN,
+                    TextTokenizer.THINK_END_TOKEN,
+                ], device=token_ids.device, dtype=token_ids.dtype)
                 if token_ids.dim() == 1:
-                    special_mask = token_ids < 10  # ID 0-9 为特殊Token
+                    special_mask = (token_ids.unsqueeze(-1) == special_ids).any(dim=-1)
                 elif token_ids.dim() == 2:
-                    # 支持 batch > 1：取任意样本存在特殊token的位置作为并集保护
                     if token_ids.size(0) == 1:
-                        special_mask = token_ids[0] < 10
+                        special_mask = (token_ids[0].unsqueeze(-1) == special_ids).any(dim=-1)
                     else:
-                        special_mask = (token_ids < 10).any(dim=0)
+                        special_mask = ((token_ids.unsqueeze(-1) == special_ids).any(dim=-1)).any(dim=0)
                 elif token_ids.dim() == 3:
-                    # (batch, seq_len, 1) 等变体
-                    special_mask = (token_ids < 10).any(dim=0).squeeze(-1)
+                    special_mask = ((token_ids.unsqueeze(-1) == special_ids).any(dim=-1)).any(dim=0).squeeze(-1)
             
             cache = self._build_cache(
                 raw_k,
@@ -1192,14 +1200,17 @@ class MainModel(nn.Module):
     def _reset_parameters(self) -> None:
         # 初始化输入 embedding（如果与输出绑定，则同时初始化了两者）
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
-        # 【修复】特殊Token（ID 0-9）使用更大的初始化标准差
+        # 【修复】特殊Token使用更大的初始化标准差
         # 原因：特殊Token在训练中出现的频率远低于普通token，梯度信号弱
         # 更大的初始范数帮助模型从一开始就区分特殊Token和普通Token
-        # 这直接解决了"特殊Token注意力消失"问题的根源
-        special_count = min(10, self.token_embedding.weight.size(0))
+        # 注意：特殊token现在在词表末尾（59990-59996）
+        dict_size = self.token_embedding.weight.size(0)
+        special_token_ids = [dict_size - 10 + i for i in range(10)]  # 最后10个token
         with torch.no_grad():
-            special_std = 0.05  # 特殊Token 5倍标准差
-            self.token_embedding.weight[:special_count].normal_(mean=0.0, std=special_std)
+            special_std = 0.05  # 特殊Token 2.5倍标准差
+            for token_id in special_token_ids:
+                if token_id < dict_size and token_id >= 0:
+                    self.token_embedding.weight[token_id].normal_(mean=0.0, std=special_std)
         # 仅在未绑定时独立初始化输出层（避免覆盖共享权重的初始化）
         if self.output_linear.weight is not self.token_embedding.weight:
             nn.init.normal_(self.output_linear.weight, mean=0.0, std=0.02)

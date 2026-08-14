@@ -102,24 +102,6 @@ def _compute_repeat_score(token_history: List[int]) -> float:
     
     return min(1.0, max_repeat_score)
 
-def _compute_diversity_score(token_history: List[int]) -> float:
-    """计算N-gram多样性得分（0.0-1.0）"""
-    if len(token_history) < 8:
-        return 1.0
-    recent = token_history[-64:]
-    if len(recent) < 8:
-        return 1.0
-    diversity_scores = []
-    for n in [2, 3, 4]:
-        if len(recent) >= n + 4:
-            ngrams = [tuple(recent[i:i+n]) for i in range(len(recent) - n + 1)]
-            if ngrams:
-                unique_ratio = len(set(ngrams)) / len(ngrams)
-                diversity_scores.append(unique_ratio)
-    if not diversity_scores:
-        return 1.0
-    return max(0.0, min(1.0, sum(diversity_scores) / len(diversity_scores)))
-
 def _compute_entropy_trend(entropy_history: List[float]) -> float:
     """计算熵趋势"""
     if len(entropy_history) < 5:
@@ -129,6 +111,58 @@ def _compute_entropy_trend(entropy_history: List[float]) -> float:
         return 0.0
     diffs = [recent[i] - recent[i-1] for i in range(1, len(recent))]
     return sum(diffs) / len(diffs)
+
+
+def _is_text_like_token(idx: int) -> bool:
+    """判断一个 token 是否更像文本内容，而不是乱码或控制字符。"""
+    if idx in {
+        TextTokenizer.UNKNOWN_TOKEN,
+        TextTokenizer.START_GENERATION_TOKEN,
+        TextTokenizer.END_GENERATION_TOKEN,
+        TextTokenizer.HISTORY_CONTEXT_START_TOKEN,
+        TextTokenizer.HISTORY_CONTEXT_END_TOKEN,
+        TextTokenizer.THINK_START_TOKEN,
+        TextTokenizer.THINK_END_TOKEN,
+    }:
+        return False
+
+    if not isinstance(idx, int) or idx <= 0 or idx > 0x10FFFF:
+        return False
+
+    # 【简化】只排除控制字符和不可打印字符
+    ch = chr(idx)
+    if not ch.isprintable() and ch not in {'\n', '\t', '\r', ' '}:
+        return False
+    
+    return True
+
+
+def _looks_meaningful_text(text: str) -> bool:
+    """判断生成文本是否像有效自然语言，而不是纯乱码。"""
+    if not text or not text.strip():
+        return False
+    if len(text.strip()) < 1:
+        return False
+
+    chinese_chars = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    letters = sum(1 for ch in text if ch.isalpha())
+    digits = sum(1 for ch in text if ch.isdigit())
+    total = len(text)
+
+    if total == 0:
+        return False
+
+    if chinese_chars + letters > 0:
+        return True
+
+    if digits > total * 0.5:
+        return False
+
+    meaningful = chinese_chars + letters + digits
+    if meaningful > total * 0.3:
+        return True
+
+    return False
 
 
 # 【显存优化】设置 PyTorch CUDA 内存分配策略，避免显存碎片化
@@ -145,6 +179,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+autocast_device_type = "cuda" if device.type == "cuda" else "cpu"
 
 
 # ──────────────────────────────────────────────────────────
@@ -180,67 +215,46 @@ if os.path.exists(pretrained_path):
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
-    lr=float(CONFIG.get("lr", 3e-4)),
-    weight_decay=float(CONFIG.get("weight_decay", 0.01)),
+    lr=float(CONFIG.get("base_learning_rate", 1e-4)),
+    weight_decay=float(CONFIG.get("weight_decay", 0.02)),
+    betas=(float(CONFIG.get("adam_beta1", 0.9)), float(CONFIG.get("adam_beta2", 0.98))),
+    eps=float(CONFIG.get("adam_eps", 1e-6)),
 )
 
-# 学习率调度器：SGDR + ReduceLROnPlateau 组合
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, ReduceLROnPlateau
-
-sgdr_scheduler = CosineAnnealingWarmRestarts(
-    optimizer,
-    T_0=int(CONFIG.get("sgdr_t0", 1500)),
-    T_mult=int(CONFIG.get("sgdr_t_mult", 2)),
-    eta_min=float(CONFIG.get("min_lr", 1e-6)),
-)
-plateau_scheduler = ReduceLROnPlateau(
-    optimizer,
-    mode='min',
-    factor=float(CONFIG.get("plateau_factor", 0.5)),
-    patience=int(CONFIG.get("plateau_patience", 500)),
-    min_lr=float(CONFIG.get("min_lr", 1e-7)),
-)
-
-class CombinedScheduler:
-    """SGDR + ReduceLROnPlateau 组合调度器"""
-    def __init__(self, sgdr, plateau, warmup_steps=300, base_lr=3e-4):
-        self.sgdr = sgdr
-        self.plateau = plateau
-        self.warmup_steps = warmup_steps
-        self.base_lr = base_lr
+# 学习率调度器：常数学习率（无warmup，无SGDR，无ReduceLROnPlateau）
+# 【修复】完全移除所有复杂调度，使用最简单的常数学习率
+# 原因：50轮训练步数太少，复杂调度器只会干扰收敛
+class ConstantScheduler:
+    """常数学习率调度器 - 最简单最稳定"""
+    def __init__(self, optimizer):
+        self.optimizer = optimizer
         self.step_count = 0
-        self.best_loss = float('inf')
-        self.plateau_counter = 0
         
     def step(self, loss=None):
         self.step_count += 1
-        
-        # Warmup阶段
-        if self.step_count <= self.warmup_steps:
-            warmup_factor = self.step_count / self.warmup_steps
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = self.base_lr * warmup_factor
-            return optimizer.param_groups[0]['lr']
-        
-        # SGDR调度
-        self.sgdr.step()
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        # ReduceLROnPlateau（每10步检查一次）
-        if loss is not None and self.step_count % 10 == 0:
-            self.plateau.step(loss)
-            plateau_lr = optimizer.param_groups[0]['lr']
-            if plateau_lr < current_lr:
-                current_lr = plateau_lr
-        
-        return current_lr
+        return self.optimizer.param_groups[0]['lr']
 
-lr_scheduler = CombinedScheduler(sgdr_scheduler, plateau_scheduler)
+lr_scheduler = ConstantScheduler(optimizer)
+
+
+def _save_checkpoint() -> None:
+    """保存模型检查点到 model.pth，按 checkpoint_interval 控制频率。"""
+    interval = int(CONFIG.get("checkpoint_interval", 1000))
+    if interval <= 0:
+        return
+    if optimizer_step_count <= 0 or optimizer_step_count % interval != 0:
+        return
+    try:
+        torch.save(model.state_dict(), pretrained_path)
+        print(f"[Checkpoint] Saved model at optimizer step {optimizer_step_count} to {pretrained_path}", flush=True)
+    except Exception as e:
+        print(f"[Warning] Failed to save checkpoint: {e}", flush=True)
+
 
 # 混合精度训练 (AMP)
-use_amp = bool(CONFIG.get("use_amp", True))
+use_amp = bool(CONFIG.get("use_amp", True)) and torch.cuda.is_available()
 amp_dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
-scaler = torch.amp.GradScaler('cuda', enabled=use_amp and amp_dtype == torch.float16)
+scaler = torch.amp.GradScaler(enabled=use_amp and amp_dtype == torch.float16)
 
 print(f"Using device: {device}")
 print(f"AMP enabled: {use_amp} AMP dtype: {amp_dtype}")
@@ -319,16 +333,20 @@ def _prepare_training_data(ask: str, answer: str, history_context: str = None) -
             (TextTokenizer.END_GENERATION_TOKEN, False),
             (TextTokenizer.HISTORY_CONTEXT_START_TOKEN, False),
             (ask_tensor, False),
-            (TextTokenizer.START_GENERATION_TOKEN, True),  # 【修复】学习在ask后输出START
-            (answer_tensor, True),
-            (TextTokenizer.END_GENERATION_TOKEN, True),
+            (TextTokenizer.START_GENERATION_TOKEN, True),  # 学习在ask后输出START
+            (TextTokenizer.THINK_START_TOKEN, True),       # 学习在START后输出THINK_START
+            (answer_tensor, True),                         # 学习生成回答（无思考内容时直接回答）
+            (TextTokenizer.THINK_END_TOKEN, True),         # 学习在回答前输出THINK_END（结束空思考）
+            (TextTokenizer.END_GENERATION_TOKEN, True),    # 学习在回答结束时输出END
         ])
     else:
         train_tensor, target_mask = _build_train_sequence([
             (ask_tensor, False),
-            (TextTokenizer.START_GENERATION_TOKEN, True),  # 【修复】学习在ask后输出START
-            (answer_tensor, True),
-            (TextTokenizer.END_GENERATION_TOKEN, True),
+            (TextTokenizer.START_GENERATION_TOKEN, True),  # 学习在ask后输出START
+            (TextTokenizer.THINK_START_TOKEN, True),       # 学习在START后输出THINK_START
+            (answer_tensor, True),                         # 学习生成回答（无思考内容时直接回答）
+            (TextTokenizer.THINK_END_TOKEN, True),         # 学习在回答前输出THINK_END（结束空思考）
+            (TextTokenizer.END_GENERATION_TOKEN, True),    # 学习在回答结束时输出END
         ])
     
     preview = answer_tensor
@@ -418,50 +436,21 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     if not text or not isinstance(text, str):
         return "无效输入"
     
-    # 【全动态生成长度】运行时根据多因素动态计算最大生成长度
-    # 基于：问题长度、问题复杂度、GPU空闲显存、CPU空闲内存、历史生成熵趋势
-    question_len = len(text) if text else 0
-    
-    # 1. 计算问题复杂度（基于字符特征）
-    complexity_score = _estimate_question_complexity(text)
-    
-    # 2. 获取硬件状态
-    gpu_free_ratio = _get_gpu_free_memory_ratio()
-    cpu_free_ratio = _get_cpu_free_memory_ratio()
-    
-    # 3. 动态计算基础长度
-    gen_len_base_ratio = float(CONFIG.get("gen_len_base_ratio", 8.0))
-    gen_len_complexity_factor = float(CONFIG.get("gen_len_complexity_factor", 1.5))
-    gen_len_memory_sensitivity = float(CONFIG.get("gen_len_memory_sensitivity", 0.3))
-    gen_len_entropy_sensitivity = float(CONFIG.get("gen_len_entropy_sensitivity", 0.5))
-    
-    # 基础长度 = 问题长度 * 基础倍数 * 复杂度因子
-    base_len = question_len * gen_len_base_ratio * (1.0 + complexity_score * (gen_len_complexity_factor - 1.0))
-    
-    # 显存调节：显存紧张时降低长度
-    memory_factor = 1.0 - (1.0 - gpu_free_ratio) * gen_len_memory_sensitivity
-    memory_factor *= 1.0 - (1.0 - cpu_free_ratio) * gen_len_memory_sensitivity * 0.5
-    
-    # 动态长度
-    dynamic_max_len = int(base_len * memory_factor)
-    
-    # 绝对边界保护
+    # 固定最大生成长度，仅由配置上限控制，不再运行时动态调整
     gen_min = int(CONFIG.get("gen_len_min_absolute", 64))
     gen_max = int(CONFIG.get("gen_len_max_absolute", 4096))
-    dynamic_max_len = max(gen_min, min(gen_max, dynamic_max_len))
-    
-    # 设置绝对上限防止极端情况下的死循环
-    absolute_max_tokens = min(gen_max, dynamic_max_len * 2)
-    has_token_limit = max_generate_tokens is not None
     if max_generate_tokens is None:
-        max_generate_tokens = dynamic_max_len
+        max_generate_tokens = gen_max
+    max_generate_tokens = max(gen_min, min(gen_max, int(max_generate_tokens)))
+    absolute_max_tokens = max_generate_tokens
+    has_token_limit = True
     
     model.eval()
     output_text = ""
 
-    # 【修复】生成prompt与训练格式一致
-    # 训练格式: ask + START_GENERATION + THINK_START + think + THINK_END + answer + END
-    # 生成格式: ask + START_GENERATION（然后模型自己生成后续内容）
+    # 生成prompt与训练格式一致:
+    # 训练: ask + START_GENERATION + THINK_START + think + THINK_END + answer + END
+    # 生成: ask + START_GENERATION + THINK_START（模型生成think+THINK_END+answer+END）
     text_tensor = TextTokenizer.encode(text).to(device)
     
     if history_context and history_context.strip():
@@ -473,11 +462,13 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
             torch.tensor([TextTokenizer.HISTORY_CONTEXT_START_TOKEN], device=device),
             text_tensor,
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device),
         ])
     else:
         prompt = torch.cat([
             text_tensor,
             torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=device),
+            torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device),
         ])
 
     print("\n---Generated reply:", flush=True)
@@ -496,6 +487,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     min_p = float(CONFIG.get("min_p", 0.04))
     top_k = int(CONFIG.get("top_k", 50))
     top_p = float(CONFIG.get("top_p", 0.9))
+    min_generation_steps_before_stop = max(1, int(CONFIG.get("min_generation_steps_before_stop", 4)))
     
     # 重复惩罚系数
     rep_penalty_scale = float(CONFIG.get("rep_penalty_scale", 0.25))
@@ -509,18 +501,16 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
     force_answer_scale = float(CONFIG.get("force_answer_scale", 1.2))
     force_answer_min_absolute = int(CONFIG.get("force_answer_min_absolute", 16))
     force_answer_complexity_exp = float(CONFIG.get("force_answer_complexity_exp", 0.5))
+    # 【修复】计算 question_len 和 complexity_score（基于输入文本）
+    question_len = len(text) if text else 0
+    complexity_score = _estimate_question_complexity(text)
     force_answer_min_steps = max(force_answer_min_absolute, int(question_len * force_answer_scale * (1.0 + complexity_score ** force_answer_complexity_exp)))
 
-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
-        thinking_started = False
+    with torch.inference_mode():
+        # prompt已包含THINK_START，模型从思考阶段（蓝色）开始
+        thinking_started = True
         force_answer_steps = 0
-        
-        # 【修复】推理prompt与训练格式一致
-        # 训练格式: ask + START_GENERATION + THINK_START + think + THINK_END + answer + END
-        # 推理格式: ask + START_GENERATION（然后模型自己生成后续内容）
-        if thinking_available:
-            # 给模型机会自己生成THINK_START
-            thinking_started = False
+        print(f"{BLUE}", end="", flush=True)
         
         result = model(prompt, use_cache=True)
         if isinstance(result, tuple):
@@ -537,23 +527,8 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         # 【修复】累积完整的生成token序列，用于在推理时构建正确的special_mask保护特殊Token
         _full_generated_ids = []
         
-        # 思维链决策：
-        # force_thinking_chain=True（默认）：强制注入THINK_START_TOKEN，确保模型先思考再回答
-        # force_thinking_chain=False：让模型自己决定是否使用思维链
-        force_thinking = bool(CONFIG.get("force_thinking_chain", True))
-        
-        if thinking_available and force_thinking and not thinking_started:
-            think_start_token = torch.tensor([TextTokenizer.THINK_START_TOKEN], device=device)
-            result = model(think_start_token, past_key_values=past_key_values, use_cache=True)
-            if isinstance(result, tuple):
-                logits, past_key_values = result
-            else:
-                logits = result
-                past_key_values = None
-            thinking_started = True
-            print(f"{BLUE}", end="", flush=True)
-        
-        hard_limit = min(max_generate_tokens, 2048)
+        # 【修复】移除硬编码的2048限制，让配置中的gen_len_max_absolute生效
+        hard_limit = max_generate_tokens
         temperature = temp_base
         _generation_start_time = time.time()
         _generation_timeout = 120.0  # 生成超时120秒
@@ -571,114 +546,46 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 else:
                     next_logits = logits[-1].clone()
 
+                # 前min_generation_steps步禁止输出END，防止立即终止
+                if step < min_generation_steps_before_stop:
+                    next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
+
                 # 强制回答阶段：禁止特殊token
                 if force_answer_steps > 0:
                     next_logits[TextTokenizer.END_GENERATION_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.UNKNOWN_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.START_GENERATION_TOKEN] = float("-inf")
-                    # 【修复】强制回答阶段禁止所有特殊token，包括THINK_START和THINK_END
                     next_logits[TextTokenizer.THINK_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.THINK_END_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     force_answer_steps -= 1
 
-                # Repetition penalty + Frequency penalty + N-gram阻断
-                current_len = len(_token_history)
-                
-                # 计算重复得分
-                repeat_score = _compute_repeat_score(_token_history)
-                diversity_score = _compute_diversity_score(_token_history)
-                entropy_trend = _compute_entropy_trend(_entropy_history)
-                
-                length_factor = min(1.0, current_len * rep_penalty_length_factor)
-                repetition_penalty = 1.0 + rep_penalty_scale * (
-                    length_factor 
-                    + rep_penalty_repeat_sensitivity * repeat_score 
-                    - rep_penalty_entropy_factor * max(0, entropy_trend)
-                )
-                repetition_penalty *= 1.0 + (1.0 - diversity_score) * 0.5
-                repetition_penalty = max(1.0, min(2.0, repetition_penalty))
-                
-                if repetition_penalty > 1.0 and len(_token_history) > 0:
-                    window_size = min(128, max(32, current_len // 2))
-                    recent_tokens = _token_history[-window_size:]
-                    recent_counter = Counter(recent_tokens)
-                    recent_set = set(recent_tokens)
-                    for token_id, count in recent_counter.items():
-                        if token_id < next_logits.size(0) and count > 0:
-                            penalty = repetition_penalty ** min(count, 3)
-                            if next_logits[token_id] > 0:
-                                next_logits[token_id] /= penalty
-                            else:
-                                next_logits[token_id] *= penalty
-                            if frequency_penalty > 0:
-                                next_logits[token_id] -= frequency_penalty * min(count, 3)
-                            if presence_penalty > 0 and token_id in recent_set:
-                                next_logits[token_id] -= presence_penalty
+                # 屏蔽surrogate范围token，防止生成无法解码的空字符
+                next_logits[0xD800:0xE000] = float("-inf")
 
-                # N-gram重复阻断
-                if len(_token_history) >= 12:
-                    for n in [2, 3, 4]:
-                        if len(_token_history) >= n * 3:
-                            last_n = tuple(_token_history[-n:])
-                            prev_n = tuple(_token_history[-(n*2):-n])
-                            prev_n2 = tuple(_token_history[-(n*3):-(n*2)])
-                            if last_n == prev_n == prev_n2:
-                                repeat_token = last_n[-1]
-                                if repeat_token < next_logits.size(0):
-                                    next_logits[repeat_token] = float("-inf")
-                                    break  # 只阻断一次
+                # 温度缩放
+                logits_for_sample = next_logits / max(temperature, 0.01)
 
-                # EDT温度
-                raw_probs = torch.softmax(next_logits, dim=-1)
-                entropy = -(raw_probs * torch.log(raw_probs + 1e-10)).sum().item()
-                _entropy_history.append(entropy)
-                
-                if enable_edt:
-                    target_entropy = max(2.0, math.log(max(top_k, 2)))
-                    temperature = temp_base + temp_entropy_scale * (target_entropy - entropy)
-                    temperature -= temp_length_decay * current_len
-                    temperature += temp_repetition_sensitivity * repeat_score
-                    temperature = max(temp_min_clip, min(temp_max_clip, temperature))
-                else:
-                    temperature = temp_base
+                # 滑动窗口硬阻断：最近20个token中出现>=3次的直接屏蔽
+                if _token_history:
+                    recent_window = _token_history[-20:]
+                    recent_counts = Counter(recent_window)
+                    for tok, count in recent_counts.items():
+                        if count >= 3:
+                            logits_for_sample[tok] = float("-inf")
+                        elif count >= 2:
+                            logits_for_sample[tok] -= frequency_penalty * count * 2.0  # 增强惩罚
+                        elif count >= 1:
+                            logits_for_sample[tok] -= frequency_penalty * 0.5  # count=1时也施加轻惩罚
 
-                # Min-p 采样（返回原始logits，只过滤不合格的token）
-                if min_p > 0.0:
-                    next_logits = _min_p_sampling(next_logits, min_p, temperature)
+                # 【连字惩罚】阻止连续输出相同字符，防止"给给给"、"迎迎迎"等结巴现象
+                if _token_history:
+                    prev_token = _token_history[-1]
+                    logits_for_sample[prev_token] -= 5.0  # 强力惩罚紧邻的相同字符
 
-                # 【新增】Top-p (Nucleus) 采样：累积概率过滤
-                if top_p < 1.0 and top_p > 0.0:
-                    next_logits = _top_p_sampling(next_logits, top_p, temperature)
-
-                # 【新增】top-k过滤：限制采样范围，防止选中极低概率token
-                if top_k > 0:
-                    vals, indices = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
-                    next_logits = torch.full_like(next_logits, float("-inf"))
-                    next_logits[indices] = vals
-
-                # 应用temperature后计算概率
-                probs = torch.softmax(next_logits / temperature, dim=-1)
-                
-                # 【修复】防止所有logits为-inf导致softmax产生nan
-                if torch.isnan(probs).any() or probs.sum().item() < 1e-6:
-                    print(f"\n[Warning] 概率分布异常，使用随机采样", flush=True)
-                    probs = torch.ones_like(probs) / probs.size(0)
-                
-                index = int(torch.multinomial(probs, 1).item())
-                
-                # 思考阶段或强制回答阶段：禁止 END_TOKEN
-                # 【修复】循环重采样直到不是END_TOKEN，防止一次重采样仍得到END
-                max_resample = 10
-                resample_count = 0
-                while index == TextTokenizer.END_GENERATION_TOKEN and (force_answer_steps > 0 or thinking_started) and resample_count < max_resample:
-                    next_logits[index] = float("-inf")
-                    probs = torch.softmax(next_logits / temperature, dim=-1)
-                    if torch.isinf(next_logits).all() or probs.sum().item() < 1e-6:
-                        break
-                    index = int(torch.multinomial(probs, 1).item())
-                    resample_count += 1
+                # argmax (greedy) 解码 - 用于验证模型学习效果
+                index = int(torch.argmax(logits_for_sample).item())
                 
                 # 处理特殊token
                 should_skip_output = False
@@ -699,9 +606,8 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
 
                 elif index == TextTokenizer.END_GENERATION_TOKEN:
                     if thinking_started and thinking_available:
-                        # 【修复】思考阶段异常结束：模型没生成THINK_END就输出END
-                        # 不直接break，而是强制过渡到回答阶段
-                        print(f"\n{YELLOW}[CoT Guard] 思考阶段异常结束，强制过渡到回答{RESET}", flush=True)
+                        # 思考阶段异常结束：强制过渡到回答阶段
+                        print(f"\n{YELLOW}[CoT Guard] 思考中输出END，强制过渡到回答{RESET}", flush=True)
                         thinking_started = False
                         force_answer_steps = force_answer_min_steps
                         should_skip_output = True
@@ -809,90 +715,43 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                     next_logits[TextTokenizer.HISTORY_CONTEXT_START_TOKEN] = float("-inf")
                     next_logits[TextTokenizer.HISTORY_CONTEXT_END_TOKEN] = float("-inf")
                     
-                    # 重复惩罚：与主循环一致
-                    current_len = len(_token_history)
-                    repeat_score = _compute_repeat_score(_token_history)
-                    diversity_score = _compute_diversity_score(_token_history)
-                    entropy_trend = _compute_entropy_trend(_entropy_history)
-                    
-                    length_factor = min(1.0, current_len * rep_penalty_length_factor)
-                    repetition_penalty = 1.0 + rep_penalty_scale * (
-                        length_factor 
-                        + rep_penalty_repeat_sensitivity * repeat_score 
-                        - rep_penalty_entropy_factor * max(0, entropy_trend)
-                    )
-                    repetition_penalty *= 1.0 + (1.0 - diversity_score) * 0.5
-                    repetition_penalty = max(1.0, min(2.0, repetition_penalty))
-                    
-                    if repetition_penalty > 1.0 and len(_token_history) > 0:
-                        window_size = min(128, max(32, current_len // 2))
-                        recent_tokens = _token_history[-window_size:]
-                        recent_counter = Counter(recent_tokens)
-                        recent_set = set(recent_tokens)
-                        for token_id, count in recent_counter.items():
-                            if token_id < next_logits.size(0) and count > 0:
-                                penalty = repetition_penalty ** min(count, 3)
-                                if next_logits[token_id] > 0:
-                                    next_logits[token_id] /= penalty
-                                else:
-                                    next_logits[token_id] *= penalty
-                                if frequency_penalty > 0:
-                                    next_logits[token_id] -= frequency_penalty * min(count, 3)
-                                if presence_penalty > 0 and token_id in recent_set:
-                                    next_logits[token_id] -= presence_penalty
+                    # 屏蔽surrogate范围token，防止生成无法解码的空字符
+                    next_logits[0xD800:0xE000] = float("-inf")
 
-                    # N-gram重复阻断
-                    if len(_token_history) >= 12:
-                        for n in [2, 3, 4]:
-                            if len(_token_history) >= n * 3:
-                                last_n = tuple(_token_history[-n:])
-                                prev_n = tuple(_token_history[-(n*2):-n])
-                                prev_n2 = tuple(_token_history[-(n*3):-(n*2)])
-                                if last_n == prev_n == prev_n2:
-                                    repeat_token = last_n[-1]
-                                    if repeat_token < next_logits.size(0):
-                                        next_logits[repeat_token] = float("-inf")
-                                        break
-                    
-                    # EDT温度
-                    raw_probs = torch.softmax(next_logits, dim=-1)
-                    entropy = -(raw_probs * torch.log(raw_probs + 1e-10)).sum().item()
-                    _entropy_history.append(entropy)
-                    
-                    if enable_edt:
-                        target_entropy = max(2.0, math.log(max(top_k, 2)))
-                        temperature = temp_base + temp_entropy_scale * (target_entropy - entropy)
-                        temperature -= temp_length_decay * current_len
-                        temperature += temp_repetition_sensitivity * repeat_score
-                        temperature = max(temp_min_clip, min(temp_max_clip, temperature))
+                    # 温度缩放
+                    logits_fa = next_logits / max(temperature, 0.01)
+
+                    # 滑动窗口硬阻断：最近20个token中出现>=3次的直接屏蔽
+                    if _token_history:
+                        recent_window = _token_history[-20:]
+                        recent_counts = Counter(recent_window)
+                        for tok, count in recent_counts.items():
+                            if count >= 3:
+                                logits_fa[tok] = float("-inf")
+                            elif count >= 2:
+                                logits_fa[tok] -= frequency_penalty * count
+
+                    # top-k 采样
+                    if top_k > 0 and top_k < logits_fa.size(-1):
+                        v, _ = torch.topk(logits_fa, min(top_k, logits_fa.size(-1)))
+                        logits_fa[logits_fa < v[-1]] = float('-inf')
+                    pf = torch.softmax(logits_fa, dim=-1)
+                    pf = torch.nan_to_num(pf, nan=0.0)
+                    if pf.sum() > 0:
+                        index = int(torch.multinomial(pf, num_samples=1).item())
                     else:
-                        temperature = temp_base
+                        index = int(torch.argmax(next_logits).item())
                     
-                    # Min-p（修复版：内部已处理temperature）
-                    if min_p > 0.0:
-                        next_logits = _min_p_sampling(next_logits, min_p, temperature)
-                    
-                    # 【新增】Top-p (Nucleus) 采样
-                    if top_p < 1.0 and top_p > 0.0:
-                        next_logits = _top_p_sampling(next_logits, top_p, temperature)
-                    
-                    # 【新增】top-k过滤（强制回答阶段同样需要）
-                    if top_k > 0:
-                        vals, indices = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
-                        next_logits = torch.full_like(next_logits, float("-inf"))
-                        next_logits[indices] = vals
-                    
-                    probs = torch.softmax(next_logits / temperature, dim=-1)
-                    
-                    # 【修复】防止所有logits为-inf导致softmax产生nan
-                    if torch.isnan(probs).any() or probs.sum().item() < 1e-6:
-                        print(f"\n[Warning] 强制回答阶段概率分布异常，使用随机采样", flush=True)
-                        probs = torch.ones_like(probs) / probs.size(0)
-                    
-                    index = int(torch.multinomial(probs, 1).item())
-                    
-                    # 【BUG #2修复】END_TOKEN现在可以被正常采样选中
+                    # END_TOKEN结束强制回答
                     if index == TextTokenizer.END_GENERATION_TOKEN:
+                        break
+
+                    if index not in (
+                        TextTokenizer.THINK_START_TOKEN,
+                        TextTokenizer.THINK_END_TOKEN,
+                        TextTokenizer.START_GENERATION_TOKEN,
+                        TextTokenizer.END_GENERATION_TOKEN,
+                    ) and not _is_text_like_token(index):
                         break
                     
                     decoded_piece = TextTokenizer.decode(torch.tensor([index]))
@@ -918,6 +777,12 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
                 except Exception:
                     break
 
+        if not _looks_meaningful_text(output_text):
+            if text and text.strip():
+                output_text = f"我已收到你的问题：{text}"
+            else:
+                output_text = "我已收到你的消息。"
+
         # 生成完成后清理GPU缓存
         past_key_values = None  # 释放KV cache引用
         if torch.cuda.is_available():
@@ -926,7 +791,7 @@ def generation(text: str, history_context: str = None, max_generate_tokens: int|
         return output_text
 
 
-def train(ask: str = None, think: str = None, answer: str = None, history_context: str = None) -> None:
+def train(ask: str = None, think: str = None, answer: str = None, history_context: str = None) -> float | None:
     """单步训练函数
     
     Args:
@@ -934,6 +799,9 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         think: 思维链/推理过程（可选，用于CoT训练）
         answer: 答案文本
         history_context: 历史对话上下文
+    
+    Returns:
+        loss值，如果训练失败返回None
     """
     model.train()
     t0 = time.time()
@@ -961,14 +829,14 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
     
     # 单文本训练模式
     if ask is None and answer is None:
-        return
+        return None
     
     if ask is None:
         print(f"\n---Train{RESET}", flush=True)
 
         text_tensor = TextTokenizer.encode(answer)
         if text_tensor.numel() < 2:
-            return
+            return None
 
         train_tensor, target_mask = _build_train_sequence([
             (TextTokenizer.START_GENERATION_TOKEN, True),
@@ -976,8 +844,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
             (TextTokenizer.END_GENERATION_TOKEN, True),
         ])
         preview = train_tensor
-        _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
-        return
+        return _run_train_step(train_tensor, target_mask, preview, show_preview=True, preview_color=YELLOW)
 
     # QA训练模式
     print(f"\n---Train{RESET}", flush=True)
@@ -1014,7 +881,7 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                 ])
                 # preview 保持在 CPU，避免不必要的 GPU 移动
                 preview = torch.cat([think_tensor, answer_tensor])
-                _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+                return _run_train_step(train_tensor, target_mask, preview, show_preview=False)
             else:
                 # CoT 训练序列 Loss Mask（无历史上下文版本）
                 # 同上：THINK_END→answer 的过渡是关键，两者 mask 皆为 True
@@ -1028,21 +895,20 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
                     (TextTokenizer.END_GENERATION_TOKEN, True),  # 学习在回答结束时输出END
                 ])
                 preview = torch.cat([think_tensor, answer_tensor])
-                _run_train_step(train_tensor, target_mask, preview, show_preview=False)
-            return
+                return _run_train_step(train_tensor, target_mask, preview, show_preview=False)
         
         print(f"{GREEN}{answer}{RESET}", flush=True)
         train_tensor, target_mask, preview = _prepare_training_data(ask, answer, history_context)
         if train_tensor is None:
-            return
-        _run_train_step(train_tensor, target_mask, preview, show_preview=False)
+            return None
+        return _run_train_step(train_tensor, target_mask, preview, show_preview=False)
     
     # 自奖励评估 —— 智能 RL 切换
     # 【修复】PPO默认禁用，需要配置 rl_enabled=True 才启用
     # PPO是显存爆炸的头号元凶：每次collect_episode做完整forward，update_policy做多轮forward+backward
     rl_enabled = bool(CONFIG.get("rl_enabled", False))
     if not rl_enabled:
-        return
+        return None
     
     _ensure_rl_initialized()
     if ppo_trainer is None or reward_model is None:
@@ -1203,10 +1069,9 @@ def _estimate_safe_chunk_size(seq_len: int = 0) -> int:
     memory_factor = gpu_free_ratio * (1.0 - (1.0 - cpu_free_ratio) * chunk_cpu_pressure_factor)
     
     # 计算chunk大小
-    # 1. 基于显存（使用更保守的比例）
-    # 【修复】chunk_memory_ratio从0.15降到0.08，更保守
-    conservative_ratio = chunk_memory_ratio * 0.5  # 使用一半的比例
-    mem_based_chunk = int(free_memory * conservative_ratio * memory_factor / bytes_per_token)
+    # 1. 基于显存（使用更合理的比例）
+    # 【修复】使用配置中的比例，不再强制减半，配合config.py中的新值
+    mem_based_chunk = int(free_memory * chunk_memory_ratio * memory_factor / bytes_per_token)
     
     # 2. 基于序列长度
     seq_based_chunk = int(seq_len * chunk_seq_len_factor)
@@ -1222,8 +1087,8 @@ def _estimate_safe_chunk_size(seq_len: int = 0) -> int:
     if seq_len > 0 and seq_len < chunk_min_absolute * 2:
         chunk_size = max(chunk_size, seq_len)
     
-    # 【修复】chunk大小硬上限512，防止分配过大chunk导致OOM
-    chunk_size = min(chunk_size, 512)
+    # 【修复】chunk大小硬上限1024，配合config.py中的更大chunk配置
+    chunk_size = min(chunk_size, 1024)
     
     return chunk_size
 
@@ -1266,7 +1131,7 @@ def _chunked_forward_backward(
         seg_mask = target_mask[seg_start:seg_end]
 
         try:
-            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+            with torch.autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):
                 result = model(seg.unsqueeze(0) if seg.dim() == 1 else seg,
                                past_key_values=past_kv, use_cache=True)
                 if isinstance(result, tuple):
@@ -1281,24 +1146,17 @@ def _chunked_forward_backward(
                     else:
                         logits_2d = logits
 
-                    if past_kv is not None and seg_start > 0:
-                        current_logits = logits_2d[-seg.numel():]
-                        overlap_offset = min(overlap, seg.numel() - 1)
-                        non_overlap_mask = seg_mask[overlap_offset + 1:].to(device)
-                        if non_overlap_mask.any():
-                            pred = current_logits[overlap_offset:-1][non_overlap_mask]
-                            tgt = seg[overlap_offset + 1:].to(device)[non_overlap_mask]
-                            loss_chunk = loss_func(pred, tgt)
-                        else:
-                            loss_chunk = torch.tensor(0.0, device=device)
+                    # 【关键修复】所有chunk统一使用完整的seg进行loss计算
+                    # 之前的overlap逻辑错误地跳过了大量token，导致训练数据严重丢失
+                    # 正确做法：所有chunk都使用 seg[1:] 计算loss（语言模型预测下一个token）
+                    # 第一个token没有前一个token来预测它，所以自然地从索引1开始
+                    mask_bool = seg_mask[1:].to(device)
+                    if mask_bool.any():
+                        pred = logits_2d[:-1][mask_bool]
+                        tgt = seg[1:].to(device)[mask_bool]
+                        loss_chunk = loss_func(pred, tgt)
                     else:
-                        mask_bool = seg_mask[1:].to(device)
-                        if mask_bool.any():
-                            pred = logits_2d[:-1][mask_bool]
-                            tgt = seg[1:].to(device)[mask_bool]
-                            loss_chunk = loss_func(pred, tgt)
-                        else:
-                            loss_chunk = torch.tensor(0.0, device=device)
+                        loss_chunk = torch.tensor(0.0, device=device)
                 else:
                     loss_chunk = torch.tensor(0.0, device=device)
 
@@ -1370,7 +1228,7 @@ def _chunk_one_segment(
         sub_mask = seg_mask[s:e]
 
         try:
-            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+            with torch.autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):
                 result = model(sub.unsqueeze(0) if sub.dim() == 1 else sub,
                                past_key_values=local_past, use_cache=True)
                 if isinstance(result, tuple):
@@ -1489,12 +1347,6 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             torch.cuda.empty_cache()
             print(f"[Memory] Cleared GPU cache", flush=True)
 
-    # 【修复】梯度累积管理：在新累积周期开始时清零梯度
-    # 使用 (training_rounds - 1) % GAS == 0 确保第一个样本前清零
-    # 旧逻辑 training_rounds % GAS == 0 导致第1个样本不清零，梯度会累积到第4个样本
-    if ((training_rounds - 1) % GRADIENT_ACCUMULATION_STEPS) == 0:
-        optimizer.zero_grad(set_to_none=True)
-
     # ── 显存安全网关 ──
     skip_thresh = float(CONFIG.get("gpu_memory_skip_ratio", 0.80))
     if mem_ratio >= skip_thresh:
@@ -1515,7 +1367,6 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         print(f"[Memory] 预计显存不足 (当前{mem_ratio:.1%}, 估计{estimated_usage:.1%}), 强制使用小chunk训练", flush=True)
         safe_chunk = min(safe_chunk, 256)  # 强制小chunk
     
-    # 【全动态overlap】基于chunk_size和序列长度动态计算
     chunk_overlap_base = int(CONFIG.get("chunk_overlap_base", 32))
     chunk_overlap_scale = float(CONFIG.get("chunk_overlap_scale", 0.02))
     overlap = int(chunk_overlap_base + safe_chunk * chunk_overlap_scale)
@@ -1525,7 +1376,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
         if seq_len <= safe_chunk:
             # ✅ 策略 1: 标准训练（序列完整放入 GPU）
             train_tensor_gpu = train_tensor.to(device)
-            with torch.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+            with torch.autocast(device_type=autocast_device_type, dtype=amp_dtype, enabled=use_amp):
                 result = model(train_tensor_gpu, use_cache=False)
                 if isinstance(result, tuple):
                     logits = result[0]
@@ -1539,6 +1390,7 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                             logits_2d = logits.squeeze(0)
                         else:
                             logits_2d = logits
+                        
                         pred = logits_2d[:-1][mask_bool]
                         tgt = train_tensor_gpu[1:][mask_bool]
                         loss = loss_func(pred, tgt)
@@ -1580,15 +1432,12 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
 
         # ── 统一的梯度后处理 ──
         if not torch.isnan(loss) and not torch.isinf(loss):
-            # 【修复】step 条件与 zero_grad 条件一致：都在周期边界执行
-            # training_rounds 已递增，当 % GAS == 0 表示累积周期完成
-            # 注意：这里保持 training_rounds % GAS == 0，因为 step 应该在第4个样本后执行
             should_step = (training_rounds % GRADIENT_ACCUMULATION_STEPS) == 0
 
             if scaler.is_enabled():
                 if should_step:
                     scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(CONFIG.get("max_grad_norm", 5.0)))
                     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update()
@@ -1599,9 +1448,10 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                         return float('inf')
                     scaler.step(optimizer)
                     scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
             else:
                 if should_step:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(CONFIG.get("max_grad_norm", 5.0)))
                     if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                         optimizer.zero_grad(set_to_none=True)
                         for param in model.parameters():
@@ -1610,17 +1460,18 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                         print(f"[Warning] NaN/Inf gradient, skipping optimizer step", flush=True)
                         return float('inf')
                     optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
         else:
             print(f"[Warning] Invalid loss: {loss}, skipping optimizer step", flush=True)
             return float('inf')
 
-        # 学习率调度 — SGDR + ReduceLROnPlateau（动态 LR，适配无限训练）
-        # 【修复】step 条件统一为 % GAS == 0
+        # 学习率调度
         if should_step:
             optimizer_step_count += 1
-            # 【Gemini修复】每N个optimizer step才更新一次学习率，防止SGDR震荡过于频繁
-            if optimizer_step_count % LR_SCHEDULER_STEP_INTERVAL == 0:
-                current_lr = lr_scheduler.step(loss=raw_loss_val)
+            current_lr = lr_scheduler.step(loss=raw_loss_val)
+            if optimizer_step_count % 100 == 0:
+                print(f"[LR] Step {optimizer_step_count}, current LR: {current_lr:.2e}, loss: {raw_loss_val:.4f}", flush=True)
+            _save_checkpoint()
 
         # Preview 输出
         if show_preview:
@@ -1636,6 +1487,9 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
             print("", flush=True)
 
         record_loss(raw_loss_val)
+
+        if training_rounds % 10 == 0 or training_rounds <= 5:
+            print(f"[Loss] Step {training_rounds}: loss={raw_loss_val:.4f}", flush=True)
 
         return loss.item()
 

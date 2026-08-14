@@ -1,5 +1,6 @@
 from abc import abstractmethod
 import math
+import unicodedata
 
 import torch
 
@@ -19,13 +20,16 @@ class Tokenizer:
 
 
 class TextTokenizer(Tokenizer):
-    UNKNOWN_TOKEN = 0
-    START_GENERATION_TOKEN = 1
-    END_GENERATION_TOKEN = 2
-    HISTORY_CONTEXT_START_TOKEN = 3
-    HISTORY_CONTEXT_END_TOKEN = 4
-    THINK_START_TOKEN = 5
-    THINK_END_TOKEN = 6
+    # 【修复】将特殊token移到词表末尾，避免与Unicode码点(0-6)冲突
+    # 使用dict_size附近的值，确保不会与普通字符冲突
+    _BASE_OFFSET = 59990  # 基于dict_size=60000的偏移
+    UNKNOWN_TOKEN = _BASE_OFFSET + 0
+    START_GENERATION_TOKEN = _BASE_OFFSET + 1
+    END_GENERATION_TOKEN = _BASE_OFFSET + 2
+    HISTORY_CONTEXT_START_TOKEN = _BASE_OFFSET + 3
+    HISTORY_CONTEXT_END_TOKEN = _BASE_OFFSET + 4
+    THINK_START_TOKEN = _BASE_OFFSET + 5
+    THINK_END_TOKEN = _BASE_OFFSET + 6
     _SURROGATE_START = 0xD800
     _SURROGATE_END = 0xDFFF
 
@@ -48,6 +52,12 @@ class TextTokenizer(Tokenizer):
             else:
                 text = str(text)
 
+        if not text:
+            return torch.tensor([], dtype=torch.long)
+
+        # Normalize compatibility characters so fullwidth punctuation and alphanumerics map into trainable token range.
+        text = unicodedata.normalize('NFKC', text)
+
         tensor: list[int] = []
         dict_size = int(CONFIG["dict_size"])
 
@@ -59,9 +69,6 @@ class TextTokenizer(Tokenizer):
                 tensor.append(idx)
             else:
                 tensor.append(TextTokenizer.UNKNOWN_TOKEN)
-
-        if len(tensor) == 0:
-            tensor = [TextTokenizer.UNKNOWN_TOKEN]
 
         return torch.tensor(tensor, dtype=torch.long)
 

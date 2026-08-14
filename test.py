@@ -1,21 +1,24 @@
-from main import generation, train
+﻿from main import generation, train
 
 for i in range(50):
-    # 单文本训练：基础语言模式
-    train(None, None, "你是什么ai 我是deepseek ai", None)
-    
-    # CoT训练1：正确格式，think是推理过程，answer是最终答案
-    train("你是什么样子的ai", "我要思考我是什么。我是一个ai，一个大语言模型。", "我是一个大模型，我叫deepseek。")
-    
-    # CoT训练2：修复格式，think和answer正确分离
-    train("python是什么语言", 
-          "python是一种编程语言。让我想想它的特点：它是解释型的、动态的、支持多种编程范式。",
-          "python是一种高级编程语言，具有简洁优雅的语法。",
-          "cpp是什么语言？cpp是静态类型语言。")
-    
-    # 额外训练：帮助模型学习THINK_START和THINK_END的正确使用
-    train("1+1等于几", "这是一个简单的数学问题。1加1等于2。", "1+1等于2。")
-    train("你好", "用户向我打招呼，我应该礼貌回应。", "你好！很高兴见到你。")
-    
-generation("你是什么样子的ai", None, max_generate_tokens=100, thinking_available=True)    
-generation("python是什么语言", None, max_generate_tokens=100, thinking_available=True)
+    # 纯文本训练示例：垂直领域对话提示模板
+    train(None, None, "这是一个简单测试", None)
+
+    # CoT示例1：清晰过程思路，think是过程，answer是最终回答
+    train("这是一个AI助手提示", "请给出一个简洁的回答。", "这是最终回答。")
+
+    # CoT示例2：概念结构过程，think和answer分别归纳
+    train(
+        "python是什么？",
+        "Python是一种高级编程语言，适合快速开发。",
+        "Python适用于数据科学、Web开发和自动化。"
+    )
+
+    # 反馈示例：用于换行思路和复核操作
+    train("1+1等于多少？", "这是一个数学问题。", "1+1等于2。")
+    train("你好", "用户开始对话。", "你好，欢迎使用测试脚本。")
+
+
+generation("你好", None, max_generate_tokens=256, thinking_available=True)
+generation("1+1等于多少？", None, max_generate_tokens=256, thinking_available=True)
+generation("python是什么？", None, max_generate_tokens=256, thinking_available=True)

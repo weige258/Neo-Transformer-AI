@@ -229,15 +229,17 @@ class WebCrawler:
             headers = self._get_headers()
             session = requests.Session()
             session.headers.update(headers)
-
-            response = session.get(
-                url,
-                headers=headers,
-                timeout=self.timeout,
-                allow_redirects=True,
-                verify=True
-            )
-            response.raise_for_status()
+            try:
+                response = session.get(
+                    url,
+                    headers=headers,
+                    timeout=self.timeout,
+                    allow_redirects=True,
+                    verify=True
+                )
+                response.raise_for_status()
+            finally:
+                session.close()
 
             content_type = response.headers.get('Content-Type', '')
             if 'text/html' not in content_type and 'text/plain' not in content_type:

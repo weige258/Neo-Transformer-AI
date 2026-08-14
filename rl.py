@@ -583,10 +583,10 @@ class LightweightPPO:
                 if isinstance(self.episode_data[key], list):
                     self.episode_data[key] = self.episode_data[key][-max_episodes//2:]
         
-        if prompt and generated_text:
+        if generated_text:
             # 【修复】显存保护：跳过过长序列的log_prob计算
             try:
-                prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
+                prompt_tokens = TextTokenizer.encode(prompt).to(self.device) if prompt else torch.tensor([], dtype=torch.long, device=self.device)
                 generated_tokens = TextTokenizer.encode(generated_text).to(self.device)
                 total_tokens = len(prompt_tokens) + len(generated_tokens)
                 if total_tokens > 1024:  # 超长序列跳过，防显存爆炸
@@ -643,12 +643,20 @@ class LightweightPPO:
         if not generated_text or not generated_text.strip():
             return None, None
         
-        prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
+        if prompt is None or prompt == "":
+            prompt_tokens = torch.tensor([], dtype=torch.long, device=self.device)
+        else:
+            prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
         generated_tokens = TextTokenizer.encode(generated_text).to(self.device)
         
         if generated_tokens.numel() == 0:
             return None, None
         
+        if prompt_tokens.numel() == 0:
+            # 空 prompt 的对齐方式：使用 START_GENERATION_TOKEN 作为前缀，
+            # 与单文本训练样本的格式保持一致。
+            prompt_tokens = torch.tensor([TextTokenizer.START_GENERATION_TOKEN], device=self.device, dtype=torch.long)
+
         full_sequence = torch.cat([prompt_tokens, generated_tokens])
         
         result = self.model(full_sequence, use_cache=False)
@@ -660,7 +668,7 @@ class LightweightPPO:
         prompt_len = len(prompt_tokens)
         gen_len = len(generated_tokens)
         
-        if len(logits) < gen_len + 1:
+        if len(logits) < prompt_len + gen_len:
             return None, None
         
         # ── 修复：向前平移1位，使 logits[i-1] 对应 generated_tokens[i] ──

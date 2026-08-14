@@ -5,19 +5,19 @@ CONFIG: Dict[str, Any] = {
     # 1️⃣ 模型架构参数（架构固定，运行时动态调整行为）
     # ═══════════════════════════════════════════════════════
     "dict_size": 60000,
-    "emb_size": 512,
-    "num_heads": 8,
-    "num_transformer_blocks": 8,
+    "emb_size": 256,
+    "num_heads": 4,
+    "num_transformer_blocks": 4,
     "tie_token_embeddings": True,
-    "dropout": 0.05,
+    "dropout": 0.0,                   # 0.1→0.0，小数据不需要dropout                   
 
     # ═══════════════════════════════════════════════════════
     # 2️⃣ 注意力机制配置（动态系数，无固定阈值）
     # ═══════════════════════════════════════════════════════
     "attention_mix": {
-        "csa": 1.0,
-        "sliding_window": 1.0,
-        "mla": 1.0,
+        "csa": 0.1,
+        "sliding_window": 5.0,
+        "mla": 0.1,
     },
     # ── 动态窗口系数 ──
     # 滑动窗口大小完全运行时动态计算：
@@ -55,31 +55,21 @@ CONFIG: Dict[str, Any] = {
     "max_mem_kv_capacity": 128,        # 压缩记忆容量（256→128，防显存膨胀）
     "h2_ratio": 0.3,
     "use_amp": True,
-    "use_gradient_checkpointing": True,
+    "use_gradient_checkpointing": False,
     "gpu_cache_clear_threshold_gb": 4.0,
     "max_forward_chunk": 512,
     
     # ── 显存硬限制配置 ──
-    "max_recent_kv_len": 512,        # recent_k/v 绝对最大长度（2048→512，防显存爆炸）
-    "max_total_kv_len": 1024,        # 拼接后 raw_k/v 绝对最大长度（4096→1024）
-    "kv_cache_max_len": 512,         # _detach_kv_cache 最大长度（1024→512）
+    # 【修复】适度放宽KV缓存限制，配合更大的max_seq_len
+    "max_recent_kv_len": 1024,       # 512→1024，保留更多近期上下文
+    "max_total_kv_len": 2048,        # 1024→2048，配合4096的max_seq_len
+    "kv_cache_max_len": 1024,        # 512→1024，更宽松的KV缓存
 
     # ═══════════════════════════════════════════════════════
-    # 4️⃣ 序列长度与显存管理（全动态计算）
-    # ═══════════════════════════════════════════════════════
-    # 最大生成长度完全运行时动态计算：
-    #   max_len = f(question_len, question_complexity, gpu_free_memory, cpu_free_memory, generation_entropy_history)
-    # 系数说明：
-    #   - gen_len_base_ratio: 基础长度 = question_len * base_ratio
-    #   - gen_len_complexity_factor: 复杂度调节因子
-    #   - gen_len_memory_sensitivity: 显存敏感度（显存紧张时降低长度）
-    #   - gen_len_entropy_sensitivity: 生成熵敏感度（高熵时允许更长生成）
-    "gen_len_base_ratio": 8.0,        # 基础长度倍数（32→8，防生成过长卡死）
-    "gen_len_complexity_factor": 1.5,  # 复杂度因子
-    "gen_len_memory_sensitivity": 0.3, # 显存敏感度（0.15→0.3，显存紧张时更积极缩短）
-    "gen_len_entropy_sensitivity": 0.5, # 熵敏感度
-    "gen_len_min_absolute": 64,       # 绝对最小长度（256→64）
-    "gen_len_max_absolute": 2048,     # 绝对最大长度（4096→2048，防生成卡死）
+    # 4️⃣ 序列长度与显存管理（固定边界）
+    # 最大生成长度由配置上限控制，不再运行时动态调整
+    "gen_len_min_absolute": 32,       # 64→32，降低最低长度
+    "gen_len_max_absolute": 512,      # 最大生成长度
     "dynamic_segment_overlap": 32,
     "gpu_memory_safe_ratio": 0.85,
     "gpu_memory_skip_ratio": 0.80,     # 显存跳过阈值（0.92→0.80，更早保护）
@@ -87,55 +77,61 @@ CONFIG: Dict[str, Any] = {
     # ═══════════════════════════════════════════════════════
     # 5️⃣ 生成采样策略
     # ═══════════════════════════════════════════════════════
-    "temp_base": 0.7,
-    "temp_entropy_scale": 0.4,
-    "temp_repetition_sensitivity": 0.6,
-    "temp_length_decay": 0.001,
-    "temp_min_clip": 0.3,
-    "temp_max_clip": 1.5,
-    "enable_edt": True,
-    "min_p": 0.04,
-    "top_k": 50,
-    "top_p": 0.9,
+    # 【修复】使用贪心解码：temperature=0表示argmax
+    "temp_base": 0.8,                 # 1.0→0.8，略微降低温度
+    "temp_entropy_scale": 0.0,
+    "temp_repetition_sensitivity": 0.0,
+    "temp_length_decay": 0.0,
+    "temp_min_clip": 0.8,
+    "temp_max_clip": 1.2,
+    "enable_edt": False,
+    "min_p": 0.0,                     # 禁用min-p（nanoGPT不用）
+    "top_k": 50,                      # nanoGPT风格: 仅top-k
+    "top_p": 1.0,                     # 禁用top-p（nanoGPT不用）
     "force_thinking_chain": True,
+    "min_generation_steps_before_stop": 8,  # 4→8，更多步数禁止END
     # ═══════════════════════════════════════════════════════
     # 6️⃣ 重复惩罚
     # ═══════════════════════════════════════════════════════
-    "rep_penalty_scale": 0.25,
-    "rep_penalty_length_factor": 0.002,
-    "rep_penalty_repeat_sensitivity": 2.0,
-    "rep_penalty_entropy_factor": 0.8,
-    "frequency_penalty": 0.3,
-    "presence_penalty": 0.1,
-    "force_answer_scale": 8.0,
-    "force_answer_min_absolute": 128,
-    "force_answer_complexity_exp": 0.5,
+    # 【修复】基于网络研究：repetition_penalty推荐1.05-1.15
+    # 我们的rep_penalty_scale计算方式：repetition_penalty = 1.0 + scale * factor
+    # 所以scale=0.1时，基础惩罚约1.1，符合推荐范围
+    "rep_penalty_scale": 0.1,
+    "rep_penalty_length_factor": 0.001,
+    "rep_penalty_repeat_sensitivity": 1.0,
+    "rep_penalty_entropy_factor": 0.0,
+    "frequency_penalty": 1.0,
+    "presence_penalty": 0.3,
+    # 【修复】减少强制回答步数，避免过度强制
+    "force_answer_scale": 2.0,
+    "force_answer_min_absolute": 8,
+    "force_answer_complexity_exp": 0.3,
 
     # ═══════════════════════════════════════════════════════
     # 7️⃣ 学习率调度配置
     # ═══════════════════════════════════════════════════════
-    "gradient_accumulation_steps": 4,    # 梯度累积步数（1→4，减少显存占用）
-    "base_learning_rate": 3e-4,
-    "warmup_steps": 300,
-    "warmup_init_lr": 1e-6,
-    "sgdr_t_0": 1500,
-    "sgdr_t_mult": 2,
-    "sgdr_eta_min": 1e-6,
-    "reduce_lr_patience": 800,
-    "reduce_lr_factor": 0.5,
-    "reduce_lr_min_lr": 5e-6,
+    # 【修复】使用常数学习率，无warmup，无SGDR，无ReduceLROnPlateau
+    # 原因：50轮训练步数太少，复杂调度器只会干扰收敛
+    "gradient_accumulation_steps": 1,    # 2→1，每步都更新，最大化学习信号
+    "base_learning_rate": 3e-4,          
+    # 【移除】所有warmup/SGDR/ReduceLROnPlateau相关参数
+    # "warmup_steps": 0,                  # 已移除
+    # "warmup_init_lr": 5e-4,             # 已移除
+    # "sgdr_t_0": ...                     # 已移除
+    # "reduce_lr_patience": ...           # 已移除
     "weight_decay": 0.01,
     "max_grad_norm": 1.0,
     "adam_beta1": 0.9,
-    "adam_beta2": 0.999,
-    "adam_eps": 1e-8,
+    "adam_beta2": 0.95,                 # 0.999→0.95，更快响应新梯度
+    "adam_eps": 1e-8,                    # 1e-6→1e-8，标准AdamW值
 
     # ═══════════════════════════════════════════════════════
     # 8️⃣ 训练数据与采样配置
     # ═══════════════════════════════════════════════════════
-    "max_seq_len": 2048,               # 最大序列长度（99999999→2048，防显存爆炸）
+    # 【修复】提高最大序列长度，字符级tokenizer需要更长的上下文
+    "max_seq_len": 4096,               # 2048→4096，字符级模型需要更长上下文
     "min_seq_len": 8,
-    "packing_max_seq_len": 2048,       # 打包最大序列长度（99999999→2048）
+    "packing_max_seq_len": 4096,       # 2048→4096，与max_seq_len一致
     "packing_buffer_size": 5000,
     "dataset_shuffle": True,
     "dataset_num_workers": 0,
@@ -158,13 +154,14 @@ CONFIG: Dict[str, Any] = {
     #   - chunk_min_absolute: 绝对最小chunk（防止过小）
     #   - chunk_max_ratio: 最大chunk占seq_len比例
     #   - chunk_cpu_pressure_factor: CPU压力调节因子
-    "chunk_memory_ratio": 0.15,       # chunk显存占比
-    "chunk_seq_len_factor": 0.3,      # 序列长度因子
-    "chunk_min_absolute": 128,        # 绝对最小chunk
-    "chunk_max_ratio": 0.5,           # 最大比例
-    "chunk_cpu_pressure_factor": 0.2,  # CPU压力因子
-    "chunk_overlap_base": 32,         # 基础overlap
-    "chunk_overlap_scale": 0.02,      # overlap缩放
+    # 【修复】提高chunk显存占比和序列因子，减少分块数量，保留更多上下文
+    "chunk_memory_ratio": 0.25,       # 0.15→0.25，允许更大的chunk
+    "chunk_seq_len_factor": 0.5,      # 0.3→0.5，更大的序列因子
+    "chunk_min_absolute": 256,        # 128→256，提高最小chunk，减少分块数
+    "chunk_max_ratio": 0.75,          # 0.5→0.75，允许更大的chunk比例
+    "chunk_cpu_pressure_factor": 0.15, # 0.2→0.15，降低CPU压力影响
+    "chunk_overlap_base": 64,         # 32→64，增加overlap保留更多上下文
+    "chunk_overlap_scale": 0.03,      # 0.02→0.03，增加overlap缩放
 
     # ═══════════════════════════════════════════════════════
     # 🔟 强化学习配置（PPO稳定训练）
@@ -176,7 +173,7 @@ CONFIG: Dict[str, Any] = {
     "rl_min_episodes": 32,
     "rl_update_batch_size": 4,        # PPO更新batch size（8→4，减少显存）
     "rl_update_interval": 8,          # 更新检查间隔（4→8，降低PPO频率）
-    "rl_enabled": False,              # PPO默认禁用（防显存爆炸，手动开启）
+    "rl_enabled": True,              
 
     # ═══════════════════════════════════════════════════════
     # ⑪ 学习率调度器配置
@@ -184,7 +181,8 @@ CONFIG: Dict[str, Any] = {
     # lr_scheduler步进间隔：每N个optimizer step才更新一次学习率
     #   - 防止大数据集下SGDR震荡过于频繁
     #   - 1 = 每个step都更新（旧行为），4 = 每4个step更新（推荐）
-    "lr_scheduler_step_interval": 4,  # 学习率调度步进间隔
+    # 【修复】降低调度间隔，让学习率更灵敏地响应训练状态
+    "lr_scheduler_step_interval": 1,  # 4→1，每个optimizer step都更新学习率
 
     # ═══════════════════════════════════════════════════════
     # ⑫ 系统与硬件监控

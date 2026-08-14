@@ -70,7 +70,7 @@ class StreamingDataset:
                         line = line.strip()
                         if not line or line == "[" or line == "]":
                             continue
-                        if line.startswith("{"):
+                        if line.lstrip().startswith("{"):
                             try:
                                 item = json.loads(line.rstrip().rstrip(","))
                                 if "ask" in item and "answer" in item:
@@ -146,66 +146,60 @@ class StreamingDataset:
                 f"文件 {file_path} 过大 ({file_size / 1024 / 1024:.2f}MB > {max_file_size / 1024 / 1024:.2f}MB)，"
                 f"可能存在安全风险或格式错误"
             )
-        
-        try:
-            with open(file_path, "r", encoding="utf-8") as f:
-                try:
-                    data = json.load(f)
-                except json.JSONDecodeError as e:
-                    raise ValueError(f"JSON解析失败 {file_path}: {e}") from e
-                except MemoryError:
-                    import gc; gc.collect()
-                    raise MemoryError(f"JSON文件 {file_path} 加载时内存不足，文件可能过大或格式异常")
-        except (ValueError, MemoryError):
-            raise
-        except Exception as e:
-            if "内存不足" in str(e) or "MemoryError" in type(e).__name__:
-                import gc; gc.collect()
-                raise MemoryError(f"JSON文件 {file_path} 加载时内存不足: {e}")
-            raise ValueError(f"无法打开文件 {file_path}: {e}")
-        
+
         current_idx = 0
-        for item in data:
-            if "ask" in item and "answer" in item:
-                ask_raw = item.get("ask")
-                answer_raw = item.get("answer")
-                
-                if ask_raw is not None and answer_raw is not None:
-                    ask = str(ask_raw).strip()
-                    answer = str(answer_raw).strip()
-                    
-                    if ask and answer:
-                        if current_idx == target_local_idx:
-                            think_raw = item.get("think", "")
-                            think = str(think_raw).strip() if think_raw is not None else ""
-                            
-                            history_raw = item.get("history", [])
-                            if isinstance(history_raw, list) and len(history_raw) > 0:
-                                history_parts = []
-                                for msg in history_raw:
-                                    if isinstance(msg, dict):
-                                        role = msg.get("role", "unknown")
-                                        content = msg.get("content", "")
-                                        if role == "user":
-                                            history_parts.append(f"用户: {content}")
-                                        elif role == "assistant":
-                                            history_parts.append(f"助手: {content}")
-                                        else:
-                                            history_parts.append(f"{role}: {content}")
-                                    elif isinstance(msg, str):
-                                        history_parts.append(str(msg))
-                                history_context = "\n".join(history_parts)
-                            else:
-                                history_context = ""
-                            
-                            return {
-                                "ask": ask,
-                                "think": think,
-                                "answer": answer,
-                                "history_context": history_context
-                            }
-                        current_idx += 1
-        
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line in ["[", "]"]:
+                    continue
+                if not line.lstrip().startswith("{"):
+                    continue
+
+                try:
+                    item = json.loads(line.rstrip().rstrip(","))
+                except json.JSONDecodeError:
+                    continue
+
+                if "ask" in item and "answer" in item:
+                    ask_raw = item.get("ask")
+                    answer_raw = item.get("answer")
+
+                    if ask_raw is not None and answer_raw is not None:
+                        ask = str(ask_raw).strip()
+                        answer = str(answer_raw).strip()
+                        if ask and answer:
+                            if current_idx == target_local_idx:
+                                think_raw = item.get("think", "")
+                                think = str(think_raw).strip() if think_raw is not None else ""
+
+                                history_raw = item.get("history", [])
+                                if isinstance(history_raw, list) and len(history_raw) > 0:
+                                    history_parts = []
+                                    for msg in history_raw:
+                                        if isinstance(msg, dict):
+                                            role = msg.get("role", "unknown")
+                                            content = msg.get("content", "")
+                                            if role == "user":
+                                                history_parts.append(f"用户: {content}")
+                                            elif role == "assistant":
+                                                history_parts.append(f"助手: {content}")
+                                            else:
+                                                history_parts.append(f"{role}: {content}")
+                                        elif isinstance(msg, str):
+                                            history_parts.append(str(msg))
+                                    history_context = "\n".join(history_parts)
+                                else:
+                                    history_context = ""
+
+                                return {
+                                    "ask": ask,
+                                    "think": think,
+                                    "answer": answer,
+                                    "history_context": history_context
+                                }
+                            current_idx += 1
+
         raise IndexError(f"Entry {target_local_idx} not found in {file_path}")
 
 
