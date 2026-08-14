@@ -5,11 +5,11 @@ CONFIG: Dict[str, Any] = {
     # 1️⃣ 模型架构参数（架构固定，运行时动态调整行为）
     # ═══════════════════════════════════════════════════════
     "dict_size": 60000,
-    "emb_size": 256,
-    "num_heads": 4,
-    "num_transformer_blocks": 4,
+    "emb_size": 512,
+    "num_heads": 8,
+    "num_transformer_blocks": 8,
     "tie_token_embeddings": True,
-    "dropout": 0.0,                   # 0.1→0.0，小数据不需要dropout                   
+    "dropout": 0.1,                   # 0.1→0.0，小数据不需要dropout                   
 
     # ═══════════════════════════════════════════════════════
     # 2️⃣ 注意力机制配置（动态系数，无固定阈值）
@@ -182,7 +182,7 @@ CONFIG: Dict[str, Any] = {
     #   - 防止大数据集下SGDR震荡过于频繁
     #   - 1 = 每个step都更新（旧行为），4 = 每4个step更新（推荐）
     # 【修复】降低调度间隔，让学习率更灵敏地响应训练状态
-    "lr_scheduler_step_interval": 1,  # 4→1，每个optimizer step都更新学习率
+    "lr_scheduler_step_interval": 4,  
 
     # ═══════════════════════════════════════════════════════
     # ⑫ 系统与硬件监控
