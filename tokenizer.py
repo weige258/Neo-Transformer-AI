@@ -42,6 +42,11 @@ class TextTokenizer(Tokenizer):
         # Unicode最大码点是0x10FFFF = 1114111
         if idx > 0x10FFFF:
             return False
+        # 【修复】排除Unicode私用区(U+E000-U+F8FF)
+        # 特殊token 59990-59996 恰落在私用区(U+EA56-U+EA5C)，
+        # 不排除则外部输入(如爬虫数据)可直接注入特殊token
+        if 0xE000 <= idx <= 0xF8FF:
+            return False
         return not (TextTokenizer._SURROGATE_START <= idx <= TextTokenizer._SURROGATE_END)
 
     @staticmethod

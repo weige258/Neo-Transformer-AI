@@ -14,11 +14,9 @@ import json
 
 import string
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format='%(message)s'
-)
 logger = logging.getLogger(__name__)
+
+_STATE_FILE = 'crawler_state.json'
 
 _TLD_WEIGHTS = {
     "com": 500, "org": 50, "net": 40, "cn": 35, "de": 30, "uk": 28,
@@ -80,10 +78,12 @@ class WebCrawler:
         self.max_cache_size = max_cache_size
         self.max_sub_urls_per_page = max_sub_urls_per_page
 
-        self.url_queue = queue.Queue()
+        self.url_queue = queue.Queue(maxsize=10000)
         self.visited_urls = OrderedDict()
         self.failed_urls = OrderedDict()
         self._MAX_URL_SET_SIZE = 100000
+        self._MAX_CONTENT_SIZE = 5 * 1024 * 1024
+        self._thread_local = threading.local()
 
         self.cache = deque(maxlen=max_cache_size)
         self.cache_lock = threading.Lock()
@@ -98,6 +98,8 @@ class WebCrawler:
         self._fail_count = 0
         self._stats_lock = threading.Lock()
 
+        self.load_state()
+
         if seed_urls:
             if isinstance(seed_urls, str):
                 seed_urls = [seed_urls]
@@ -106,13 +108,19 @@ class WebCrawler:
                     url = 'https://' + url
                 with self.url_lock:
                     if url not in self.visited_urls and url not in self.failed_urls:
-                        self.url_queue.put(url)
+                        try:
+                            self.url_queue.put_nowait(url)
+                        except queue.Full:
+                            pass
         elif self.url_queue.qsize() == 0:
             seeds = []
             for _ in range(3):
                 seed = _generate_random_url()
+                try:
+                    self.url_queue.put_nowait(seed)
+                except queue.Full:
+                    break
                 seeds.append(seed)
-                self.url_queue.put(seed)
             print(f"[Crawler] 随机生成种子URL: {', '.join(seeds)}", flush=True)
 
         self._start_threads()
@@ -122,7 +130,6 @@ class WebCrawler:
         for i in range(self.max_workers):
             self.executor.submit(self._crawler_worker)
         threading.Thread(target=self._queue_manager, daemon=True).start()
-        threading.Thread(target=self._memory_cleaner, daemon=True).start()
 
     def _crawler_worker(self):
         while self.is_running and not self.stop_event.is_set():
@@ -146,7 +153,6 @@ class WebCrawler:
 
                 if success:
                     with self.url_lock:
-                        self.visited_urls[url] = True
                         if len(self.visited_urls) > self._MAX_URL_SET_SIZE:
                             while len(self.visited_urls) > self._MAX_URL_SET_SIZE // 2:
                                 self.visited_urls.popitem(last=False)
@@ -154,6 +160,7 @@ class WebCrawler:
                         self._success_count += 1
                 else:
                     with self.url_lock:
+                        self.visited_urls.pop(url, None)
                         self.failed_urls[url] = True
                         if len(self.failed_urls) > self._MAX_URL_SET_SIZE:
                             while len(self.failed_urls) > self._MAX_URL_SET_SIZE // 2:
@@ -222,31 +229,46 @@ class WebCrawler:
         except Exception:
             return False
 
+    def _get_session(self):
+        """每个worker线程复用一个Session，保持keep-alive"""
+        session = getattr(self._thread_local, 'session', None)
+        if session is None:
+            session = requests.Session()
+            self._thread_local.session = session
+        return session
+
     def _fetch_and_parse(self, url):
         try:
             time.sleep(random.uniform(0.1, 0.5))
 
             headers = self._get_headers()
-            session = requests.Session()
+            session = self._get_session()
             session.headers.update(headers)
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=self.timeout,
+                allow_redirects=True,
+                verify=True,
+                stream=True
+            )
             try:
-                response = session.get(
-                    url,
-                    headers=headers,
-                    timeout=self.timeout,
-                    allow_redirects=True,
-                    verify=True
-                )
                 response.raise_for_status()
+                content = b''
+                for chunk in response.iter_content(chunk_size=65536):
+                    content += chunk
+                    if len(content) > self._MAX_CONTENT_SIZE:
+                        print(f"[Crawler] ✗ {url} → 响应体过大(>5MB)", flush=True)
+                        return False
             finally:
-                session.close()
+                response.close()
 
             content_type = response.headers.get('Content-Type', '')
             if 'text/html' not in content_type and 'text/plain' not in content_type:
                 print(f"[Crawler] ✗ {url} → 非HTML内容: {content_type[:50]}", flush=True)
                 return False
 
-            soup = BeautifulSoup(response.content, 'html.parser')
+            soup = BeautifulSoup(content, 'html.parser')
 
             links = soup.find_all('a', href=True)
             sub_urls = []
@@ -272,7 +294,10 @@ class WebCrawler:
             for sub_url in sub_urls[:self.max_sub_urls_per_page]:
                 with self.url_lock:
                     if sub_url not in self.visited_urls and sub_url not in self.failed_urls:
-                        self.url_queue.put(sub_url)
+                        try:
+                            self.url_queue.put_nowait(sub_url)
+                        except queue.Full:
+                            continue
                         added_count += 1
 
             cleaned_content = self._clean_html(soup)
@@ -345,30 +370,18 @@ class WebCrawler:
                     new_urls = []
                     for _ in range(max(1, self.queue_threshold - current_size)):
                         url = _generate_random_url()
-                        self.url_queue.put(url)
+                        try:
+                            self.url_queue.put_nowait(url)
+                        except queue.Full:
+                            break
                         new_urls.append(url)
-                    print(f"[Crawler] 队列不足({current_size}), 补充{len(new_urls)}个随机URL: {new_urls[0]}...", flush=True)
+                    if new_urls:
+                        print(f"[Crawler] 队列不足({current_size}), 补充{len(new_urls)}个随机URL: {new_urls[0]}...", flush=True)
 
                 time.sleep(5)
 
             except Exception as e:
                 logger.warning(f"队列管理线程异常: {e}", exc_info=True)
-
-    def _memory_cleaner(self):
-        while self.is_running and not self.stop_event.is_set():
-            try:
-                time.sleep(600)
-                if not self.is_running:
-                    break
-
-                with self.cache_lock:
-                    self.cache.clear()
-
-                import gc
-                gc.collect()
-
-            except Exception as e:
-                logger.warning(f"内存清理线程异常: {e}", exc_info=True)
 
     def _add_to_cache(self, data):
         with self.cache_lock:
@@ -430,11 +443,53 @@ class WebCrawler:
             url = 'https://' + url
         with self.url_lock:
             if url not in self.visited_urls and url not in self.failed_urls:
-                self.url_queue.put(url)
+                try:
+                    self.url_queue.put_nowait(url)
+                except queue.Full:
+                    pass
 
     def add_seed_urls(self, urls):
         for url in urls:
             self.add_seed_url(url)
+
+    def save_state(self):
+        """持久化爬虫状态到 crawler_state.json，用于断点续爬"""
+        try:
+            with self.url_lock:
+                state = {
+                    'visited_urls': list(self.visited_urls.keys()),
+                    'failed_urls': list(self.failed_urls.keys()),
+                    'url_queue': list(self.url_queue.queue),
+                }
+            tmp_file = self._STATE_FILE + '.tmp'
+            with open(tmp_file, 'w', encoding='utf-8') as f:
+                json.dump(state, f)
+            os.replace(tmp_file, self._STATE_FILE)
+        except Exception as e:
+            logger.warning(f"保存爬虫状态失败: {e}", exc_info=True)
+
+    def load_state(self):
+        """从 crawler_state.json 恢复爬虫状态，文件不存在或损坏则静默忽略"""
+        try:
+            with open(self._STATE_FILE, 'r', encoding='utf-8') as f:
+                state = json.load(f)
+            with self.url_lock:
+                for url in state.get('visited_urls', []):
+                    self.visited_urls[url] = True
+                for url in state.get('failed_urls', []):
+                    self.failed_urls[url] = True
+                for url in state.get('url_queue', []):
+                    if url not in self.visited_urls and url not in self.failed_urls:
+                        try:
+                            self.url_queue.put_nowait(url)
+                        except queue.Full:
+                            break
+            print(f"[Crawler] 已恢复状态: 已访问{len(self.visited_urls)}, "
+                  f"失败{len(self.failed_urls)}, 队列{self.url_queue.qsize()}", flush=True)
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logger.warning(f"加载爬虫状态失败: {e}", exc_info=True)
 
     def stop(self, timeout=5):
         self.is_running = False

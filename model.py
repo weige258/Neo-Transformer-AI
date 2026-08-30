@@ -42,9 +42,8 @@ class MLALatentMemory(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
-        self.use_delta = use_delta
-        # 【修复】将alpha暴露为可配置属性，允许推理时动态调整更新速率
-        self.alpha = 0.9
+        # use_delta 参数保留仅为兼容旧调用，已不再使用：
+        # delta规则/EMA更新会破坏训练与推理的等价性（见 retrieve 注释）
 
         # 根据网络研究，latent维度应该是head_dim的1/4到1/2
         # DeepSeek-V2使用512维latent压缩2048维的KV
@@ -76,42 +75,60 @@ class MLALatentMemory(nn.Module):
         z = torch.zeros(1, num_heads, latent_dim, device=device, dtype=dtype)
         return M, z
 
-    def retrieve(self, q: torch.Tensor, mem_M: torch.Tensor, mem_z: torch.Tensor) -> torch.Tensor:
-        """从压缩记忆中检索值（矩阵吸收版本）- 修复版
-        
-        修复: 原实现错误地对Q本身应用softmax，这破坏了query的相对幅度信息。
-        正确做法: Q投影后直接使用，通过内积计算注意力权重（由mem_M/mem_z隐式完成）。
-        
+    def retrieve(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                 mem_M: torch.Tensor, mem_z: torch.Tensor) -> torch.Tensor:
+        """从压缩记忆中检索值 —— 因果线性注意力版本（修复未来信息泄漏）
+
+        【关键修复】原实现先用整个序列的K/V update记忆、再对每个位置retrieve，
+        导致训练时每个位置都能检索到未来token的信息（label leakage）。
+        模型（尤其是router）学会严重依赖这条泄漏路径，loss骤降，
+        但推理时记忆里只有过去token，生成立刻崩溃为乱码。
+
+        本实现是精确的因果线性注意力：
+          - 当前序列内部：下三角mask，位置t只能看到 i<=t 的token
+          - 历史记忆 mem_M/mem_z：只包含过去token的精确累加（见 update）
+        训练（整段forward）与推理（逐token + 记忆累加）在数学上完全一致，
+        不存在任何未来信息通道。
+
         Args:
-            q: Query张量 (batch, heads, seq_len, head_dim)
-            mem_M: 关联矩阵 (1, heads, latent_dim, latent_dim)
-            mem_z: 归一化项 (1, heads, latent_dim)
+            q: Query (batch, heads, seq_len, head_dim)，未加RoPE
+            k: Key   (batch, heads, seq_len, head_dim)，未加RoPE
+            v: Value (batch, heads, seq_len, head_dim)
+            mem_M: 历史关联矩阵 (1, heads, latent_dim, latent_dim)，仅含过去token
+            mem_z: 历史归一化项 (1, heads, latent_dim)，仅含过去token
         Returns:
             检索值 (batch, heads, seq_len, head_dim)
         """
-        # Q投影到latent空间
-        q_lat = self.q_proj(q)
-        
-        # 应用可学习的头缩放（不使用softmax，保留相对幅度）
-        q_lat = q_lat * self.scale.view(1, -1, 1, 1)
-        
-        # 使用elu激活替代softmax，保留非负性同时不破坏幅度信息
+        q_lat = self.q_proj(q) * self.scale.view(1, -1, 1, 1)
         q_lat = F.elu(q_lat) + 1.0
-        
-        numer = torch.matmul(q_lat, mem_M)
-        denom = torch.matmul(q_lat, mem_z.unsqueeze(-1)).clamp_min(1e-4)
-        v_lat = numer / denom
-        
-        v_full = self.v_up_proj(v_lat)
+        k_lat = F.elu(self.kv_proj(k)) + 1.0
+        v_lat = F.elu(self.v_proj(v)) + 1.0
+
+        seq_len = q.size(-2)
+        # 当前序列内部的因果注意力（含自身）：S[t,i] = q_t · k_i, i <= t
+        scores = torch.matmul(q_lat, k_lat.transpose(-2, -1))
+        if seq_len > 1:
+            causal_mask = torch.tril(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=q.device))
+            scores = scores.masked_fill(~causal_mask, 0.0)
+
+        # 历史记忆只含过去token，与当前序列的因果项相加
+        numer = torch.matmul(scores, v_lat) + torch.matmul(q_lat, mem_M)
+        denom = scores.sum(dim=-1, keepdim=True) + torch.matmul(q_lat, mem_z.unsqueeze(-1))
+        v_lat_out = numer / denom.clamp_min(1e-4)
+
+        v_full = self.v_up_proj(v_lat_out)
         return self.out_proj(v_full)
 
     def update(self, k: torch.Tensor, v: torch.Tensor,
                mem_M: torch.Tensor, mem_z: torch.Tensor
                ) -> tuple[torch.Tensor, torch.Tensor]:
-        """用新KV更新记忆，返回新的M/z。
-        
-        使用增量更新（delta update）来减少记忆漂移。
-        
+        """用新KV更新记忆：纯累加（精确求和，无EMA无delta规则）。
+
+        只有纯累加才能保证：训练时位置 t 的因果检索结果
+        与推理时"先累加 t 之前的全部token、再检索"的结果严格相等。
+        EMA/delta规则都会让推理时的记忆内容偏离训练分布，必须弃用。
+
         Args:
             k: Key (batch, heads, seq_len, head_dim)
             v: Value (batch, heads, seq_len, head_dim)
@@ -120,33 +137,22 @@ class MLALatentMemory(nn.Module):
         Returns:
             (new_M, new_z)
         """
-        # K/V联合压缩
-        k_lat = self.kv_proj(k)
-        v_lat = self.v_proj(v)
-        
-        # 使用elu激活替代softmax（与retrieve保持一致）
-        k_lat = F.elu(k_lat) + 1.0
-        v_lat = F.elu(v_lat) + 1.0
-        
-        if self.use_delta and mem_M.abs().max().item() > 1e-6:
-            k_z = torch.matmul(k_lat, mem_z.unsqueeze(-1)).clamp_min(1e-4)
-            v_pred = torch.matmul(k_lat, mem_M) / k_z
-            v_error = v_lat - v_pred
-            delta_M = torch.matmul(k_lat.transpose(-2, -1), v_error)
-        else:
-            delta_M = torch.matmul(k_lat.transpose(-2, -1), v_lat)
+        k_lat = F.elu(self.kv_proj(k)) + 1.0
+        v_lat = F.elu(self.v_proj(v)) + 1.0
 
-        # 使用指数移动平均更新，更稳定
-        # 【修复】使用self.alpha替代硬编码，支持推理时动态调整
-        alpha = self.alpha
-        # delta_M 来自 matmul(k_lat.T, v_error)，已在 seq_len 上聚合
-        # 只用 mean(dim=0) 做batch归一化，不再除以 seq_len（已由mean隐式完成）
-        delta_M_mean = delta_M.mean(dim=0, keepdim=True)  # (1, H, latent, latent)
-        k_lat_mean = k_lat.mean(dim=(0, -2), keepdim=True).squeeze(-2)  # (1, H, latent)
+        # 【修复】记忆矩阵 (1, H, latent, latent) 在 batch 维上共享，
+        # 下方 einsum 会把 batch 维求和掉，batch>1 时不同样本的记忆互相污染。
+        # 当前生成路径均为 batch=1，此处直接拒绝 batch>1，避免静默错误。
+        if k.size(0) != 1:
+            raise ValueError(
+                f"MLALatentMemory.update 仅支持 batch=1（记忆矩阵为全 batch 共享），"
+                f"实际收到 batch={k.size(0)}")
 
-        new_M = alpha * mem_M + (1 - alpha) * delta_M_mean
-        new_z = alpha * mem_z + (1 - alpha) * k_lat_mean
-        return new_M, new_z
+        # 在 batch 与 seq_len 维度上精确累加
+        delta_M = torch.einsum('bhld,bhle->hde', k_lat, v_lat).unsqueeze(0)
+        delta_z = k_lat.sum(dim=(0, 2)).unsqueeze(0)  # (1, H, latent)
+
+        return mem_M + delta_M, mem_z + delta_z
 
 
 class RMSNorm(nn.Module):
@@ -159,17 +165,20 @@ class RMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         norm = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         output = x * norm * self.weight
-        if torch.isnan(output).any() or torch.isinf(output).any():
-            output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
-            if self.training and not self._nan_warned:
-                self._nan_warned = True
-                print(
-                    f"[Warning] RMSNorm detected NaN/Inf; clamped output to safe range. "
-                    f"input_min={x.min().item():.3f}, input_max={x.max().item():.3f}",
-                    flush=True,
-                )
-        elif self._nan_warned:
-            self._nan_warned = False
+        # 【优化】NaN/Inf 检查合并为一次 isfinite 全张量归约（原两次归约），
+        # 且仅在训练时执行，避免推理时每次前向都强制 GPU 同步
+        if self.training:
+            if not torch.isfinite(output).all():
+                output = torch.nan_to_num(output, nan=0.0, posinf=1e6, neginf=-1e6)
+                if not self._nan_warned:
+                    self._nan_warned = True
+                    print(
+                        f"[Warning] RMSNorm detected NaN/Inf; clamped output to safe range. "
+                        f"input_min={x.min().item():.3f}, input_max={x.max().item():.3f}",
+                        flush=True,
+                    )
+            elif self._nan_warned:
+                self._nan_warned = False
         return output
 
 
@@ -316,6 +325,10 @@ class HyperAttention(nn.Module):
         if bool(CONFIG.get("use_learned_pooling", True)):
             self.importance_pooler = nn.Linear(self.head_dim, 1, bias=False)
 
+        # 本训练步的显存压力快照（由 MainModel.forward 在梯度检查点模式下写入），
+        # 用于保证 checkpoint 重计算时的动态窗口/压缩比决策与前向一致
+        self._forward_mem_pressure: float | None = None
+
     _gpu_pressure_cache = None
     _gpu_pressure_cache_time = 0.0
     _in_checkpoint = False  # 标记是否在gradient checkpoint内
@@ -344,10 +357,10 @@ class HyperAttention(nn.Module):
             return HyperAttention._gpu_pressure_cache
 
         # 【修复】推理模式：不查询CUDA，避免同步阻塞。显存在推理期间基本稳定。
+        # 能走到这里说明上方 1 秒新鲜缓存检查未命中（缓存不存在或已过期），
+        # 必须返回默认低压力 0.3 并刷新缓存——否则训练结束时缓存的高压力值
+        # 会一直被推理分支原样返回，污染整个推理会话。
         if not self.training and not torch.is_grad_enabled():
-            # 推理时返回缓存值或默认低压力0.3
-            if HyperAttention._gpu_pressure_cache is not None:
-                return HyperAttention._gpu_pressure_cache
             HyperAttention._gpu_pressure_cache = 0.3
             HyperAttention._gpu_pressure_cache_time = now
             return 0.3
@@ -360,7 +373,8 @@ class HyperAttention(nn.Module):
 
         try:
             allocated = torch.cuda.memory_allocated() / torch.cuda.max_memory_allocated() if torch.cuda.max_memory_allocated() > 0 else 0.0
-            reserved = torch.cuda.memory_reserved() / torch.cuda.get_device_properties(0).total_memory
+            # 【修复】使用当前设备而非硬编码 0，尊重 CONFIG["gpu_id"] 的设备选择
+            reserved = torch.cuda.memory_reserved() / torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
             pressure = max(allocated, reserved)
             HyperAttention._gpu_pressure_cache = pressure
             HyperAttention._gpu_pressure_cache_time = now
@@ -384,8 +398,12 @@ class HyperAttention(nn.Module):
         if seq_len <= 0:
             return 8
         
-        # 获取显存压力
-        mem_pressure = self._get_gpu_memory_pressure()
+        # 【修复】优先使用前向开始时快照的显存压力值（见 MainModel.forward）。
+        # gradient checkpoint 的重计算发生在 backward 阶段，此时类级压力缓存
+        # 可能已过期，重新决策会得到与前向不同的窗口大小，产生静默错误梯度。
+        mem_pressure = (self._forward_mem_pressure
+                        if (self.training and self._forward_mem_pressure is not None)
+                        else self._get_gpu_memory_pressure())
         
         # 【修复】full attention阈值：最大512，超过512必须用窗口
         # 旧版 seq_len <= full_threshold 时返回 seq_len（full attention），
@@ -430,7 +448,11 @@ class HyperAttention(nn.Module):
         depth_factor = max(0.3, min(2.0, depth_factor))
         
         # 显存压力因子：压力大时增加压缩（降低ratio=保留更少）
-        mem_pressure = self._get_gpu_memory_pressure()
+        # 【修复】同 _get_dynamic_window_size：优先用前向快照值，
+        # 保证 gradient checkpoint 重计算与前向的压缩比决策一致
+        mem_pressure = (self._forward_mem_pressure
+                        if (self.training and self._forward_mem_pressure is not None)
+                        else self._get_gpu_memory_pressure())
         memory_factor = 1.0 + mem_pressure * self.compress_memory_pressure_factor
         
         # 序列长度因子：超长序列更激进
@@ -459,6 +481,7 @@ class HyperAttention(nn.Module):
         start_pos: int,
         sink_count: int = 4,
         special_mask: torch.Tensor | None = None,
+        token_positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """智能KV压缩：Attention Sink + Learned Soft Pooling + Special Token Anchoring
 
@@ -470,12 +493,21 @@ class HyperAttention(nn.Module):
         【修复说明】原代码的special_mask在调用链中从未被传入，导致特殊Token
         （THINK_START/END等）在压缩时信息被稀释。现已修复调用链传递。
         同时在forward中自动为PLACEHOLDER_SINK_TOKEN生成保护掩码。
+
+        Args:
+            token_positions: 每个输入token的真实绝对位置 (seq_len,)。
+                H2O筛选后传入的序列是非连续的，不能用 start_pos+连续索引 表示，
+                调用方必须传入真实位置；为 None 时退化为 start_pos+arange(seq_len)。
         """
         batch, heads, seq_len, dim = k.shape
         if seq_len <= 0:
             empty = k.new_zeros(batch, heads, 0, dim)
             pos = torch.empty(0, device=k.device, dtype=torch.long)
             return empty, empty, pos
+
+        # 【修复】构造每个token的真实绝对位置（H2O筛选后位置非连续）
+        if token_positions is None:
+            token_positions = start_pos + torch.arange(seq_len, device=k.device, dtype=torch.long)
 
         # ── 收集需要完整保留的锚点token索引 ──
         anchor_mask = torch.zeros(seq_len, dtype=torch.bool, device=k.device)
@@ -501,7 +533,7 @@ class HyperAttention(nn.Module):
         if is_anchor:
             anchor_k = k[:, :, anchor_idx, :]
             anchor_v = v[:, :, anchor_idx, :]
-            anchor_pos = start_pos + anchor_idx
+            anchor_pos = token_positions[anchor_idx]
             # 生成非锚点token索引
             non_anchor_mask = ~anchor_mask
             non_anchor_idx = non_anchor_mask.nonzero(as_tuple=True)[0]
@@ -509,13 +541,13 @@ class HyperAttention(nn.Module):
                 return anchor_k, anchor_v, anchor_pos
             compress_k = k[:, :, non_anchor_idx, :]
             compress_v = v[:, :, non_anchor_idx, :]
-            compress_start = start_pos + non_anchor_idx[0].item()
+            compress_pos = token_positions[non_anchor_idx]
         else:
             # 没有锚点，全部压缩（退化到原始行为）
             anchor_k, anchor_v, anchor_pos = None, None, None
             compress_k = k
             compress_v = v
-            compress_start = start_pos
+            compress_pos = token_positions
 
         # ── 对非锚点部分做CSA压缩 (Compressed Sparse Attention) ──
         # DeepSeek-V4: 每4个token压缩成1个entry
@@ -535,6 +567,8 @@ class HyperAttention(nn.Module):
             vp = compress_v[:, :, -1:, :].expand(batch, heads, pad_len, dim)
             compress_k = torch.cat((compress_k, kp), dim=-2)
             compress_v = torch.cat((compress_v, vp), dim=-2)
+            # 位置同步补齐：pad 位复制最后一个真实位置（valid mask 已将其权重置零）
+            compress_pos = torch.cat((compress_pos, compress_pos[-1:].expand(pad_len)), dim=0)
 
         ck = compress_k.view(batch, heads, chunks, csa_stride, dim)
         cv = compress_v.view(batch, heads, chunks, csa_stride, dim)
@@ -559,9 +593,13 @@ class HyperAttention(nn.Module):
             ck_out = (ck * valid.view(1, 1, chunks, csa_stride, 1)).sum(dim=-2) / denom
             cv_out = (cv * valid.view(1, 1, chunks, csa_stride, 1)).sum(dim=-2) / denom
 
-        # CSA位置编码：压缩后的位置取chunk的中点
-        c_ends = torch.arange(chunks, device=k.device, dtype=torch.long)
-        c_ends = compress_start + (c_ends * csa_stride + csa_stride // 2)
+        # CSA位置编码：压缩entry的位置取组内最后一个token的真实位置（chunk末尾）
+        # 【修复1】原实现取chunk中点(c*4+2)，位置 t≡2(mod4) 的 query 会通过
+        # mem_pos <= q_pos 的因果mask看到包含未来token t+1 的chunk（1-token泄漏）；
+        # 取组内最大真实位置后，query 只能在chunk内所有token都成为过去后才看到该entry。
+        # 【修复2】H2O筛选后token非连续，必须按真实位置（token_positions）计算，
+        # 不能再用 start_pos+连续索引（偏差最大达被筛掉的token数）。
+        c_ends = compress_pos.view(chunks, csa_stride).amax(dim=-1)
 
         # ── 合并锚点 + 压缩结果 ──
         if is_anchor:
@@ -818,14 +856,20 @@ class HyperAttention(nn.Module):
             remaining_mask = torch.ones(compress_len, dtype=torch.bool, device=k_all.device)
             remaining_mask[h2_idx] = False
             if remaining_mask.any():
+                rem_idx = remaining_mask.nonzero(as_tuple=True)[0]
                 rem_k = overflow_k[:, :, remaining_mask, :]
                 rem_v = overflow_v[:, :, remaining_mask, :]
-                rem_start = start_pos + remaining_mask.nonzero(as_tuple=True)[0][0].item()
+                rem_start = start_pos + rem_idx[0].item()
+                # 【修复】H2O移除非连续token后，rem_k 是压缩过的序列，
+                # 必须把剩余token的真实位置传入，否则位置按 start_pos+连续索引
+                # 计算会产生最大 h2_count 的漂移，污染下游因果 mask
+                rem_pos = start_pos + rem_idx
 
                 # 【修复Bug #1】传递对齐后的special_mask保护特殊Token
                 pooled_k, pooled_v, pooled_pos = self._compress_kv_with_sink(
                     rem_k, rem_v, rem_start, sink_count=0,
-                    special_mask=overflow_special_mask[remaining_mask] if overflow_special_mask is not None else None)
+                    special_mask=overflow_special_mask[remaining_mask] if overflow_special_mask is not None else None,
+                    token_positions=rem_pos)
                 mem_parts_k.append(torch.cat([h2_k, pooled_k], dim=-2))
                 mem_parts_v.append(torch.cat([h2_v, pooled_v], dim=-2))
                 mem_parts_pos.append(torch.cat([h2_pos, pooled_pos], dim=0))
@@ -860,6 +904,23 @@ class HyperAttention(nn.Module):
             overflow = mem_k.size(-2) - max_mem_capacity
             to_linear_k = mem_k[:, :, :overflow, :]
             to_linear_v = mem_v[:, :, :overflow, :]
+            # 【修复】固化前先对 key 做逆 RoPE：mem_k 中的 key 写入 cache 前
+            # 已按其 mem_pos 位置做过 RoPE 旋转，而 MLA 记忆的其余路径
+            # （retrieve / 逐 token update / 训练）全部使用无 RoPE 的 key，
+            # 直接固化会让带位置相位的 key 混入关联矩阵，污染记忆分布。
+            # RoPE 是按位置的正交旋转，用相同位置反向旋转即可还原：
+            #   x = y·cos(pθ) − rotate_half(y)·sin(pθ)
+            # 对池化压缩 entry，其内部 token 位置不完全相同，取 entry 的代表
+            # 位置（mem_pos）近似还原；对锚点/H2O保留的原始 token 则为精确还原。
+            # 说明：之所以不用"传入无RoPE的k参数"方案，是因为被固化的 entry
+            # 大多是历史轮次的压缩结果，cache 中并未保存其无 RoPE 版本，
+            # 逆旋转是唯一对所有 entry 都可行的还原方式。
+            pos = mem_pos[:overflow].to(torch.float32)
+            freqs = torch.outer(pos, self.rope.inv_freq)
+            rope_emb = torch.cat((freqs, freqs), dim=-1)
+            cos = rope_emb.cos().view(1, 1, overflow, -1).to(to_linear_k.dtype)
+            sin = rope_emb.sin().view(1, 1, overflow, -1).to(to_linear_k.dtype)
+            to_linear_k = to_linear_k * cos - rotate_half(to_linear_k) * sin
             # 固化到 MLA latent memory（使用无位置编码的 key）
             mla_M, mla_z = self.mla_memory.update(
                 to_linear_k.detach(), to_linear_v.detach(),
@@ -889,7 +950,19 @@ class HyperAttention(nn.Module):
         
         q, k_new, v_new = self._split_qkv(x)
 
-        if past_key_value is None or not isinstance(past_key_value, (tuple, list)) or len(past_key_value) < 6:
+        # 【修复】统一 past_key_value 的有效性判断：None 才表示无 past；
+        # 非 None 但结构畸形（非 tuple/list 或长度不足 6，无法解包）时直接报错，
+        # 不再静默当作无 past 处理——否则下方 else 分支会用 past_key_value is None
+        # 做判断，导致对 None.size() 抛 AttributeError 或逻辑错乱。
+        if past_key_value is not None and (
+                not isinstance(past_key_value, (tuple, list)) or len(past_key_value) < 6):
+            raise ValueError(
+                "past_key_value 格式错误：期望 None 或长度>=6 的 tuple/list "
+                "(recent_k, recent_v, mem_k, mem_v, mem_pos, total_len[, mla_M, mla_z])，"
+                f"实际类型={type(past_key_value).__name__}, "
+                f"长度={len(past_key_value) if isinstance(past_key_value, (tuple, list)) else 'N/A'}")
+
+        if past_key_value is None:
             q_start_pos = 0
             raw_k_start_pos = 0
             past_recent_k = past_recent_v = None
@@ -916,18 +989,10 @@ class HyperAttention(nn.Module):
             mla_M, mla_z = self.mla_memory.init_mem(
                 1, self.num_heads, self.head_dim, x.device, x.dtype)
 
-        # 【BUG修复 #1】训练-推理 MLA 记忆一致性
-        # 原Bug：训练时(use_cache=False) MLA retrieve 使用零记忆，
-        #        推理时(use_cache=True, step2+) MLA retrieve 使用上一步update后的非零记忆。
-        # 这导致训练和推理的注意力输出严重不一致（差异>2.0），是生成崩溃的根因。
-        #
-        # 修复：在训练时(past_key_value is None)，先用当前序列的K/V做MLA update，
-        # 得到非零的mla_M/mla_z，再用更新后的记忆做retrieve。
-        # 这使得训练时的MLA路径与推理时第一步（处理prompt）的行为完全一致。
-        if past_key_value is None:
-            with torch.no_grad():
-                mla_M, mla_z = self.mla_memory.update(
-                    k_new.detach(), v_new.detach(), mla_M, mla_z)
+        # 【说明】此处绝不能先用当前序列的K/V更新MLA记忆再retrieve：
+        # 那会让每个位置看到未来token（label leakage），训练loss虚假降低、
+        # 推理时生成崩溃。因果性由 MLALatentMemory.retrieve 内部的下三角
+        # mask + "记忆只含过去token"共同保证。
 
         q_for_memory = q
         k_for_memory = k_new
@@ -1003,9 +1068,18 @@ class HyperAttention(nn.Module):
         # 初始化累积输出为零
         out_accum = None  # (batch, seq_len, emb_size)
 
+        # 【优化】三个路由分支的阈值标量拼成一个张量，一次GPU→CPU同步取回，
+        # 避免三处 .item() 各自强制一次同步（阈值与分支语义保持不变：
+        # csa > 0.01、sliding_window > 0.01、mla 按 abs > 1e-8）
+        mix_gate_csa, mix_gate_sw, mix_gate_mla = torch.stack([
+            mix[..., 0].max(),
+            mix[..., 1].max(),
+            mix[..., 2].abs().max(),
+        ]).tolist()
+
         # ── 路径0: CSA (Compressed Sparse Attention) ──
         # DeepSeek-V4: 每4个token压缩成1个entry + 稀疏注意力
-        if mix[..., 0:1].max().item() > 0.01 and mem_k.size(-2) > 0:
+        if mix_gate_csa > 0.01 and mem_k.size(-2) > 0:
             # 使用压缩后的KV进行稀疏注意力
             csa_out = self._attend_compressed(q, mem_k, mem_v, mem_pos, q_start_pos)
             csa_out = csa_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
@@ -1015,14 +1089,20 @@ class HyperAttention(nn.Module):
         # ── 路径1: SlidingWindow (精确注意力) ──
         # 【修复】之前硬编码window_size=128，导致sliding_window配置被完全忽略。
         # 现在使用self.window_size（来自配置）。对于短序列，这等效于full attention。
-        if mix[..., 1:2].max().item() > 0.01:
+        if mix_gate_sw > 0.01:
             # 【动态窗口】使用动态计算的窗口大小
             dynamic_window = self._get_dynamic_window_size(raw_k.size(-2))
             window_size = min(dynamic_window, raw_k.size(-2))
             if window_size > 0:
                 window_k = raw_k[..., -window_size:, :]
                 window_v = raw_v[..., -window_size:, :]
-                window_out = self._attend_local_window(q, window_k, window_v, q_start_pos, raw_k_start_pos)
+                # 【修复】窗口切片后其绝对起始位置不再是 raw_k_start_pos：
+                # window_k 是 raw_k 末尾 window_size 个 token，
+                # 正确起点 = raw_k_start_pos + raw_k长度 - window_size。
+                # 传错起点会导致长序列训练时位置错位（未来信息泄漏），
+                # 且 chunk 起点 > 2*window 时该分支整块输出为零。
+                window_k_start = raw_k_start_pos + raw_k.size(-2) - window_size
+                window_out = self._attend_local_window(q, window_k, window_v, q_start_pos, window_k_start)
                 window_out = window_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
                 if out_accum is None:
                     out_accum = window_out * mix[..., 1:2]
@@ -1032,8 +1112,9 @@ class HyperAttention(nn.Module):
 
         # ── 路径2: MLA (Multi-head Latent Attention) ──
         # DeepSeek-V4: 低秩latent压缩，处理长距离上下文
-        if mix[..., 2:3].abs().max().item() > 1e-8:
-            lin_out = self.mla_memory.retrieve(q_for_memory, mla_M, mla_z)
+        # 【修复】因果检索：当前序列内下三角mask，历史记忆只含过去token
+        if mix_gate_mla > 1e-8:
+            lin_out = self.mla_memory.retrieve(q_for_memory, k_for_memory, v_new, mla_M, mla_z)
             lin_out = lin_out.transpose(1, 2).contiguous().view(batch, seq_len, self.emb_size)
             if out_accum is None:
                 out_accum = lin_out * mix[..., 2:3]
@@ -1283,9 +1364,10 @@ class MainModel(nn.Module):
             # 若 history_tokens 在同设备，或不启用 GPU 分块压缩，走原有路径
             if history_tokens.device != emb_weight.device:
                 # 在 CPU 上进行 embedding lookup 与压缩
-                hist_idx = history_tokens.to(torch.long).to("cpu")
-                weight_cpu = emb_weight.detach().to("cpu")
-                hist_emb = weight_cpu[hist_idx]
+                # 【优化】先在权重所在设备按索引 gather 需要的行，仅把选中行
+                # 搬到 CPU；原实现每次复制整个 embedding 矩阵（约123MB）到 CPU
+                hist_idx = history_tokens.to(torch.long).to(emb_weight.device)
+                hist_emb = emb_weight.detach()[hist_idx].to("cpu")
                 if hist_emb.dim() == 3:
                     hist_emb = hist_emb.squeeze(0)
                 seq_len = hist_emb.size(0)
@@ -1335,6 +1417,16 @@ class MainModel(nn.Module):
             use_gc = bool(CONFIG.get("use_gradient_checkpointing", False))
             if self.training and use_gc:
                 HyperAttention._in_checkpoint = True
+                # 【修复】为每层快照本训练步的显存压力决策：
+                # gradient checkpoint 的重计算发生在 backward 阶段，此时
+                # _in_checkpoint 已复位、类级压力缓存（1秒TTL）可能已过期，
+                # 重新决策会得到与前向不同的动态窗口/压缩比，产生静默错误梯度。
+                # 同一训练步内 forward→backward 之间不会再有另一次 forward
+                # （main.py 训练循环每步仅调用一次本前向），因此重计算时
+                # 复用该实例快照是安全的；快照在 checkpoint 区域外设置，
+                # 重计算路径（block.forward）不会覆盖它。
+                for _blk in self.transformers:
+                    _blk.attention._forward_mem_pressure = _blk.attention._get_gpu_memory_pressure()
             try:
                 for block in self.transformers:
                     if self.training and use_gc:

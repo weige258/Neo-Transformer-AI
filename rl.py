@@ -2,36 +2,9 @@ import logging
 import torch
 import torch.nn.functional as F
 from typing import List, Tuple, Dict
-from dataclasses import dataclass
 from tokenizer import TextTokenizer
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class TreeNode:
-    """树节点"""
-    token_id: int
-    log_prob: float
-    reward: float = 0.0
-    cumulative_reward: float = 0.0
-    children: List['TreeNode'] = None
-    parent: 'TreeNode' = None
-    visit_count: int = 0
-    depth: int = 0
-    
-    def __post_init__(self):
-        if self.children is None:
-            self.children = []
-    
-    def get_path(self) -> List[int]:
-        """获取从根节点到当前节点的路径"""
-        path = []
-        node = self
-        while node is not None:
-            path.append(node.token_id)
-            node = node.parent
-        return path[::-1][1:]
 
 
 class SelfRewardModel:
@@ -154,7 +127,8 @@ class SelfRewardModel:
         # 防止模型通过重复相同关键词刷分
         found_markers = [marker for marker in reasoning_markers if marker in think_lower]
         unique_marker_count = len(set(found_markers))  # 唯一关键词数量
-        total_marker_count = len(found_markers)  # 总出现次数
+        # 【修复】统计每个关键词的实际出现次数，否则 diversity_score 恒为 1
+        total_marker_count = sum(think_lower.count(marker) for marker in found_markers)
         
         # 多样性得分：唯一关键词数量 / 总关键词数量
         # 如果所有关键词都不同，得分为1；如果大量重复，得分接近0
@@ -279,11 +253,11 @@ class SelfRewardModel:
         # 找到 THINK_END 之后的所有 token
         answer_tokens = tokens[think_end_idx + 1:]
         
-        # 过滤掉特殊 token（END_GENERATION, UNKNOWN, START_GENERATION 等）
-        # 只保留普通字符 token（id > 6 且有效）
+        # 过滤掉特殊 token（特殊 token 现位于 _BASE_OFFSET=59990 起的区间）
+        # 只保留普通字符 token，并显式排除 UNKNOWN
         valid_answer_tokens = [
             t for t in answer_tokens 
-            if t > 6 and TextTokenizer._is_valid_token(t)
+            if t < TextTokenizer._BASE_OFFSET and t != TextTokenizer.UNKNOWN_TOKEN
         ]
         
         # 如果思维链结束后没有有效回答内容 → 毁灭性惩罚
@@ -540,6 +514,7 @@ class LightweightPPO:
         context: str = None,
         reference_texts: List[str] = None,
         model_log_probs: torch.Tensor | None = None,
+        precomputed_reward: Tuple[float, Dict[str, float]] | None = None,
     ) -> Tuple[float, Dict[str, float]]:
         """收集一个 episode 的数据并计算奖励。
 
@@ -553,13 +528,18 @@ class LightweightPPO:
             context: 上下文
             reference_texts: 参考文本列表
             model_log_probs: 【已弃用】保留参数兼容性，实际会被忽略
+            precomputed_reward: 【新增】调用方已计算好的 (total_reward, reward_breakdown)，
+                传入时直接复用，避免重复计算与重复记录奖励历史
         """
-        total_reward, reward_breakdown = self.reward_model.compute_total_reward(
-            think_text=think_text,
-            answer_text=answer_text,
-            context=context,
-            reference_texts=reference_texts
-        )
+        if precomputed_reward is not None:
+            total_reward, reward_breakdown = precomputed_reward
+        else:
+            total_reward, reward_breakdown = self.reward_model.compute_total_reward(
+                think_text=think_text,
+                answer_text=answer_text,
+                context=context,
+                reference_texts=reference_texts
+            )
 
         self.episode_data['rewards'].append(float(total_reward))
 
@@ -598,23 +578,23 @@ class LightweightPPO:
                 self.episode_data['entropies'].append(None)
                 return total_reward, reward_breakdown
             
+            # 【修复】保存进入前的模式，异常时也用 finally 恢复，避免模型卡在 eval 模式
+            was_training = self.model.training
             self.model.eval()
-            with torch.no_grad():
-                old_token_lps, old_entropies = self._compute_token_log_probs_and_entropy(prompt, generated_text)
-            self.model.train()  # 恢复训练模式
-            # 【修复】计算完后立即清理GPU缓存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            try:
+                with torch.no_grad():
+                    old_token_lps, old_entropies = self._compute_token_log_probs_and_entropy(prompt, generated_text)
+            finally:
+                if was_training:
+                    self.model.train()
             if old_token_lps is not None:
                 self.episode_data['log_probs'].append(old_token_lps.detach())
-                self.episode_data['entropies'].append(old_entropies.detach() if old_entropies is not None else torch.tensor([0.0], device=self.device))
+                self.episode_data['entropies'].append(old_entropies.detach() if old_entropies is not None else None)
             else:
-                self.episode_data['log_probs'].append(
-                    torch.tensor([0.0], device=self.device)
-                )
-                self.episode_data['entropies'].append(
-                    torch.tensor([0.0], device=self.device)
-                )
+                # 【修复】计算失败时记录 None（update_policy 会跳过该样本），
+                # 不再用 0.0 占位值（会使 ratio 恒为 1，PPO 完全失效）
+                self.episode_data['log_probs'].append(None)
+                self.episode_data['entropies'].append(None)
         else:
             self.episode_data['log_probs'].append(None)
             self.episode_data['entropies'].append(None)
@@ -737,7 +717,9 @@ class LightweightPPO:
                 advantages.insert(0, returns)
 
         advantages = torch.tensor(advantages, dtype=torch.float32, device=self.device)
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # 【修复】torch.std 默认 unbiased，n=1 时产生 NaN，仅在样本数 >1 时归一化
+        if advantages.numel() > 1:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         return advantages.tolist()
     
@@ -774,112 +756,130 @@ class LightweightPPO:
         update_count = 0
         
         # ── 多轮次 PPO（核心） ──
-        for epoch in range(self.ppo_epochs):
-            # 【修复】共享优化器时不调用 zero_grad，避免清零 SFT 累积的梯度
-            if not self.using_shared_optimizer:
-                self.optimizer.zero_grad(set_to_none=True)
-            epoch_policy_loss = 0.0
-            epoch_entropy_loss = 0.0
-            epoch_update_count = 0
-            
-            for idx in high_reward_indices:
-                old_token_lps = self.episode_data['log_probs'][idx]
-                advantage = advantages_raw[idx]
-                
-                if old_token_lps is None:
-                    continue
-                
-                if not isinstance(old_token_lps, torch.Tensor):
-                    old_token_lps = torch.tensor([old_token_lps], device=self.device, dtype=torch.float32)
-                if not isinstance(advantage, torch.Tensor):
-                    advantage = torch.tensor(advantage, device=self.device, dtype=torch.float32)
-                
-                prompt = self.episode_data['prompts'][idx]
-                generated_text = self.episode_data['generated_texts'][idx]
-                
-                if not prompt or not generated_text:
-                    continue
-                
-                # 【关键】每轮 epoch 重新计算当前策略的逐 token log_prob和熵
-                # 【修复MED-6】一次前向同时获取两者，避免2x计算浪费
-                current_token_lps, current_entropies = self._compute_token_log_probs_and_entropy(
-                    prompt, generated_text
-                )
-                if current_token_lps is None:
-                    continue
-                
-                # ── 对齐序列长度（安全网） ──
-                old_len = old_token_lps.numel()
-                new_len = current_token_lps.numel()
-                min_len = min(old_len, new_len)
-                if min_len == 0:
-                    continue
-                
-                # 截断到相同长度
-                old_lps = old_token_lps[:min_len].to(self.device)
-                new_lps = current_token_lps[:min_len].to(self.device)
-                
-                # ── 逐 token 重要性采样比率 ──
-                # ratio_t = π_new(a_t|s_t) / π_old(a_t|s_t)
-                #         = exp(log π_new - log π_old)
-                log_ratio = new_lps - old_lps.detach()
-                ratio = torch.exp(log_ratio)  # (min_len,)
-                
-                # ── PPO Clipped Surrogate Objective（逐 token） ──
-                # L^CLIP(θ) = E_t[min(ratio_t * A_t, clip(ratio_t, 1-ε, 1+ε) * A_t)]
-                surr1 = ratio * advantage        # 未裁剪
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantage
-                
-                # 逐 token 取 min 后取均值
-                policy_loss = -torch.min(surr1, surr2).mean()
-                
-                # ── 熵奖励（鼓励探索） ──
-                # 【修复CRIT-2+MED-6】使用当前策略的分布熵（已从上方一次前向获取）
-                if current_entropies is not None:
-                    entropy_val = current_entropies[:min_len].mean()
-                else:
-                    entropy_val = -new_lps.mean()
-                entropy_loss = -self.entropy_coef * entropy_val
-                
-                # ── 近似 KL 散度（监控指标） ──
-                # KL(π_old || π_new) ≈ mean(log π_old - log π_new)
-                approx_kl = (old_lps.detach() - new_lps).mean()
-                
-                loss = policy_loss + entropy_loss
-                
-                # 梯度累积（多轮次 + 多样本混合）
-                (loss / (self.ppo_epochs * len(high_reward_indices))).backward()
-                
-                epoch_policy_loss += policy_loss.item()
-                epoch_entropy_loss += entropy_loss.item()
-                total_approx_kl += approx_kl.item()
-                epoch_update_count += 1
-            
-            # ── 每个 epoch 结束后执行优化器步进 ──
-            if epoch_update_count > 0:
-                # 梯度裁剪（标准 PPO 做法）
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                
-                # 【修复】共享优化器时，学习率由主训练流调度器统一管理，PPO不覆盖
+        # 【修复】PPO 更新期间统一在 eval 模式下前向，避免 dropout 噪声污染
+        # 新旧策略 log_prob 的 ratio（eval 模式下梯度仍可正常计算，不影响 backward）
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            for epoch in range(self.ppo_epochs):
+                # 【修复】共享优化器时不调用 zero_grad，避免清零 SFT 累积的梯度
                 if not self.using_shared_optimizer:
-                    current_lr = self.apply_ppo_learning_rate()
-                    self.optimizer.step()
-                else:
-                    current_lr = self.optimizer.param_groups[0]['lr']
-                    # 【修复Bug #2】PPO步后必须清零梯度，防止SFT残余+PPO梯度混合
                     self.optimizer.zero_grad(set_to_none=True)
-                self.ppo_training_steps += 1
+                epoch_policy_loss = 0.0
+                epoch_entropy_loss = 0.0
+                epoch_update_count = 0
                 
-                total_policy_loss += epoch_policy_loss
-                total_entropy_loss += epoch_entropy_loss
-                update_count += epoch_update_count
+                # 【修复】先过滤出本 epoch 实际参与的有效样本，梯度只按有效样本数归一化
+                # （zero_grad/step 每个 epoch 各执行一次，不应再除以 ppo_epochs）
+                valid_indices = [
+                    i for i in high_reward_indices
+                    if self.episode_data['log_probs'][i] is not None
+                    and self.episode_data['prompts'][i]
+                    and self.episode_data['generated_texts'][i]
+                ]
                 
-                if self.ppo_training_steps % 50 == 0:
-                    avg_kl = total_approx_kl / max(epoch_update_count, 1)
-                    print(f"[PPO] Epoch {epoch+1}/{self.ppo_epochs}, Step {self.ppo_training_steps}, "
-                          f"LR={current_lr:.2e}, PolicyLoss={epoch_policy_loss/max(epoch_update_count,1):.4f}, "
-                          f"Entropy={epoch_entropy_loss/max(epoch_update_count,1):.4f}, "
-                          f"ApproxKL={avg_kl:.4f}", flush=True)
+                for idx in valid_indices:
+                    old_token_lps = self.episode_data['log_probs'][idx]
+                    advantage = advantages_raw[idx]
+                    
+                    if old_token_lps is None:
+                        continue
+                    
+                    if not isinstance(old_token_lps, torch.Tensor):
+                        old_token_lps = torch.tensor([old_token_lps], device=self.device, dtype=torch.float32)
+                    if not isinstance(advantage, torch.Tensor):
+                        advantage = torch.tensor(advantage, device=self.device, dtype=torch.float32)
+                    
+                    prompt = self.episode_data['prompts'][idx]
+                    generated_text = self.episode_data['generated_texts'][idx]
+                    
+                    if not prompt or not generated_text:
+                        continue
+                    
+                    # 【关键】每轮 epoch 重新计算当前策略的逐 token log_prob和熵
+                    # 【修复MED-6】一次前向同时获取两者，避免2x计算浪费
+                    current_token_lps, current_entropies = self._compute_token_log_probs_and_entropy(
+                        prompt, generated_text
+                    )
+                    if current_token_lps is None:
+                        continue
+                    
+                    # ── 对齐序列长度（安全网） ──
+                    old_len = old_token_lps.numel()
+                    new_len = current_token_lps.numel()
+                    min_len = min(old_len, new_len)
+                    if min_len == 0:
+                        continue
+                    
+                    # 截断到相同长度
+                    old_lps = old_token_lps[:min_len].to(self.device)
+                    new_lps = current_token_lps[:min_len].to(self.device)
+                    
+                    # ── 逐 token 重要性采样比率 ──
+                    # ratio_t = π_new(a_t|s_t) / π_old(a_t|s_t)
+                    #         = exp(log π_new - log π_old)
+                    log_ratio = new_lps - old_lps.detach()
+                    ratio = torch.exp(log_ratio)  # (min_len,)
+                    
+                    # ── PPO Clipped Surrogate Objective（逐 token） ──
+                    # L^CLIP(θ) = E_t[min(ratio_t * A_t, clip(ratio_t, 1-ε, 1+ε) * A_t)]
+                    surr1 = ratio * advantage        # 未裁剪
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_ratio, 1.0 + self.clip_ratio) * advantage
+                    
+                    # 逐 token 取 min 后取均值
+                    policy_loss = -torch.min(surr1, surr2).mean()
+                    
+                    # ── 熵奖励（鼓励探索） ──
+                    # 【修复CRIT-2+MED-6】使用当前策略的分布熵（已从上方一次前向获取）
+                    if current_entropies is not None:
+                        entropy_val = current_entropies[:min_len].mean()
+                    else:
+                        entropy_val = -new_lps.mean()
+                    entropy_loss = -self.entropy_coef * entropy_val
+                    
+                    # ── 近似 KL 散度（监控指标） ──
+                    # KL(π_old || π_new) ≈ mean(log π_old - log π_new)
+                    approx_kl = (old_lps.detach() - new_lps).mean()
+                    
+                    loss = policy_loss + entropy_loss
+                    
+                    # 梯度累积（逐样本 backward，按本 epoch 有效样本数归一化）
+                    (loss / len(valid_indices)).backward()
+                    
+                    epoch_policy_loss += policy_loss.item()
+                    epoch_entropy_loss += entropy_loss.item()
+                    total_approx_kl += approx_kl.item()
+                    epoch_update_count += 1
+                
+                # ── 每个 epoch 结束后执行优化器步进 ──
+                if epoch_update_count > 0:
+                    # 梯度裁剪（标准 PPO 做法）
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    
+                    # 【修复】共享优化器时，学习率由主训练流调度器统一管理，PPO不覆盖
+                    if not self.using_shared_optimizer:
+                        current_lr = self.apply_ppo_learning_rate()
+                        self.optimizer.step()
+                    else:
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                        # 【修复Bug #2】PPO步后必须清零梯度，防止SFT残余+PPO梯度混合
+                        self.optimizer.zero_grad(set_to_none=True)
+                    self.ppo_training_steps += 1
+                    
+                    total_policy_loss += epoch_policy_loss
+                    total_entropy_loss += epoch_entropy_loss
+                    update_count += epoch_update_count
+                    
+                    if self.ppo_training_steps % 50 == 0:
+                        avg_kl = total_approx_kl / max(epoch_update_count, 1)
+                        print(f"[PPO] Epoch {epoch+1}/{self.ppo_epochs}, Step {self.ppo_training_steps}, "
+                              f"LR={current_lr:.2e}, PolicyLoss={epoch_policy_loss/max(epoch_update_count,1):.4f}, "
+                              f"Entropy={epoch_entropy_loss/max(epoch_update_count,1):.4f}, "
+                              f"ApproxKL={avg_kl:.4f}", flush=True)
+        finally:
+            # 【修复】无论是否抛异常都恢复进入前的模式
+            if was_training:
+                self.model.train()
         
         # ── 清空 episode 数据 ──
         self.episode_data = {
@@ -892,10 +892,6 @@ class LightweightPPO:
             'prompts': [],
             'generated_texts': []
         }
-        
-        # 【修复】PPO更新后强制清理GPU缓存
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         
         n_updates = max(update_count, 1)
         return {
@@ -917,342 +913,3 @@ class LightweightPPO:
             'prompts': [],
             'generated_texts': []
         }
-
-
-class TreeReinforcementLearning:
-    """树强化学习生成器"""
-    
-    def __init__(
-        self,
-        model,
-        reward_model: SelfRewardModel,
-        device: torch.device,
-        max_depth: int = 100,
-        beam_width: int = 4,
-        exploration_coef: float = 1.0,
-        temperature: float = 0.7
-    ):
-        self.model = model
-        self.reward_model = reward_model
-        self.device = device
-        self.max_depth = max_depth
-        self.beam_width = beam_width
-        self.exploration_coef = exploration_coef
-        self.temperature = temperature
-        
-        self.root = TreeNode(token_id=None, log_prob=0.0)
-    
-    def select_node(self, node: TreeNode) -> TreeNode:
-        """使用UCB算法选择节点"""
-        if not node.children:
-            return node
-        
-        def ucb_score(child: TreeNode) -> float:
-            if child.visit_count == 0:
-                return float('inf')
-            
-            exploitation = child.cumulative_reward / child.visit_count
-            exploration = self.exploration_coef * torch.sqrt(
-                torch.log(torch.tensor(node.visit_count + 1)) / child.visit_count
-            ).item()
-            
-            return exploitation + exploration
-        
-        selected = max(node.children, key=ucb_score)
-        return self.select_node(selected)
-    
-    def expand_node(
-        self,
-        node: TreeNode,
-        prompt_tokens: torch.Tensor,
-        current_tokens: List[int],
-        context: str = None
-    ) -> List[TreeNode]:
-        """扩展节点，生成候选子节点"""
-        if node.depth >= self.max_depth:
-            return []
-        
-        if current_tokens:
-            current_tokens_tensor = torch.tensor(current_tokens, device=self.device, dtype=torch.long)
-        else:
-            current_tokens_tensor = torch.tensor([], device=self.device, dtype=torch.long)
-        input_tokens = torch.cat([prompt_tokens, current_tokens_tensor])
-        
-        with torch.inference_mode():
-            result = self.model(input_tokens, use_cache=True)
-            if isinstance(result, tuple):
-                logits, _ = result
-            else:
-                logits = result
-        
-        next_logits = logits[-1]
-        next_probs = F.softmax(next_logits / self.temperature, dim=-1)
-        
-        top_k_probs, top_k_indices = torch.topk(next_logits, k=self.beam_width)
-        
-        new_children = []
-        for i in range(self.beam_width):
-            token_id = top_k_indices[i].item()
-            log_prob = torch.log(top_k_probs[i] + 1e-10).item()
-            
-            child = TreeNode(
-                token_id=token_id,
-                log_prob=log_prob,
-                parent=node,
-                depth=node.depth + 1
-            )
-            new_children.append(child)
-        
-        node.children = new_children
-        return new_children
-    
-    def evaluate_node(
-        self,
-        node: TreeNode,
-        prompt_tokens: torch.Tensor,
-        current_tokens: List[int],
-        think_tokens: List[int] = None,
-        context: str = None
-    ) -> float:
-        """评估节点的奖励值"""
-        full_tokens = prompt_tokens.tolist() + current_tokens
-        
-        generated_text = TextTokenizer.decode(torch.tensor(full_tokens))
-        
-        think_text = None
-        answer_text = generated_text
-        
-        if think_tokens is not None:
-            think_text = TextTokenizer.decode(torch.tensor(think_tokens))
-            answer_text = generated_text[len(think_text):]
-        
-        total_reward, _ = self.reward_model.compute_total_reward(
-            think_text=think_text,
-            answer_text=answer_text,
-            context=context
-        )
-        
-        return total_reward
-    
-    def backpropagate(self, node: TreeNode, reward: float):
-        """反向传播奖励值"""
-        current = node
-        while current is not None:
-            current.visit_count += 1
-            current.cumulative_reward += reward
-            current = current.parent
-    
-    def search(
-        self,
-        prompt: str,
-        context: str = None,
-        max_iterations: int = 100,
-        thinking_available: bool = True
-    ) -> Tuple[str, float, Dict[str, float]]:
-        """执行树搜索"""
-        prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
-        
-        self.root = TreeNode(token_id=None, log_prob=0.0)
-        
-        initial_children = self.expand_node(
-            self.root,
-            prompt_tokens,
-            [],
-            context
-        )
-        
-        for iteration in range(max_iterations):
-            selected_node = self.select_node(self.root)
-            
-            current_tokens = selected_node.get_path()
-            new_children = self.expand_node(
-                selected_node,
-                prompt_tokens,
-                current_tokens,
-                context
-            )
-            
-            for child in new_children:
-                child_tokens = child.get_path()
-                think_tokens = None
-                if thinking_available:
-                    try:
-                        think_end_idx = child_tokens.index(TextTokenizer.THINK_END_TOKEN)
-                        think_tokens = child_tokens[:think_end_idx + 1]
-                    except ValueError:
-                        think_tokens = child_tokens
-                reward = self.evaluate_node(
-                    child,
-                    prompt_tokens,
-                    child_tokens,
-                    think_tokens=think_tokens,
-                    context=context
-                )
-                child.reward = reward
-                
-                self.backpropagate(child, reward)
-        
-        best_node = self._select_best_node()
-        best_tokens = best_node.get_path()
-        
-        generated_text = TextTokenizer.decode(torch.tensor(best_tokens))
-        
-        think_text = None
-        answer_text = generated_text
-        if thinking_available:
-            try:
-                think_end_idx = best_tokens.index(TextTokenizer.THINK_END_TOKEN)
-                think_text = TextTokenizer.decode(torch.tensor(best_tokens[:think_end_idx + 1]))
-                answer_text = TextTokenizer.decode(torch.tensor(best_tokens[think_end_idx + 1:]))
-            except ValueError:
-                pass
-        
-        total_reward, reward_breakdown = self.reward_model.compute_total_reward(
-            think_text=think_text,
-            answer_text=answer_text,
-            context=context
-        )
-        
-        return generated_text, total_reward, reward_breakdown
-    
-    def _select_best_node(self) -> TreeNode:
-        """选择最佳节点"""
-        def collect_leaves(node: TreeNode, leaves: List[TreeNode]):
-            if not node.children:
-                leaves.append(node)
-            else:
-                for child in node.children:
-                    collect_leaves(child, leaves)
-        
-        leaves = []
-        collect_leaves(self.root, leaves)
-        
-        if not leaves:
-            return self.root
-        
-        best_leaf = max(
-            leaves,
-            key=lambda n: n.cumulative_reward / max(n.visit_count, 1)
-        )
-        
-        return best_leaf
-    
-    def beam_search_with_reward(
-        self,
-        prompt: str,
-        context: str = None,
-        max_length: int = 100,
-        beam_width: int = 4,
-        thinking_available: bool = True
-    ) -> Tuple[str, float, Dict[str, float]]:
-        """基于奖励的束搜索"""
-        prompt_tokens = TextTokenizer.encode(prompt).to(self.device)
-        
-        beams = [
-            {
-                'tokens': [],
-                'log_prob': 0.0,
-                'reward': 0.0,
-                'finished': False
-            }
-        ]
-        
-        for step in range(max_length):
-            new_beams = []
-            
-            for beam in beams:
-                if beam['finished']:
-                    new_beams.append(beam)
-                    continue
-                
-                if beam['tokens']:
-                    beam_tokens = torch.tensor(beam['tokens'], device=self.device, dtype=torch.long)
-                else:
-                    beam_tokens = torch.tensor([], device=self.device, dtype=torch.long)
-                current_tokens = torch.cat([
-                    prompt_tokens,
-                    beam_tokens
-                ])
-                
-                with torch.inference_mode():
-                    result = self.model(current_tokens, use_cache=True)
-                    if isinstance(result, tuple):
-                        logits, _ = result
-                    else:
-                        logits = result
-                
-                next_logits = logits[-1]
-                next_probs = F.softmax(next_logits / self.temperature, dim=-1)
-                
-                top_k_probs, top_k_indices = torch.topk(next_logits, k=beam_width)
-                
-                for i in range(beam_width):
-                    token_id = top_k_indices[i].item()
-                    log_prob = torch.log(top_k_probs[i] + 1e-10).item()
-                    
-                    if token_id == TextTokenizer.END_GENERATION_TOKEN:
-                        finished = True
-                    else:
-                        finished = False
-                    
-                    new_beam = {
-                        'tokens': beam['tokens'] + [token_id],
-                        'log_prob': beam['log_prob'] + log_prob,
-                        'reward': 0.0,
-                        'finished': finished
-                    }
-                    
-                    if finished or step == max_length - 1:
-                        full_tokens = prompt_tokens.tolist() + new_beam['tokens']
-                        generated_text = TextTokenizer.decode(torch.tensor(full_tokens))
-                        
-                        think_text = None
-                        answer_text = generated_text
-                        if thinking_available:
-                            try:
-                                think_end_idx = new_beam['tokens'].index(TextTokenizer.THINK_END_TOKEN)
-                                think_text = TextTokenizer.decode(torch.tensor(new_beam['tokens'][:think_end_idx + 1]))
-                                answer_text = TextTokenizer.decode(torch.tensor(new_beam['tokens'][think_end_idx + 1:]))
-                            except ValueError:
-                                pass
-                        
-                        total_reward, _ = self.reward_model.compute_total_reward(
-                            think_text=think_text,
-                            answer_text=answer_text,
-                            context=context
-                        )
-                        new_beam['reward'] = total_reward
-                    
-                    new_beams.append(new_beam)
-            
-            beams = sorted(
-                new_beams,
-                key=lambda b: b['log_prob'] + b['reward'],
-                reverse=True
-            )[:beam_width]
-            
-            if all(beam['finished'] for beam in beams):
-                break
-        
-        best_beam = max(beams, key=lambda b: b['log_prob'] + b['reward'])
-        best_tokens = best_beam['tokens']
-        
-        generated_text = TextTokenizer.decode(torch.tensor(best_tokens))
-        
-        think_text = None
-        answer_text = generated_text
-        if thinking_available:
-            try:
-                think_end_idx = best_tokens.index(TextTokenizer.THINK_END_TOKEN)
-                think_text = TextTokenizer.decode(torch.tensor(best_tokens[:think_end_idx + 1]))
-                answer_text = TextTokenizer.decode(torch.tensor(best_tokens[think_end_idx + 1:]))
-            except ValueError:
-                pass
-        
-        total_reward, reward_breakdown = self.reward_model.compute_total_reward(
-            think_text=think_text,
-            answer_text=answer_text,
-            context=context
-        )
-        
-        return generated_text, total_reward, reward_breakdown

@@ -84,7 +84,7 @@ def _print_status():
 _wait_counter = 0
 
 def main() -> None:
-    global _wait_counter
+    global _wait_counter, local_training_rounds
 
     _create_crawler()
 

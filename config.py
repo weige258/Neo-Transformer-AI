@@ -214,6 +214,13 @@ def validate_config(cfg: Dict[str, Any]) -> list[str]:
     dict_size = int(cfg.get("dict_size", 60000))
     if dict_size < 10:
         warnings.append(f"dict_size({dict_size}) is too small, must be >= 10")
+    # 【修复】特殊token占用59990-59996（tokenizer.TextTokenizer._BASE_OFFSET起），
+    # dict_size必须大于59996，否则特殊token直接embedding越界崩溃
+    if dict_size <= 59996:
+        warnings.append(
+            f"dict_size({dict_size}) must be > 59996, "
+            f"特殊token占用59990-59996，否则embedding越界"
+        )
     
     num_blocks = int(cfg.get("num_transformer_blocks", 8))
     if num_blocks < 1:

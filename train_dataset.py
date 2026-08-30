@@ -7,8 +7,17 @@ import gc
 import time
 from typing import List, Optional, Dict
 
+from config import CONFIG
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _save_model_atomic(state_dict, path: str = "model.pth"):
+    """原子写入checkpoint：先写临时文件再os.replace，避免崩溃时损坏model.pth"""
+    tmp_path = path + ".tmp"
+    torch.save(obj=state_dict, f=tmp_path)
+    os.replace(tmp_path, path)
 
 # ═══════════════════════════════════════════════════════
 # 延迟导入 main 模块，避免循环导入
@@ -30,12 +39,17 @@ def _get_main_refs():
 
 def load_dataset_files(dataset_dir: str = "dataset") -> List[str]:
     """Load all dataset JSON files from the specified directory"""
-    
+
+    # 【修复】dataset目录缺失时不崩溃，返回空列表，由上层 total_entries==0 分支处理
+    if not os.path.isdir(dataset_dir):
+        logging.error(f"Dataset directory not found: {dataset_dir}")
+        return []
+
     dataset_files = []
     for file_name in os.listdir(dataset_dir):
         if file_name.endswith('.json'):
             dataset_files.append(os.path.join(dataset_dir, file_name))
-    
+
     logging.info(f"Found {len(dataset_files)} dataset files in {dataset_dir}")
     return dataset_files
 
@@ -48,7 +62,11 @@ class StreamingDataset:
         self.dataset_files = load_dataset_files(dataset_dir)
         self.total_entries = 0
         self.file_entry_counts = []
-        
+        # 【修复】文件条目内存缓存：{filepath: [entry, ...]}
+        # 每个文件第一次访问时一次性解析并缓存，之后按索引直接取，
+        # 避免每训练一步都全量扫描一次数据集文件
+        self._entry_cache: Dict[str, list] = {}
+
         self._build_index()
     
     def _build_index(self):
@@ -81,7 +99,8 @@ class StreamingDataset:
                                         answer = str(answer_raw).strip()
                                         if ask and answer:
                                             count += 1
-                            except (json.JSONDecodeError, Exception):
+                            except json.JSONDecodeError:
+                                # 【修复】只捕获JSON解析错误，不再吞掉MemoryError等异常
                                 pass
                     return count
                 except MemoryError:
@@ -132,11 +151,78 @@ class StreamingDataset:
         
         raise RuntimeError(f"连续 {max_retries} 次加载样本均失败，请检查数据集文件")
     
+    @staticmethod
+    def _item_to_entry(item: dict) -> Optional[Dict[str, Optional[str]]]:
+        """将解析好的JSON条目转换为训练样本格式，无效条目返回None"""
+        if "ask" not in item or "answer" not in item:
+            return None
+        ask_raw = item.get("ask")
+        answer_raw = item.get("answer")
+        if ask_raw is None or answer_raw is None:
+            return None
+        ask = str(ask_raw).strip()
+        answer = str(answer_raw).strip()
+        if not ask or not answer:
+            return None
+
+        think_raw = item.get("think", "")
+        think = str(think_raw).strip() if think_raw is not None else ""
+
+        history_raw = item.get("history", [])
+        if isinstance(history_raw, list) and len(history_raw) > 0:
+            history_parts = []
+            for msg in history_raw:
+                if isinstance(msg, dict):
+                    role = msg.get("role", "unknown")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        history_parts.append(f"用户: {content}")
+                    elif role == "assistant":
+                        history_parts.append(f"助手: {content}")
+                    else:
+                        history_parts.append(f"{role}: {content}")
+                elif isinstance(msg, str):
+                    history_parts.append(str(msg))
+            history_context = "\n".join(history_parts)
+        else:
+            history_context = ""
+
+        return {
+            "ask": ask,
+            "think": think,
+            "answer": answer,
+            "history_context": history_context
+        }
+
+    def _parse_file_entries(self, file_path: str) -> list:
+        """一次性解析文件中的全部有效条目（用于内存缓存），解析失败的行跳过"""
+        entries = []
+        with open(file_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line in ["[", "]"]:
+                    continue
+                if not line.lstrip().startswith("{"):
+                    continue
+
+                try:
+                    item = json.loads(line.rstrip().rstrip(","))
+                except json.JSONDecodeError:
+                    continue
+
+                entry = self._item_to_entry(item)
+                if entry is not None:
+                    entries.append(entry)
+        return entries
+
     def _load_entry_from_file(self, file_path: str, target_local_idx: int) -> Dict[str, Optional[str]]:
         """从文件中加载指定索引的条目
-        
+
         修复：添加文件大小限制和安全校验，防止恶意JSON导致内存耗尽
         内存不足时抛出异常，由 get_random_sample 捕获并重试其他样本
+        【修复】优先使用内存缓存：文件第一次访问时一次性解析全部条目并缓存，
+        之后按索引直接取，避免每训练一步都全量扫描一次数据集文件；
+        缓存解析遇MemoryError时回退到流式逐行加载
         """
         # 【安全修复】检查文件大小，限制为100MB
         max_file_size = 100 * 1024 * 1024  # 100MB
@@ -147,6 +233,22 @@ class StreamingDataset:
                 f"可能存在安全风险或格式错误"
             )
 
+        cached = self._entry_cache.get(file_path)
+        if cached is None:
+            try:
+                cached = self._parse_file_entries(file_path)
+                self._entry_cache[file_path] = cached
+            except MemoryError:
+                # 内存不足：不缓存，回退到流式逐行加载
+                gc.collect()
+                return self._load_entry_streaming(file_path, target_local_idx)
+
+        if target_local_idx >= len(cached):
+            raise IndexError(f"Entry {target_local_idx} not found in {file_path}")
+        return cached[target_local_idx]
+
+    def _load_entry_streaming(self, file_path: str, target_local_idx: int) -> Dict[str, Optional[str]]:
+        """流式逐行加载指定索引的条目（内存不足时的回退路径，不占用缓存）"""
         current_idx = 0
         with open(file_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -161,44 +263,11 @@ class StreamingDataset:
                 except json.JSONDecodeError:
                     continue
 
-                if "ask" in item and "answer" in item:
-                    ask_raw = item.get("ask")
-                    answer_raw = item.get("answer")
-
-                    if ask_raw is not None and answer_raw is not None:
-                        ask = str(ask_raw).strip()
-                        answer = str(answer_raw).strip()
-                        if ask and answer:
-                            if current_idx == target_local_idx:
-                                think_raw = item.get("think", "")
-                                think = str(think_raw).strip() if think_raw is not None else ""
-
-                                history_raw = item.get("history", [])
-                                if isinstance(history_raw, list) and len(history_raw) > 0:
-                                    history_parts = []
-                                    for msg in history_raw:
-                                        if isinstance(msg, dict):
-                                            role = msg.get("role", "unknown")
-                                            content = msg.get("content", "")
-                                            if role == "user":
-                                                history_parts.append(f"用户: {content}")
-                                            elif role == "assistant":
-                                                history_parts.append(f"助手: {content}")
-                                            else:
-                                                history_parts.append(f"{role}: {content}")
-                                        elif isinstance(msg, str):
-                                            history_parts.append(str(msg))
-                                    history_context = "\n".join(history_parts)
-                                else:
-                                    history_context = ""
-
-                                return {
-                                    "ask": ask,
-                                    "think": think,
-                                    "answer": answer,
-                                    "history_context": history_context
-                                }
-                            current_idx += 1
+                entry = self._item_to_entry(item)
+                if entry is not None:
+                    if current_idx == target_local_idx:
+                        return entry
+                    current_idx += 1
 
         raise IndexError(f"Entry {target_local_idx} not found in {file_path}")
 
@@ -223,7 +292,8 @@ def main() -> None:
     logging.info(f"Initialized streaming dataset with {dataset.total_entries} training samples.")
 
     local_training_rounds = 0
-    save_interval = 500
+    # 【修复】保存间隔从配置读取，与config.py的checkpoint_interval保持一致
+    save_interval = int(CONFIG.get("checkpoint_interval", 1000))
     consecutive_sample_errors = 0
     max_consecutive_sample_errors = 50
     
@@ -296,7 +366,7 @@ def main() -> None:
                     print("*" * 100, flush=True)
 
                     if local_training_rounds % save_interval == 0:
-                        torch.save(obj=model_obj.state_dict(), f="model.pth")
+                        _save_model_atomic(model_obj.state_dict())
                         avg_loss = sum(recent_losses) / len(recent_losses) if recent_losses else 0
                         logging.info(f"Model saved, training rounds: {local_training_rounds}, current LR: {current_lr:.6f}, avg loss: {avg_loss:.6f}")
 
@@ -335,13 +405,13 @@ def main() -> None:
 
         except KeyboardInterrupt:
             logging.info("Training interrupted by user.")
-            torch.save(obj=model_obj.state_dict(), f="model.pth")
+            _save_model_atomic(model_obj.state_dict())
             logging.info(f"Final model saved, training rounds: {local_training_rounds}")
             return
         
         except MemoryError as e:
             logging.error(f"内存不足导致训练循环异常: {e}")
-            torch.save(obj=model_obj.state_dict(), f="model.pth")
+            _save_model_atomic(model_obj.state_dict())
             logging.info("模型已保存，清理内存后自动重启训练...")
             gc.collect()
             if torch.cuda.is_available():
@@ -360,7 +430,7 @@ def main() -> None:
         
         except Exception as e:
             logging.error(f"训练循环意外异常: {e}")
-            torch.save(obj=model_obj.state_dict(), f="model.pth")
+            _save_model_atomic(model_obj.state_dict())
             logging.info("模型已保存，5秒后自动重启训练...")
             time.sleep(5)
             gc.collect()

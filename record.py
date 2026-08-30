@@ -214,17 +214,11 @@ def evaluate_rl_readiness(
         max_read_lines = stability_window * 10
         if file_size > 100_000:
             with open(record_file, "r", encoding="utf-8") as f:
-                lines = []
-                for i, line in enumerate(f):
-                    if i >= max_read_lines:
-                        f.seek(max(0, file_size - 50000))
-                        f.readline()
-                        break
-                    lines.append(line.strip())
-                lines = [l for l in lines if l.strip()]
-                if not lines:
-                    remaining = f.readlines()
-                    lines = [l.strip() for l in remaining if l.strip()][-max_read_lines:]
+                # 【修复】大文件只读尾部：之前先读文件头再seek，seek结果被丢弃，
+                # 导致RL就绪判断基于训练初期的过时数据
+                f.seek(max(0, file_size - 50000))
+                f.readline()  # 丢弃首行残行（seek落点可能在行中间）
+                lines = [l.strip() for l in f.readlines() if l.strip()][-max_read_lines:]
         else:
             with open(record_file, "r", encoding="utf-8") as f:
                 lines = [l.strip() for l in f.readlines() if l.strip()]

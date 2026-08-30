@@ -10,7 +10,6 @@ from config import CONFIG
 from model import MainModel
 from record import record_loss, evaluate_rl_readiness
 from tokenizer import TextTokenizer
-from rl import SelfRewardModel, LightweightPPO
 
 # ═══════════════════════════════════════════════════════
 # 全动态计算辅助函数
@@ -21,7 +20,7 @@ def _get_gpu_free_memory_ratio() -> float:
     if not torch.cuda.is_available():
         return 1.0
     try:
-        total = torch.cuda.get_device_properties(0).total_memory
+        total = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
         reserved = torch.cuda.memory_reserved()
         allocated = torch.cuda.memory_allocated()
         # free = total - reserved + (reserved - allocated)  # 包含缓存
@@ -190,6 +189,9 @@ model.to(device)
 
 # 检查是否有可用的预训练权重
 pretrained_path = "model.pth"
+# 新格式检查点中恢复的优化器状态与步数计数（旧格式纯 state_dict 时为默认值）
+_pretrained_optimizer_state = None
+_pretrained_optimizer_step_count = 0
 if os.path.exists(pretrained_path):
     try:
         file_size = os.path.getsize(pretrained_path)
@@ -202,11 +204,16 @@ if os.path.exists(pretrained_path):
             except Exception:
                 pass
         else:
-            try:
-                state_dict = torch.load(pretrained_path, map_location=device, weights_only=True)
-            except Exception:
-                print(f"Warning: weights_only=True 加载失败，尝试 weights_only=False ...")
-                state_dict = torch.load(pretrained_path, map_location=device, weights_only=False)
+            # 【修复】不再回退 weights_only=False（pickle 反序列化风险），
+            # 加载失败直接抛出，走下方既有警告路径（不覆盖旧文件）
+            checkpoint = torch.load(pretrained_path, map_location=device, weights_only=True)
+            # 向后兼容：新格式为 dict（含优化器状态），旧格式为纯 state_dict
+            if isinstance(checkpoint, dict) and "model" in checkpoint:
+                state_dict = checkpoint["model"]
+                _pretrained_optimizer_state = checkpoint.get("optimizer")
+                _pretrained_optimizer_step_count = int(checkpoint.get("optimizer_step_count", 0))
+            else:
+                state_dict = checkpoint
             model.load_state_dict(state_dict)
             print(f"Loaded pretrained model from {pretrained_path}")
     except Exception as e:
@@ -220,6 +227,14 @@ optimizer = torch.optim.AdamW(
     betas=(float(CONFIG.get("adam_beta1", 0.9)), float(CONFIG.get("adam_beta2", 0.98))),
     eps=float(CONFIG.get("adam_eps", 1e-6)),
 )
+
+# 新格式检查点包含优化器状态时，恢复之（失败则保持全新优化器，不影响模型权重）
+if _pretrained_optimizer_state is not None:
+    try:
+        optimizer.load_state_dict(_pretrained_optimizer_state)
+        print("已恢复优化器状态")
+    except Exception as e:
+        print(f"Warning: 无法恢复优化器状态: {e}")
 
 # 学习率调度器：常数学习率（无warmup，无SGDR，无ReduceLROnPlateau）
 # 【修复】完全移除所有复杂调度，使用最简单的常数学习率
@@ -238,14 +253,24 @@ lr_scheduler = ConstantScheduler(optimizer)
 
 
 def _save_checkpoint() -> None:
-    """保存模型检查点到 model.pth，按 checkpoint_interval 控制频率。"""
+    """保存模型检查点到 model.pth，按 checkpoint_interval 控制频率。
+
+    【修复】原子写入：先写临时文件再 os.replace，避免写一半崩溃损坏唯一权重。
+    保存内容包含优化器状态与步数计数，便于断点续训。
+    """
     interval = int(CONFIG.get("checkpoint_interval", 1000))
     if interval <= 0:
         return
     if optimizer_step_count <= 0 or optimizer_step_count % interval != 0:
         return
     try:
-        torch.save(model.state_dict(), pretrained_path)
+        tmp_path = pretrained_path + ".tmp"
+        torch.save({
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "optimizer_step_count": optimizer_step_count,
+        }, tmp_path)
+        os.replace(tmp_path, pretrained_path)
         print(f"[Checkpoint] Saved model at optimizer step {optimizer_step_count} to {pretrained_path}", flush=True)
     except Exception as e:
         print(f"[Warning] Failed to save checkpoint: {e}", flush=True)
@@ -267,26 +292,10 @@ GRADIENT_ACCUMULATION_STEPS = int(CONFIG.get("gradient_accumulation_steps", 4))
 # 学习率调度器步进间隔（Gemini修复：防止SGDR震荡过于频繁）
 LR_SCHEDULER_STEP_INTERVAL = int(CONFIG.get("lr_scheduler_step_interval", 4))
 
-# PPO配置（Gemini修复：增加episode收集量，减少方差）
-RL_MIN_EPISODES = int(CONFIG.get("rl_min_episodes", 32))
-RL_UPDATE_BATCH_SIZE = int(CONFIG.get("rl_update_batch_size", 8))
-RL_UPDATE_INTERVAL = int(CONFIG.get("rl_update_interval", 4))
-
 # 训练轮数计数器
 training_rounds = 0
-optimizer_step_count = 0
-
-# 自奖励模型和PPO训练器
-# 【修复】PPO延迟初始化，rl_enabled=False时不创建，节省显存
-reward_model = None
-ppo_trainer = None
-
-def _ensure_rl_initialized():
-    """延迟初始化PPO训练器，仅在rl_enabled=True时创建"""
-    global reward_model, ppo_trainer
-    if ppo_trainer is None and bool(CONFIG.get("rl_enabled", False)):
-        reward_model = SelfRewardModel(device)
-        ppo_trainer = LightweightPPO(model, reward_model, device)
+# 新格式检查点可恢复优化器步数计数（旧格式为0）
+optimizer_step_count = _pretrained_optimizer_step_count
 
 
 def _build_train_sequence(segments: List[Tuple[torch.Tensor | int, bool]]) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -902,60 +911,10 @@ def train(ask: str = None, think: str = None, answer: str = None, history_contex
         if train_tensor is None:
             return None
         return _run_train_step(train_tensor, target_mask, preview, show_preview=False)
-    
-    # 自奖励评估 —— 智能 RL 切换
-    # 【修复】PPO默认禁用，需要配置 rl_enabled=True 才启用
-    # PPO是显存爆炸的头号元凶：每次collect_episode做完整forward，update_policy做多轮forward+backward
-    rl_enabled = bool(CONFIG.get("rl_enabled", False))
-    if not rl_enabled:
-        return None
-    
-    _ensure_rl_initialized()
-    if ppo_trainer is None or reward_model is None:
-        return
-    
-    try:
-        # 显存保护：GPU占用超过70%时跳过PPO
-        if torch.cuda.is_available():
-            mem_used = torch.cuda.memory_allocated() / torch.cuda.get_device_properties(0).total_memory
-            if mem_used > 0.70:
-                if training_rounds % 100 == 0:
-                    print(f"[RL] 跳过: GPU显存占用{mem_used:.0%}过高", flush=True)
-                return
 
-        # 计算奖励（自动记录到历史）
-        total_reward, reward_breakdown = reward_model.compute_total_reward(
-            think_text=think,
-            answer_text=answer,
-            context=history_context
-        )
-
-        # 智能决策是否启用 RL 训练
-        should_enable_rl, rl_decision_reason = reward_model.should_enable_rl()
-
-        if should_enable_rl:
-            ppo_trainer.collect_episode(
-                prompt=ask if ask else "",
-                think_text=think if think else "",
-                answer_text=answer if answer else "",
-                context=history_context
-            )
-            if (training_rounds > 0 and 
-                (training_rounds % RL_UPDATE_INTERVAL) == 0 and
-                len(ppo_trainer.episode_data['rewards']) >= RL_MIN_EPISODES):
-                ppo_update_result = ppo_trainer.update_policy(batch_size=RL_UPDATE_BATCH_SIZE)
-                # PPO更新后强制清理显存
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                if training_rounds % 100 == 0:
-                    print(f"[RL] 启用 | 奖励={total_reward:.3f} | {rl_decision_reason}", flush=True)
-        else:
-            if training_rounds % 50 == 0:
-                print(f"[RL] 暂停 | 奖励={total_reward:.3f} | {rl_decision_reason}", flush=True)
-    except Exception as e:
-        print(f"[Warning] RL step failed (non-fatal): {e}", flush=True)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    # 【修复】原 RL/PPO 分支已删除：上面 answer 非空时均已先行返回，
+    # 该分支只有 answer 为空才可能到达，所有真实调用方都传 answer，实际永远不可达；
+    # 且一旦触发会用空 answer 收集无意义 episode。answer 为空时直接结束（返回 None）。
 
 
 def _detach_kv_cache(past_kv, max_cache_len: int = None):
@@ -987,6 +946,10 @@ def _detach_kv_cache(past_kv, max_cache_len: int = None):
                 limit = max_cache_len if i < 2 else max_mem_len
                 if dt.dim() >= 2 and dt.shape[-2] > limit:
                     dt = dt[..., -limit:, :].contiguous()
+                # 【修复】mem_pos（索引4，1-D）也要同步截断，
+                # 否则 mem_k/mem_v 截断后与 mem_pos 长度不一致
+                elif i == 4 and dt.dim() == 1 and dt.shape[0] > limit:
+                    dt = dt[-limit:].contiguous()
                 detached_tuple.append(dt)
             else:
                 detached_tuple.append(t)
@@ -1025,43 +988,12 @@ def _estimate_safe_chunk_size(seq_len: int = 0) -> int:
     chunk_max_ratio = float(CONFIG.get("chunk_max_ratio", 0.5))
     chunk_cpu_pressure_factor = float(CONFIG.get("chunk_cpu_pressure_factor", 0.2))
     
-    # 【修复】计算可用显存时扣除模型固定开销
-    # 模型固定开销 = 参数 + 梯度 + 优化器状态(Adam = 2x参数)
-    # 估算：参数量 * 4 (fp32) * 3 (参数+梯度+优化器)
+    # 【修复】可用显存直接采用 total - allocated 口径：
+    # gpu_free_ratio 已基于 (total - allocated) 计算，allocated 本身包含
+    # 模型参数/梯度/优化器状态，此处不再重复扣除模型固定开销
     if torch.cuda.is_available():
-        total_memory = torch.cuda.get_device_properties(0).total_memory
-        # 【修复】使用正确的配置键名 "dict_size" 而非 "vocab_size"
-        vocab_size = int(CONFIG.get("dict_size", 60000))
-        # 【修复】更准确的参数估算：
-        # embedding: vocab_size * emb_size
-        # 每个transformer block: 
-        #   - qkv_proj: emb_size * emb_size * 3
-        #   - out_proj: emb_size * emb_size
-        #   - router: emb_size * (emb_size//4) + (emb_size//4) * 3
-        #   - SwiGLU FFN: gate(emb*hidden) + up(emb*hidden) + down(hidden*emb), hidden=3*emb
-        #   - RMSNorm: 2 * emb_size (attn_norm + ffn_norm)
-        #   - MLA memory: kv_proj(head*latent) + v_proj(head*latent) + q_proj(head*latent) + v_up_proj(latent*head) + out_proj(head*head)
-        # output: emb_size * vocab_size (与embedding共享时忽略)
-        hidden = emb_size * 3  # SwiGLU hidden size
-        attn_params = emb_size * emb_size * 3 + emb_size * emb_size  # qkv + out
-        ffn_params = emb_size * hidden * 2 + hidden * emb_size  # gate + up + down
-        router_params = emb_size * max(1, emb_size // 4) + max(1, emb_size // 4) * 3
-        norm_params = emb_size * 2
-        # MLA 参数 (粗略)
-        head_dim = emb_size // 8  # num_heads=8
-        latent_dim = max(16, head_dim // 4)
-        mla_params = head_dim * latent_dim * 3 + latent_dim * head_dim + head_dim * head_dim
-        block_params = attn_params + ffn_params + router_params + norm_params + mla_params
-        
-        param_count = vocab_size * emb_size + block_params * num_layers
-        if not bool(CONFIG.get("tie_token_embeddings", True)):
-            param_count += emb_size * vocab_size  # output layer
-        
-        model_overhead = param_count * 4 * 3  # fp32 * 3 (param + grad + optimizer)
-        
-        # 可用显存 = 空闲显存 - 模型固定开销 - 安全余量(15%)
-        free_memory = max(0, total_memory * gpu_free_ratio - model_overhead)
-        free_memory = min(free_memory, total_memory * gpu_free_ratio * 0.85)  # 保留15%安全余量
+        total_memory = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory
+        free_memory = total_memory * gpu_free_ratio * 0.85  # 保留15%安全余量
     else:
         free_memory = 8 * 1024**3  # 默认8GB
     
@@ -1117,6 +1049,7 @@ def _chunked_forward_backward(
     step = max(1, chunk_size - overlap)
 
     chunk_losses = []
+    chunk_weights = []  # 各 chunk 有效 loss token 数，用于加权平均
     past_kv = None
     max_chunks = 32  # 【修复】最大chunk数限制，防止无限循环
     chunk_count = 0
@@ -1140,21 +1073,26 @@ def _chunked_forward_backward(
                     logits = result
                     past_kv = None
 
+                n_tokens = 0
                 if seg.numel() > 1 and seg_mask.any():
                     if logits.dim() == 3:
                         logits_2d = logits.squeeze(0)
                     else:
                         logits_2d = logits
 
-                    # 【关键修复】所有chunk统一使用完整的seg进行loss计算
-                    # 之前的overlap逻辑错误地跳过了大量token，导致训练数据严重丢失
-                    # 正确做法：所有chunk都使用 seg[1:] 计算loss（语言模型预测下一个token）
+                    # 所有chunk都使用 seg[1:] 计算loss（语言模型预测下一个token）
                     # 第一个token没有前一个token来预测它，所以自然地从索引1开始
                     mask_bool = seg_mask[1:].to(device)
+                    # 【修复】overlap 区的 target 在上一 chunk 已计过一次 loss，
+                    # 非首个 chunk 将前 overlap-1 个 target 位置的 mask 置 False，
+                    # 保证每个 token 只计一次 loss（KV/past 传递逻辑不变，仍输入完整 seg）
+                    if seg_start > 0 and overlap > 1:
+                        mask_bool[:overlap - 1] = False
                     if mask_bool.any():
                         pred = logits_2d[:-1][mask_bool]
                         tgt = seg[1:].to(device)[mask_bool]
                         loss_chunk = loss_func(pred, tgt)
+                        n_tokens = int(mask_bool.sum().item())
                     else:
                         loss_chunk = torch.tensor(0.0, device=device)
                 else:
@@ -1171,14 +1109,14 @@ def _chunked_forward_backward(
                     loss_scaled.backward()
 
             chunk_losses.append(loss_chunk.detach())
+            chunk_weights.append(n_tokens)
             del seg, logits, loss_chunk, loss_scaled
 
             # 【修复】强制清理中间变量，防止显存泄漏
             if past_kv is not None:
                 past_kv = _detach_kv_cache(past_kv)
-            # 每个chunk后都清理GPU缓存，防止显存累积
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # 【修复】删除每个 chunk 后的 empty_cache：它会同步设备并强制重新
+            # 向驱动申请显存，长序列几十个 chunk 每步都付出代价且基本无效
 
         except RuntimeError as e_oom:
             if "out of memory" in str(e_oom).lower():
@@ -1188,10 +1126,14 @@ def _chunked_forward_backward(
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
                     safe_past = _detach_kv_cache(past_kv) if past_kv is not None else None
-                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller, grad_scale=grad_scale)
+                    # 非首个 chunk 的前 overlap-1 个 target 已由上一 chunk 计过 loss，跳过
+                    skip_first = (overlap - 1) if (seg_start > 0 and overlap > 1) else 0
+                    sub = _chunk_one_segment(seg, seg_mask, safe_past, smaller,
+                                             grad_scale=grad_scale, skip_first=skip_first)
                     if sub is not None:
-                        sub_loss, past_kv = sub
+                        sub_loss, past_kv, sub_tokens = sub
                         chunk_losses.append(sub_loss.detach())
+                        chunk_weights.append(sub_tokens)
                         del sub_loss
                     else:
                         continue
@@ -1203,23 +1145,35 @@ def _chunked_forward_backward(
 
     if not chunk_losses:
         return None
-    avg_loss = torch.stack([l.to(device) for l in chunk_losses]).mean()
+    # 【修复】按各 chunk 有效 token 数加权平均，避免稀疏 chunk 与密集 chunk 等权
+    losses_t = torch.stack([l.to(device) for l in chunk_losses])
+    weights_t = torch.tensor(chunk_weights, dtype=torch.float32, device=device)
+    total_weight = weights_t.sum()
+    if total_weight > 0:
+        avg_loss = (losses_t * weights_t).sum() / total_weight
+    else:
+        avg_loss = losses_t.mean()
     return avg_loss.item()
 
 
 def _chunk_one_segment(
     seg: torch.Tensor, seg_mask: torch.Tensor, past_kv, chunk_size: int,
     grad_scale: int = 1,
-) -> tuple[torch.Tensor, any] | None:
-    """OOM 回退：将单个 segment 进一步细分后训练，返回 (avg_loss, past_kv) 或 None。
+    skip_first: int = 0,
+) -> tuple[torch.Tensor, any, int] | None:
+    """OOM 回退：将单个 segment 进一步细分后训练，返回 (avg_loss, past_kv, 有效token数) 或 None。
 
     【修复】统一梯度缩放：每个子 chunk 的 loss 除以 grad_scale，
     与主循环的缩放一致。细分后的多个子 chunk 会自然累加它们的梯度，
     这与长序列提供更多训练信号的直觉相符。
+
+    Args:
+        skip_first: 首个子 chunk 开头已由上一 chunk 计过 loss 的 target 数，跳过避免重复计权
     """
     seg_len = seg.numel()
     step = max(1, chunk_size // 2)
     seg_losses = []
+    seg_weights = []  # 各子 chunk 有效 loss token 数，用于加权平均
     local_past = past_kv
 
     for s in range(0, seg_len, step):
@@ -1236,27 +1190,39 @@ def _chunk_one_segment(
                 else:
                     logits = result
                     local_past = None
+                n_tokens = 0
                 if sub.numel() > 1 and sub_mask.any():
                     if logits.dim() == 3:
                         logits_2d = logits.squeeze(0)
                     else:
                         logits_2d = logits
 
+                    # 【修复】overlap 区的 target 在上一子 chunk 已计过一次 loss，
+                    # 非首个子 chunk 跳过前 (chunk_size - step - 1) 个 target 位置，
+                    # 首个子 chunk 跳过 skip_first 个（主循环 overlap 区），保证每个 token 只计一次
+                    skip = skip_first if s == 0 else max(0, chunk_size - step - 1)
+
                     if local_past is not None and s > 0:
                         current_logits = logits_2d[-sub.numel():]
                         mask_bool = sub_mask[1:].to(device)
+                        if skip > 0:
+                            mask_bool[:skip] = False
                         if mask_bool.any():
                             pred = current_logits[:-1][mask_bool]
                             tgt = sub[1:].to(device)[mask_bool]
                             loss_sub = loss_func(pred, tgt)
+                            n_tokens = int(mask_bool.sum().item())
                         else:
                             loss_sub = torch.tensor(0.0, device=device)
                     else:
                         mask_bool = sub_mask[1:].to(device)
+                        if skip > 0:
+                            mask_bool[:skip] = False
                         if mask_bool.any():
                             pred = logits_2d[:-1][mask_bool]
                             tgt = sub[1:].to(device)[mask_bool]
                             loss_sub = loss_func(pred, tgt)
+                            n_tokens = int(mask_bool.sum().item())
                         else:
                             loss_sub = torch.tensor(0.0, device=device)
                 else:
@@ -1271,13 +1237,12 @@ def _chunk_one_segment(
                 else:
                     loss_scaled.backward()
             seg_losses.append(loss_sub.detach())
+            seg_weights.append(n_tokens)
             del sub, logits, loss_sub, loss_scaled
 
             if local_past is not None:
                 local_past = _detach_kv_cache(local_past)
-            # 【修复】每个子chunk后清理GPU缓存
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # 【修复】删除每个子 chunk 后的 empty_cache：同步设备且对防显存累积基本无效
 
         except RuntimeError:
             torch.cuda.empty_cache()
@@ -1285,8 +1250,15 @@ def _chunk_one_segment(
             continue
 
     if seg_losses:
-        avg = torch.stack(seg_losses).mean()
-        return avg, local_past
+        # 【修复】按各子 chunk 有效 token 数加权平均，避免稀疏 chunk 与密集 chunk 等权
+        losses_t = torch.stack(seg_losses)
+        weights_t = torch.tensor(seg_weights, dtype=torch.float32, device=losses_t.device)
+        total_weight = weights_t.sum()
+        if total_weight > 0:
+            avg = (losses_t * weights_t).sum() / total_weight
+        else:
+            avg = losses_t.mean()
+        return avg, local_past, int(total_weight.item())
     return None
 
 
@@ -1314,13 +1286,9 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
 
     model.train()
     seq_len = train_tensor.numel()
-    
-    # 【修复】序列长度硬限制，防止超长序列导致显存爆炸
-    max_seq_len_cfg = int(CONFIG.get("max_seq_len", 2048))
-    if seq_len > max_seq_len_cfg:
-        train_tensor = train_tensor[-max_seq_len_cfg:]
-        target_mask = target_mask[-max_seq_len_cfg:]
-        seq_len = max_seq_len_cfg
+
+    # 【修复】删除超长序列左截断（保留尾部会丢掉 ask/history/START，
+    # 且使分块路径对超长序列永不生效）；超长序列交给下方既有分块训练路径处理
 
     # ── 显存状态检查 ──
     if torch.cuda.is_available():
@@ -1429,6 +1397,13 @@ def _run_train_step(train_tensor: torch.Tensor, target_mask: torch.Tensor, previ
                 return float('inf')
             raw_loss_val = loss_val
             loss = torch.tensor(loss_val, device=device)
+
+        # 【修复】mask 全空时 loss 无梯度、不参与 backward，若仍执行 optimizer step，
+        # AdamW 的 weight decay 会在空样本上持续衰减权重；此处直接跳过整个 step
+        if seq_len <= 1 or not target_mask[1:].any():
+            print(f"[Warning] target_mask 全空，无有效训练信号，跳过 optimizer step", flush=True)
+            optimizer.zero_grad(set_to_none=True)
+            return float('inf')
 
         # ── 统一的梯度后处理 ──
         if not torch.isnan(loss) and not torch.isinf(loss):
